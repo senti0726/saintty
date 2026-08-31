@@ -1541,12 +1541,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Clamp so a burst cannot displace more than one screen, which
                 // would just look like a flash of unrelated content.
                 const limit = cell_h * @as(f32, @floatFromInt(self.size.grid().rows));
-                self.scroll_anim.start(
-                    std.math.clamp(offset, -limit, limit),
+                // Accumulate rather than replace, and only reset the clock
+                // when starting from idle. Resetting it on every scroll would
+                // skip the integration frame each time, so during continuous
+                // scrolling the offset would never decay and would simply
+                // wind up to the limit.
+                const was_idle = !self.scroll_anim.active();
+                self.scroll_anim.push(
+                    offset,
                     @floatFromInt(ev.top),
                     @floatFromInt(ev.bottom),
+                    limit,
                 );
-                self.scroll_anim_last = null;
+                if (was_idle) self.scroll_anim_last = null;
             }
 
             // Outside the critical area, complete the update we began

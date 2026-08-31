@@ -32,17 +32,37 @@ pub fn active(self: ScrollAnim) bool {
     return self.offset_px != 0;
 }
 
-/// Begin an animation displaced by `offset_px`, covering rows [top, bottom].
+/// Record a scroll of `offset_px` over rows [top, bottom].
 ///
-/// A scroll arriving mid-animation supersedes it rather than queueing: the
-/// animation can only ever chase the latest position, so there is nothing to
-/// be gained by remembering where it used to be going.
-pub fn start(self: *ScrollAnim, offset_px: f32, top: f32, bottom: f32) void {
-    self.* = .{
-        .offset_px = if (@abs(offset_px) < min_offset_px) 0 else offset_px,
-        .top = top,
-        .bottom = bottom,
-    };
+/// Displacement **accumulates** while an animation is in flight. This is the
+/// non-obvious part. If the screen is already drawn a fraction of a row behind
+/// the model and the model scrolls again, the display is now behind by the sum
+/// of the two: the previous shortfall did not stop being true just because
+/// more scrolling happened. Replacing instead of adding pins the display a
+/// constant one row behind during continuous scrolling and then snaps at the
+/// end, which reads as lag rather than motion.
+///
+/// A scroll over a *different* region replaces, because the pending offset
+/// describes rows that are no longer the ones moving.
+///
+/// `limit` caps the accumulated displacement, so a burst cannot wind the
+/// offset up to something that flashes unrelated content when it unwinds.
+pub fn push(
+    self: *ScrollAnim,
+    offset_px: f32,
+    top: f32,
+    bottom: f32,
+    limit: f32,
+) void {
+    const base: f32 = if (self.active() and self.top == top and self.bottom == bottom)
+        self.offset_px
+    else
+        0;
+
+    const combined = std.math.clamp(base + offset_px, -@abs(limit), @abs(limit));
+    self.offset_px = if (@abs(combined) < min_offset_px) 0 else combined;
+    self.top = top;
+    self.bottom = bottom;
 }
 
 pub fn stop(self: *ScrollAnim) void {
@@ -87,13 +107,13 @@ test "ScrollAnim: starts inactive" {
 
 test "ScrollAnim: start below the visible threshold is a no-op" {
     var a: ScrollAnim = .{};
-    a.start(0.1, 0, 10);
+    a.push(0.1, 0, 10, 10_000);
     try testing.expect(!a.active());
 }
 
 test "ScrollAnim: advancing a full duration finishes it" {
     var a: ScrollAnim = .{};
-    a.start(-20, 0, 10);
+    a.push(-20, 0, 10, 10_000);
     try testing.expect(a.active());
     a.advance(80, 80);
     try testing.expect(!a.active());
@@ -102,7 +122,7 @@ test "ScrollAnim: advancing a full duration finishes it" {
 
 test "ScrollAnim: a longer-than-duration frame does not overshoot past zero" {
     var a: ScrollAnim = .{};
-    a.start(-20, 0, 10);
+    a.push(-20, 0, 10, 10_000);
     // A stalled surface: the offset must land exactly on zero, never cross it
     // and animate back from the other side.
     a.advance(5000, 80);
@@ -111,7 +131,7 @@ test "ScrollAnim: a longer-than-duration frame does not overshoot past zero" {
 
 test "ScrollAnim: decays monotonically toward zero without changing sign" {
     var a: ScrollAnim = .{};
-    a.start(-20, 0, 10);
+    a.push(-20, 0, 10, 10_000);
     var prev = a.offset_px;
     var i: usize = 0;
     while (i < 200 and a.active()) : (i += 1) {
@@ -126,8 +146,8 @@ test "ScrollAnim: decays monotonically toward zero without changing sign" {
 test "ScrollAnim: positive and negative decay symmetrically" {
     var up: ScrollAnim = .{};
     var down: ScrollAnim = .{};
-    up.start(30, 0, 10);
-    down.start(-30, 0, 10);
+    up.push(30, 0, 10, 10_000);
+    down.push(-30, 0, 10, 10_000);
     for (0..3) |_| {
         up.advance(16, 80);
         down.advance(16, 80);
@@ -135,19 +155,41 @@ test "ScrollAnim: positive and negative decay symmetrically" {
     try testing.expectApproxEqAbs(up.offset_px, -down.offset_px, 0.001);
 }
 
-test "ScrollAnim: a new scroll supersedes one in flight" {
+test "ScrollAnim: a scroll over a different region replaces" {
     var a: ScrollAnim = .{};
-    a.start(-20, 0, 10);
+    a.push(-20, 0, 10, 10_000);
     a.advance(16, 80);
-    a.start(40, 2, 8);
+    a.push(40, 2, 8, 10_000);
     try testing.expectEqual(@as(f32, 40), a.offset_px);
     try testing.expectEqual(@as(f32, 2), a.top);
     try testing.expectEqual(@as(f32, 8), a.bottom);
 }
 
+test "ScrollAnim: successive scrolls over the same region accumulate" {
+    var a: ScrollAnim = .{};
+    a.push(-20, 0, 10, 10_000);
+    // Still behind by 20px when the model scrolls another 20: the display is
+    // now behind by 40, not by 20.
+    a.push(-20, 0, 10, 10_000);
+    try testing.expectEqual(@as(f32, -40), a.offset_px);
+}
+
+test "ScrollAnim: opposing scrolls net out rather than compounding" {
+    var a: ScrollAnim = .{};
+    a.push(-20, 0, 10, 10_000);
+    a.push(20, 0, 10, 10_000);
+    try testing.expect(!a.active());
+}
+
+test "ScrollAnim: accumulation is capped by the limit" {
+    var a: ScrollAnim = .{};
+    for (0..100) |_| a.push(-20, 0, 10, 50);
+    try testing.expectEqual(@as(f32, -50), a.offset_px);
+}
+
 test "ScrollAnim: zero or negative dt is ignored rather than reversing" {
     var a: ScrollAnim = .{};
-    a.start(-20, 0, 10);
+    a.push(-20, 0, 10, 10_000);
     const before = a.offset_px;
     a.advance(0, 80);
     a.advance(-5, 80);
@@ -156,7 +198,7 @@ test "ScrollAnim: zero or negative dt is ignored rather than reversing" {
 
 test "ScrollAnim: a zero duration does not divide by zero" {
     var a: ScrollAnim = .{};
-    a.start(-20, 0, 10);
+    a.push(-20, 0, 10, 10_000);
     a.advance(16, 0);
     try testing.expect(a.offset_px == -20);
 }
