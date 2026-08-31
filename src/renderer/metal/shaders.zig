@@ -246,6 +246,13 @@ pub const Uniforms = extern struct {
         /// (thickness) to gamma-incorrect blending.
         use_linear_correction: bool align(1) = false,
     },
+    /// Scroll animation, as {offset_px, top_row, bottom_row, unused}.
+    /// Mirrors the OpenGL uniform; see src/renderer/scroll_anim.zig.
+    ///
+    /// The Metal shaders do not consume this yet, so scroll animation is
+    /// currently OpenGL-only. The field exists so the shared renderer code
+    /// that publishes it still compiles for Metal.
+    scroll_anim: [4]f32 align(16),
 
     const PaddingExtend = packed struct(u8) {
         left: bool = false,
