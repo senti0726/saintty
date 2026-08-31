@@ -19,7 +19,7 @@ they were expensive. Do re-verify them if `git merge-base` has moved.
 |-------|---------|--------|
 | 0 | Toolchain + unmodified build | **DONE, verified** |
 | 1 | Momentum | **WORKS** — verified by hand; tuning open |
-| 2 | Scroll-region animation | not started |
+| 2 | Scroll-region animation | **2a detection DONE + verified**; 2b animation not started |
 | 3 | Pixel viewport scroll | not started |
 
 Commits on this branch: `ff0b00271` (docs), `d312bef5a` (stage 1).
@@ -167,15 +167,66 @@ scroll momentum: vel_y=<N> residual=<N> combined=<N> px/s tau=<N>s
 `residual` non-zero on a second flick is stacking working. If `combined`
 saturates at 30000 repeatedly, the ceiling is being hit and could be raised.
 
+## Stage 2a — scroll detection, done and verified 2026-08-31
+
+`Terminal.scroll_event` records region scrolls; the renderer drains it in the
+`updateFrame` critical section and logs. **No visual change yet.**
+
+Verified twice. Synthetic sequences with known answers:
+
+```
+CSI 1;23r, cursor row 5, then IL 2 / DL 3 / SU 4 / SD 2
+-> rows=-2 region=4..22 insert_lines
+   rows=3  region=4..22 delete_lines
+   rows=4  region=0..22 scroll_up
+   rows=-2 region=0..22 insert_lines
+```
+
+And against real tmux copy-mode: three scroll-ups give `rows=-1
+region=0..51 insert_lines` each, matching the `CSI 1 L` measured in SPEC §3.3.
+A 5-row scroll-down at the buffer end correctly reported `rows=3` — the
+clamped count, not the requested one.
+
+### Two things testing caught that guesswork had wrong
+
+1. **`scrollDown` delegates to `insertLines`.** Hooking both double-counted:
+   `SD 2` reported 4. Only `insertLines` is hooked now; it is the choke point
+   for SD and RI alike. `scrollUp` has its own implementation and stays
+   distinguishable. This is why `ScrollEvent.Source` has no `scroll_down`.
+2. **`insertLines`/`deleteLines` scroll from the cursor row**, not the region
+   top, so the span is `[cursor, bottom margin]`. Recording
+   `scrolling_region.top` would have been wrong for every IL/DL.
+
+### Deliberately not done
+
+`index` (`src/terminal/Terminal.zig:2316`) is **not** hooked. It fires on every
+newline at the bottom of the screen, so hooking it animates all terminal
+output, not deliberate scrolling. Decide that separately, after watching what
+the deliberate-scroll traffic looks like on its own.
+
+### Seeing it
+
+Run the fork and watch stderr; events log at debug level as
+
+```
+scroll event: rows=<N> region=<top>..<bottom> source=<which>
+```
+
+---
+
 ## Next action
 
 1. Live with the current feel; adjust `mouse-scroll-momentum-decay` in config.
    Only revisit code if the *character* is wrong, not the distance.
 2. Once settled: consider flipping `mouse-scroll-momentum` to default true,
    and decide whether the debug log stays.
-3. Then Stage 2 (SPEC §4 Feature 2) — the real prize, and the risky one.
-   Re-read the hazard note before writing code: **animate the pixel offset used
-   at draw time, never the grid model.**
+3. **Stage 2b: the animation itself.** SPEC §4 Feature 2 now carries the full
+   design analysis — read it before writing code, especially the outgoing-row
+   problem and the recommendation to composite the previous frame rather than
+   stash rows. Attach continuous frames to `animationWake()`
+   (`src/renderer/generic.zig:1039`); do not invent a timer. And the standing
+   hazard: **animate the pixel offset used at draw time, never the grid
+   model.**
 
 ### Known-unknown carried forward
 
