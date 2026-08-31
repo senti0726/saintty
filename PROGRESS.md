@@ -18,7 +18,7 @@ they were expensive. Do re-verify them if `git merge-base` has moved.
 | Stage | Feature | Status |
 |-------|---------|--------|
 | 0 | Toolchain + unmodified build | **DONE, verified** |
-| 1 | Momentum | **IMPLEMENTED, UNVERIFIED** ← needs a touchpad test |
+| 1 | Momentum | **WORKS** — verified by hand; tuning open |
 | 2 | Scroll-region animation | not started |
 | 3 | Pixel viewport scroll | not started |
 
@@ -130,65 +130,57 @@ done.
 
 ---
 
-## Stage 1 — implemented 2026-08-31, NOT yet verified
+## Stage 1 — works, tuning open
 
-Builds clean, runs, registers `mouse-scroll-momentum = false`. **The gesture
-itself has not been tested — that needs a hand on the touchpad.** Do not mark
-this done until someone has actually flung a pane.
+Verified by hand on the touchpad 2026-08-31: `decelerate` fires, the fling
+runs. Two rounds of feedback so far.
 
-Files touched: `src/apprt/gtk/ui/1.2/surface.blp` (kinetic flag + decelerate
-handler), `src/apprt/gtk/class/surface.zig` (fling state, callbacks, dispose),
-`src/config/Config.zig` (the option).
+**Round 1 → round 2.** Momentum was too weak, and flicks did not stack. The
+stacking failure was a design bug: `ecMouseScrollVertical` called
+`momentumStop()`, zeroing velocity the moment fingers came back down, so the
+follow-up flick started from nothing. Now a real scroll *pauses* the fling and
+keeps its velocity; `decelerate` adds the new gesture's velocity to the
+residual, after decaying it by the length of the gesture. Strength: decay
+constant 0.18s → 0.45s, stop threshold 12 → 8 px/s.
 
-### The test
+### Tuning without rebuilding
 
-```bash
-cd ~/dev/ghostty
-./zig-out/bin/ghostty -e 'tmux new -A -s flingtest'
-```
-
-In that new window: `--mouse-scroll-momentum` is off by default, so first
-confirm the build behaves like upstream, then relaunch with
-
-```bash
-./zig-out/bin/ghostty --mouse-scroll-momentum=true
-```
-
-Fill a pane with output (`seq 1 5000`), scroll up into copy-mode, and flick.
-
-**Reading the result.** The `decelerate` handler logs at debug level:
+`mouse-scroll-momentum-decay` (seconds, default 0.45) is the "how far does a
+flick carry" knob. A fling runs roughly 4-5x this before stopping.
 
 ```
-scroll momentum: decelerate vel_y=<N> px/s
+mouse-scroll-momentum = true
+mouse-scroll-momentum-decay = 0.7      # glides further
 ```
 
-- **Log line appears, screen keeps moving** → working; tune
-  `momentum_decay_tau` (0.18 s) and `momentum_min_velocity` (12 px/s) to taste.
-- **Log line appears, screen does not move** → the fling runs but the delta is
-  being swallowed. Suspect the `10.0` precision multiplier (SPEC §3.4b) or the
-  accumulator threshold in `scrollCallback`.
-- **No log line at all** → GTK is not emitting `decelerate`. Check the
-  `kinetic` flag survived into the compiled blueprint, and whether the
-  compositor delivers a kinetic phase for this touchpad.
+Ghostty reloads config without a restart, so iterate on feel there rather than
+in the source. Only touch the code constants if the *shape* is wrong rather
+than the duration — `momentum_max_velocity` (30000 px/s, the stacking ceiling)
+and `momentum_min_velocity` (8 px/s, the stop threshold).
 
-Run with `GHOSTTY_LOG=debug` or check stderr of the launching terminal.
+### Reading the debug log
 
----
+```
+scroll momentum: vel_y=<N> residual=<N> combined=<N> px/s tau=<N>s
+```
+
+`residual` non-zero on a second flick is stacking working. If `combined`
+saturates at 30000 repeatedly, the ceiling is being hit and could be raised.
 
 ## Next action
 
-1. **Run the test above.** Everything else is blocked on it.
-2. If it works: tune the two constants, then turn the debug log into something
-   permanent or remove it, and flip the default only once it has been lived
-   with for a while.
-3. Then Stage 2 (SPEC §4 Feature 2) — the real prize, and the risky one. Re-read
-   the hazard note there before writing code: **animate the pixel offset used at
-   draw time, never the grid model.**
+1. Live with the current feel; adjust `mouse-scroll-momentum-decay` in config.
+   Only revisit code if the *character* is wrong, not the distance.
+2. Once settled: consider flipping `mouse-scroll-momentum` to default true,
+   and decide whether the debug log stays.
+3. Then Stage 2 (SPEC §4 Feature 2) — the real prize, and the risky one.
+   Re-read the hazard note before writing code: **animate the pixel offset used
+   at draw time, never the grid model.**
 
 ### Known-unknown carried forward
 
 `ecMouseScrollVertical` applies a hardcoded `10.0` multiplier to precision
 scrolls (SPEC §3.4b). The momentum path copies it so the two agree, but nobody
 has checked *why* it is 10, or whether it interacts badly with a
-`mouse-scroll-multiplier` far from 1. If fling speed feels wrong relative to
-dragging, look here first.
+`mouse-scroll-multiplier` far from 1. If fling speed feels wrong *relative to
+dragging*, look here first — that is the one symptom the decay knob will not fix.
