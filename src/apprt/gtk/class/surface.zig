@@ -750,6 +750,13 @@ pub const Surface = extern struct {
         momentum_tick: ?c_uint = null,
         momentum_last_us: i64 = 0,
 
+        /// Frame time at which a fling was paused because the user put their
+        /// fingers back down. Velocity is preserved across the gesture so a
+        /// second flick *stacks* on the first, but it is decayed by however
+        /// long the gesture took, so stacking only rewards a quick follow-up.
+        /// 0 means there is no paused fling.
+        momentum_paused_us: i64 = 0,
+
         overrides: struct {
             command: ?configpkg.Command = null,
             shell_integration: ?configpkg.Config.ShellIntegration = null,
@@ -3083,12 +3090,33 @@ pub const Surface = extern struct {
     /// Stop any in-flight momentum scroll. Safe to call when none is running.
     fn momentumStop(self: *Self) void {
         const priv = self.private();
+        self.momentumCancelTick();
+        priv.momentum_velocity = 0.0;
+        priv.momentum_paused_us = 0;
+    }
+
+    /// Remove the tick but keep the velocity, so it can be stacked onto.
+    fn momentumPause(self: *Self) void {
+        const priv = self.private();
+        if (priv.momentum_tick == null and priv.momentum_velocity == 0.0) return;
+        self.momentumCancelTick();
+        priv.momentum_paused_us = self.momentumNowUs();
+    }
+
+    fn momentumCancelTick(self: *Self) void {
+        const priv = self.private();
         if (priv.momentum_tick) |v| {
             self.as(gtk.Widget).removeTickCallback(v);
             priv.momentum_tick = null;
         }
-        priv.momentum_velocity = 0.0;
         priv.momentum_last_us = 0;
+    }
+
+    /// Monotonic microseconds from the widget's frame clock, or 0 if the
+    /// widget is not realized (in which case residual decay is skipped).
+    fn momentumNowUs(self: *Self) i64 {
+        const clock = self.as(gtk.Widget).getFrameClock() orelse return 0;
+        return clock.getFrameTime();
     }
 
     /// GTK emits ::decelerate when a continuous (touchpad) scroll gesture
@@ -3108,17 +3136,51 @@ pub const Surface = extern struct {
         const enabled = if (priv.config) |c| c.get().@"mouse-scroll-momentum" else false;
         if (!enabled) return;
 
-        self.momentumStop();
+        const tau = self.momentumTau();
+
+        // Stack onto whatever is left of a previous fling, rather than
+        // replacing it. Flicking repeatedly should build speed the way it does
+        // on a phone; before this, a second flick killed the first.
+        //
+        // The residual is decayed by how long the new gesture took, so it is
+        // as if the old fling had kept coasting underneath the finger. A quick
+        // follow-up stacks nearly all of it; a flick seconds later stacks
+        // nothing, which is what makes this safe to do unconditionally.
+        const residual = residual: {
+            if (priv.momentum_velocity == 0.0) break :residual 0.0;
+            const paused_us = priv.momentum_paused_us;
+            const now_us = self.momentumNowUs();
+            if (paused_us == 0 or now_us <= paused_us) break :residual priv.momentum_velocity;
+            const gap: f64 = @as(f64, @floatFromInt(now_us - paused_us)) / std.time.us_per_s;
+            break :residual priv.momentum_velocity * @exp(-gap / tau);
+        };
+
+        self.momentumCancelTick();
+
+        // Same sign convention as vel_y, so opposing flicks cancel naturally.
+        const combined = std.math.clamp(
+            residual + vel_y,
+            -momentum_max_velocity,
+            momentum_max_velocity,
+        );
 
         // Logged because this is the signal the whole feature depends on:
         // if a fling feels wrong, the first question is whether GTK emitted
         // ::decelerate at all and with what velocity. Without this, "nothing
         // happened" is ambiguous between "never fired" and "decayed too fast".
-        log.debug("scroll momentum: decelerate vel_y={d:.1} px/s", .{vel_y});
+        log.debug(
+            "scroll momentum: vel_y={d:.0} residual={d:.0} combined={d:.0} px/s tau={d:.2}s",
+            .{ vel_y, residual, combined, tau },
+        );
 
-        if (@abs(vel_y) < momentum_min_velocity) return;
+        priv.momentum_velocity = combined;
+        priv.momentum_paused_us = 0;
 
-        priv.momentum_velocity = vel_y;
+        if (@abs(combined) < momentum_min_velocity) {
+            priv.momentum_velocity = 0.0;
+            return;
+        }
+
         // 0 means "no baseline yet"; the first tick establishes it.
         priv.momentum_last_us = 0;
         priv.momentum_tick = self.as(gtk.Widget).addTickCallback(
@@ -3128,13 +3190,23 @@ pub const Surface = extern struct {
         );
     }
 
-    /// Below this speed (px/s) a fling is over. Roughly a tenth of a cell per
-    /// second: any slower and it reads as a stuck screen, not motion.
-    const momentum_min_velocity: f64 = 12.0;
+    /// Below this speed (px/s) a fling is over. Slow enough to coast to a
+    /// gentle stop rather than cutting out while still visibly moving.
+    const momentum_min_velocity: f64 = 8.0;
 
-    /// Exponential decay time constant in seconds. Velocity falls by 1/e every
-    /// this many seconds, so a fling lasts on the order of half a second.
-    const momentum_decay_tau: f64 = 0.18;
+    /// Ceiling on stacked velocity (px/s). Without it, repeated flicks compound
+    /// without bound and one more flick sends the viewport into orbit.
+    const momentum_max_velocity: f64 = 30_000.0;
+
+    /// Decay time constant in seconds: velocity falls by 1/e every tau, so a
+    /// fling runs for roughly 4-5x tau before crossing the stop threshold.
+    /// Configurable because "how far a flick should carry" is pure taste and
+    /// nobody should rebuild a terminal to adjust it.
+    fn momentumTau(self: *Self) f64 {
+        const priv = self.private();
+        const config = priv.config orelse return 0.45;
+        return @max(0.01, config.get().@"mouse-scroll-momentum-decay");
+    }
 
     /// Integrate the fling once per frame and feed the resulting pixel delta
     /// through the ordinary scroll path.
@@ -3175,7 +3247,7 @@ pub const Surface = extern struct {
 
         // Distance covered this frame, then decay for the next one.
         const dy = priv.momentum_velocity * dt_clamped;
-        priv.momentum_velocity *= @exp(-dt_clamped / momentum_decay_tau);
+        priv.momentum_velocity *= @exp(-dt_clamped / self.momentumTau());
 
         if (@abs(priv.momentum_velocity) < momentum_min_velocity) {
             self.momentumStop();
@@ -3209,8 +3281,9 @@ pub const Surface = extern struct {
         const priv: *Private = self.private();
         const surface = priv.core_surface orelse return 0;
 
-        // A real scroll always wins over a fling still in flight.
-        self.momentumStop();
+        // A real scroll takes over from a fling in flight, but the fling's
+        // velocity is kept so the next flick stacks onto it.
+        self.momentumPause();
 
         // Multiply precision scrolls by 10 to get a better response from
         // touchpad scrolling
