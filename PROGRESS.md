@@ -19,7 +19,7 @@ they were expensive. Do re-verify them if `git merge-base` has moved.
 |-------|---------|--------|
 | 0 | Toolchain + unmodified build | **DONE, verified** |
 | 1 | Momentum | **WORKS** — verified by hand; tuning open |
-| 2 | Scroll-region animation | 2a done; **2b implemented, NOT visually verified** |
+| 2 | Scroll-region animation | 2a done; 2b implemented + hardened; **needs eyes** |
 | 3 | Pixel viewport scroll | not started |
 
 Commits on this branch: `ff0b00271` (docs), `d312bef5a` (stage 1).
@@ -255,6 +255,63 @@ the compositing work rather than fiddling with the duration.
 
 ---
 
+## Overnight session, 2026-09-01 — hardening while verification was blocked
+
+Visual verification was impossible (no headless display; the GUI harness hangs
+for upstream too), so the night went on work that can be *proven* rather than
+looked at. Four commits, full suite green throughout
+(**3773/3808 pass, 35 skipped, 0 failures**).
+
+**Easing extracted to `src/renderer/scroll_anim.zig`** so it can be tested. It
+was buried in a generic renderer struct, unreachable by any test, despite being
+pure arithmetic. 12 tests pin what could otherwise only be judged by eye: never
+overshoots past zero on a stalled frame, never flips sign, decays
+monotonically, symmetric between directions, ignores zero/negative dt, survives
+a zero duration.
+
+**Five bugs found by reasoning, none of which look obviously broken:**
+
+1. *The gap rendered as `vec4(0.0)`.* With a transparent background — which
+   this machine runs — that is not "nothing", it is **a band of desktop
+   wallpaper showing through mid-scroll**. Now clamps to the region's edge row,
+   so the gap reads as a blank line in the surrounding background.
+2. *Glyphs displaced past the region edge were still drawn*, painting text over
+   rows that are deliberately stationary — tmux's status line. Now pushed
+   outside the clip volume.
+3. *A pending scroll survived a resize or screen switch*, where the recorded
+   rows index a grid that no longer exists — it would slide unrelated content
+   on entry to and exit from tmux or vim. Both discard it now, with tests.
+4. *Displacement replaced instead of accumulating.* If the screen is already
+   drawn a fraction of a row behind and the model scrolls again, it is behind
+   by the **sum**. Replacing pins the display one row behind for the whole of a
+   continuous scroll, then snaps — reads as lag, not motion.
+5. *The animation clock was reset on every incoming scroll*, skipping the
+   integration frame. During continuous scrolling (a momentum fling generates a
+   scroll every frame) the offset would never decay and would wind up to the
+   clamp. Now only reset when starting from idle.
+
+4 and 5 interact: accumulation without the clock fix compounds forever. Neither
+is visible as a distinct symptom — both just make scrolling feel wrong, which
+is exactly why they needed to be reasoned about rather than watched.
+
+**Metal kept compiling.** `generic.zig` publishes `uniforms.scroll_anim` for
+every backend, so the Metal `Uniforms` needed the field or macOS stops
+building. Mirrored in `shaders.metal` too, byte-compatible. Metal shaders do
+not consume it: scroll animation is OpenGL-only.
+
+### Sign convention, re-derived (the most likely remaining bug)
+
+- `insertLines` moves content **down**; the pre-scroll view is one row
+  **higher**, so `rows` is negative and the offset is negative.
+- `deleteLines` moves content **up**; pre-scroll is one row **lower**, offset
+  positive.
+- Screen Y increases downward (`origin_upper_left`), so a negative offset draws
+  content higher. Consistent.
+- The background pass **subtracts** the same offset to find which cell sits
+  under a pixel, matching the text pass.
+
+---
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a
@@ -276,22 +333,43 @@ already been mis-reporting.
 
 ---
 
-## Next action
+## Next action — for the morning
 
-1. Live with the current feel; adjust `mouse-scroll-momentum-decay` in config.
-   Only revisit code if the *character* is wrong, not the distance.
-2. Once settled: consider flipping `mouse-scroll-momentum` to default true,
-   and decide whether the debug log stays.
-3. **Look at stage 2b** (above) and decide whether the trailing-edge artifact
-   justifies the compositing work in SPEC §4 Feature 2.
-4. Open question deferred from 2a: whether to hook `index`
-   (`src/terminal/Terminal.zig`), which would animate *all* output scrolling
-   rather than deliberate scrolls. Decide after living with 2b.
+Everything that can be done without eyes is done. **The open item is looking at
+it.**
+
+```
+scroll-animation = true
+scroll-animation-duration = 120     # exaggerated, easier to judge; 80 is default
+```
+
+Scroll in tmux copy-mode. In order of what would be most informative:
+
+1. **Does tmux's status line stay perfectly still?** If it moves at all, region
+   bounds are being ignored somewhere and that is the bug to chase first.
+2. **Is there a visible band at the trailing edge** during the slide? Expected —
+   the outgoing row is erased and unrecoverable on the alternate screen. It
+   should now look like a *blank line*, not a hole and definitely not
+   wallpaper. If it is ugly, that is the trigger for the compositing work in
+   SPEC §4 Feature 2, not for changing the duration.
+3. **Does a fast momentum fling look smooth or soupy?** Momentum and animation
+   now compose (fling -> mouse reports -> tmux scrolls -> animation), and the
+   accumulation fix is what should keep that coherent. This is the interaction
+   least likely to be right first time.
+4. **Does text ever slide over a stationary background?** That would mean the
+   two shader passes disagree.
+
+Then still open, needing a decision rather than a fix:
+
+- Whether to hook `index` (`src/terminal/Terminal.zig`), which would animate
+  **all** output scrolling rather than deliberate scrolls. Deliberately not
+  done; decide after living with 2b.
+- Whether `mouse-scroll-momentum` and `scroll-animation` should default on.
+- Whether the trailing-edge artifact justifies compositing the previous frame.
 
 ### Known-unknown carried forward
 
 `ecMouseScrollVertical` applies a hardcoded `10.0` multiplier to precision
 scrolls (SPEC §3.4b). The momentum path copies it so the two agree, but nobody
-has checked *why* it is 10, or whether it interacts badly with a
-`mouse-scroll-multiplier` far from 1. If fling speed feels wrong *relative to
-dragging*, look here first — that is the one symptom the decay knob will not fix.
+has checked *why* it is 10. If fling speed feels wrong *relative to dragging*,
+look here first — the decay knob will not fix that.
