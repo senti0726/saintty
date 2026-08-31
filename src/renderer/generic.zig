@@ -1298,6 +1298,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
+                scroll_event: ?terminal.Terminal.ScrollEvent,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1320,6 +1321,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.debug("synchronized output started, skipping render", .{});
                     return;
                 }
+
+                // Drain any region scroll the terminal recorded since the last
+                // frame. Left in place if we bail out above; it coalesces, so a
+                // skipped frame costs accuracy of timing, not of position.
+                const scroll_event = state.terminal.scroll_event;
+                state.terminal.scroll_event = null;
 
                 // If scroll-to-bottom on output is enabled, check if the final line
                 // changed by comparing the bottom-right pin. If the node pointer or
@@ -1452,8 +1459,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
+                    .scroll_event = scroll_event,
                 };
             };
+
+            // Stage 2a of SPEC.md is detection only: prove we see the right
+            // scrolls, with the right row counts and regions, before anything
+            // visual depends on it. `index` is deliberately not yet hooked --
+            // it fires on every newline at the bottom of the screen, and we
+            // want to know what the deliberate-scroll traffic looks like on
+            // its own first.
+            if (critical.scroll_event) |ev| {
+                log.debug(
+                    "scroll event: rows={d} region={d}..{d} source={s}",
+                    .{ ev.rows, ev.top, ev.bottom, @tagName(ev.source) },
+                );
+            }
 
             // Outside the critical area, complete the update we began
             // within it. This must be done before anything reads the

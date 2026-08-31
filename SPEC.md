@@ -238,6 +238,60 @@ Animating the model instead will corrupt the screen. This is how Neovide does
 it, and it is the difference between this working and producing tearing
 garbage.
 
+**The problem neither obvious approach solves: the outgoing row is gone.**
+
+Verified by reading `insertLines` (`src/terminal/Terminal.zig:2951`): it
+operates within `scrolling_region.top/bottom` and the row scrolled out of the
+region is erased/reused immediately. After the call the old content does not
+exist anywhere.
+
+That matters because animating a scroll means showing, for a few frames, the
+arrangement *before* the scroll. Concretely, scrolling up one row and animating
+the new model downward by `cell_height` leaves the top row of the region with
+nothing to draw — a one-row gap for the duration of the animation, N rows for
+an N-row scroll. On the primary screen the missing row is in scrollback and
+could be fetched, but **tmux runs on the alternate screen, which has no
+scrollback**, so for the case we actually care about it is genuinely gone.
+
+Any working implementation must therefore preserve the outgoing rows somehow.
+Two candidates:
+
+- **(a) Stash rows.** The scroll primitives copy outgoing rows into a small
+  ring in shared state; the renderer draws them in the gap. Bounded and
+  explicit, but touches core terminal code on the hot path and needs its own
+  lifetime rules.
+- **(b) Composite the previous frame.** Keep the last frame's texture and,
+  during the animation, draw it shifted by the offset with the current frame
+  shifted by `offset - N*cell_height`, scissored to the region. The old rows
+  come for free because the old frame contains them, and it is region-agnostic
+  apart from the scissor. The renderer already has offscreen render targets for
+  the custom-shader path (`frame.custom_shader_state`,
+  `src/renderer/generic.zig:1707`), so the machinery exists — though today it is
+  only allocated when custom shaders are enabled.
+
+**(b) is the recommendation.** It solves the gap without putting per-row
+copying in the terminal's hot path, and it degrades to "no animation" cleanly.
+
+**Where the pieces attach.**
+
+- Per-row offset in the vertex shader is easy: `cell_text.v.glsl:50` computes
+  `cell_pos = cell_size * vec2(grid_pos)`, so a conditional Y offset for rows
+  inside the margins is a small change. Note the background is a separate pass
+  (`cell_bg.f.glsl`) and must be offset consistently or text will slide over a
+  stationary background.
+- Continuous frames already have a sanctioned mechanism: `animationWake()`
+  (`src/renderer/generic.zig:1039`) returns the soonest wake the renderer needs
+  and is what drives custom-shader animation at `draw_interval_ms`. A running
+  scroll animation is another source of `.draw` wakes; do not invent a timer.
+- Backends: only OpenGL matters here, but `generic.zig` is shared with Metal.
+  Keep changes in the generic layer where possible.
+
+**Sequencing.** Detection first, animation second. The scroll primitives fire
+far more often than one might guess — `index` (`:2316`) runs on *every* newline
+at the bottom of the screen, so animating it naively would animate all terminal
+output, not just deliberate scrolling. Log what fires and how often before
+attaching anything visual to it. That is why Stage 2a below is detection only.
+
 **Design sketch (unproven).** A per-surface `scroll_anim` holding pixel offset,
 target, and start time. Terminal scroll primitives (§3.4) signal the renderer
 that a region scrolled by N rows; renderer initialises offset to `N *

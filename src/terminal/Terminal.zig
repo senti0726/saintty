@@ -66,6 +66,20 @@ height_px: u32 = 0,
 /// The current scrolling region.
 scrolling_region: ScrollingRegion,
 
+/// The most recent region scroll, for the renderer to animate.
+///
+/// Set by the scroll primitives and consumed (and cleared) by the renderer.
+/// Only the accumulated row count matters, so several scrolls landing between
+/// two frames coalesce rather than queueing: an animation can only ever chase
+/// the latest position anyway.
+///
+/// This is deliberately *not* a queue. Writes land during an animation --
+/// tmux emits the newly exposed row and its status bar in the same burst as
+/// the scroll -- so the model must always be current and the animation must
+/// only ever chase it.
+scroll_event: ?ScrollEvent = null,
+
+
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
 
@@ -171,6 +185,54 @@ pub const Colors = struct {
 /// Unsupported dynamic and special colors return null. The cursor color
 /// follows xterm-style reporting and falls back to the foreground color when
 /// no explicit cursor color is set.
+pub const ScrollEvent = struct {
+    /// Rows scrolled. Positive means content moved up (new content appears at
+    /// the bottom), matching the sense of `scrollUp`.
+    rows: isize = 0,
+
+    /// The scrolling region the scroll applied to, inclusive. Rows outside it
+    /// do not move -- tmux keeps its status line outside the margins
+    /// precisely so it stays put -- so an animation that ignores this would
+    /// visibly jiggle the status bar.
+    top: usize = 0,
+    bottom: usize = 0,
+
+    /// Which primitive produced this. `index` fires on every newline at the
+    /// bottom of the screen, so it is by far the most common and is the one
+    /// most likely to need separate treatment from deliberate scrolling.
+    source: Source = .index,
+
+    /// Note there is no `scroll_down`: SD and RI are implemented on top of
+    /// `insertLines`, so downward scrolls all arrive tagged `insert_lines`.
+    /// `scrollUp` does have its own implementation and so is distinguishable.
+    pub const Source = enum { index, scroll_up, insert_lines, delete_lines };
+};
+
+/// Record a region scroll for the renderer. Coalesces with any event not yet
+/// consumed, provided the region matches; a region change means the previous
+/// event describes a layout that no longer exists, so it is replaced.
+pub fn noteScroll(
+    self: *Terminal,
+    rows: isize,
+    top: usize,
+    source: ScrollEvent.Source,
+) void {
+    const bottom = self.scrolling_region.bottom;
+    if (self.scroll_event) |*ev| {
+        if (ev.top == top and ev.bottom == bottom) {
+            ev.rows += rows;
+            ev.source = source;
+            return;
+        }
+    }
+    self.scroll_event = .{
+        .rows = rows,
+        .top = top,
+        .bottom = bottom,
+        .source = source,
+    };
+}
+
 pub fn colorForXterm(self: *const Terminal, target: osc.color.Target) ?color.RGB {
     return switch (target) {
         .palette => |i| self.colors.palette.current[i],
@@ -2617,6 +2679,11 @@ pub fn setLeftAndRightMargin(self: *Terminal, left_req: usize, right_req: usize)
 
 /// Scroll the text down by one row.
 pub fn scrollDown(self: *Terminal, count: usize) void {
+    // No noteScroll here on purpose: this delegates to insertLines below,
+    // which records the scroll itself. Recording in both places double-counted
+    // the rows -- SD 2 reported 4. It moves the cursor to the region top
+    // first, so the region insertLines records is the right one.
+
     // Preserve our x/y to restore.
     const old_x = self.screens.active.cursor.x;
     const old_y = self.screens.active.cursor.y;
@@ -2657,6 +2724,8 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
 ///
 /// Does not change the (absolute) cursor position.
 pub fn scrollUp(self: *Terminal, count: usize) !void {
+    self.noteScroll(@intCast(count), self.scrolling_region.top, .scroll_up);
+
     // Preserve our x/y to restore.
     const old_x = self.screens.active.cursor.x;
     const old_y = self.screens.active.cursor.y;
@@ -2983,6 +3052,10 @@ pub fn insertLines(self: *Terminal, count: usize) void {
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
 
+    // Content moves down by adjusted_count, spanning the cursor row to the
+    // bottom margin -- not the region top, which is why start_y is passed.
+    self.noteScroll(-@as(isize, @intCast(adjusted_count)), start_y, .insert_lines);
+
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
     var cur_p = self.screens.active.pages.trackPin(
@@ -3155,6 +3228,10 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
     // We can only insert lines up to our remaining lines in the scroll
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
+
+    // Content moves up by adjusted_count, spanning the cursor row to the
+    // bottom margin -- not the region top, which is why start_y is passed.
+    self.noteScroll(@intCast(adjusted_count), start_y, .delete_lines);
 
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
