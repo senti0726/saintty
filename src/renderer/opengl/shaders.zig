@@ -191,6 +191,16 @@ pub const Uniforms = extern struct {
     /// Various booleans, in a packed struct for space efficiency.
     bools: Bools align(4),
 
+    /// Scroll animation, as {offset_px, top_row, bottom_row, unused}.
+    ///
+    /// `offset_px` is added to the Y position of cells whose row is within
+    /// [top_row, bottom_row], so a scroll can be shown part-way through. Zero
+    /// means no animation is running and the shaders take their normal path.
+    ///
+    /// Rows are floats only so this packs as one vec4 under std140; they are
+    /// whole numbers.
+    scroll_anim: [4]f32 align(16),
+
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,

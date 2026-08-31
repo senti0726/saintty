@@ -160,6 +160,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
+        /// In-flight scroll animation, if any. Seeded when the terminal
+        /// reports a region scroll and eased to zero over the following
+        /// frames. See SPEC.md stage 2.
+        scroll_anim: ScrollAnim = .{},
+
         /// Custom shader uniform values.
         custom_shader_uniforms: shadertoy.Uniforms,
 
@@ -559,6 +564,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background: terminal.color.RGB,
             background_opacity: f64,
             background_opacity_cells: bool,
+            scroll_animation: bool,
+            scroll_animation_duration_ms: u32,
             foreground: terminal.color.RGB,
             selection_background: ?configpkg.Config.TerminalColor,
             selection_foreground: ?configpkg.Config.TerminalColor,
@@ -636,6 +643,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .faint_opacity = @intFromFloat(@ceil(config.@"faint-opacity" * 255)),
 
                     .min_contrast = @floatCast(config.@"minimum-contrast"),
+
+                    .scroll_animation = config.@"scroll-animation",
+                    .scroll_animation_duration_ms = config.@"scroll-animation-duration",
                     .padding_color = config.@"window-padding-color",
 
                     .selection_background = config.@"selection-background",
@@ -726,6 +736,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cell_size = undefined,
                     .grid_size = undefined,
                     .grid_padding = undefined,
+                    .scroll_anim = .{ 0, 0, 0, 0 },
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
@@ -1013,6 +1024,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// A point in the future when the renderer needs to be driven
         /// again to keep animating, and what kind of drive it needs.
+        pub const ScrollAnim = struct {
+            /// Pixels the animated rows are currently displaced by. Decays to
+            /// zero, at which point the animation is over.
+            offset_px: f32 = 0,
+
+            /// Inclusive row range the offset applies to. Rows outside it do
+            /// not move: tmux keeps its status line outside the scrolling
+            /// margins precisely so it stays put.
+            top: f32 = 0,
+            bottom: f32 = 0,
+
+            /// When the animation was last advanced, so the decay is
+            /// time-based rather than frame-count-based and does not change
+            /// character with the refresh rate.
+            last: ?std.Io.Timestamp = null,
+
+            pub fn active(self: ScrollAnim) bool {
+                return self.offset_px != 0;
+            }
+        };
+
         pub const AnimationWake = struct {
             /// Delay in milliseconds until the wake is due.
             delay_ms: u64,
@@ -1074,7 +1106,57 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (shader_delay) |s| return .{ .delay_ms = s, .kind = .draw };
 
+            // A scroll animation needs draw-only wakes until it settles. This
+            // rides the existing mechanism rather than adding a timer, so it
+            // composes with the shader and Kitty sources above for free.
+            if (self.scroll_anim.active()) {
+                return .{ .delay_ms = draw_interval_ms, .kind = .draw };
+            }
+
             return null;
+        }
+
+        /// Ease an in-flight scroll animation toward zero.
+        ///
+        /// Linear over the configured duration rather than exponential: a
+        /// scroll has a definite end, and an exponential tail would leave a
+        /// fraction of a row hanging around looking like a misaligned grid.
+        ///
+        /// Must be called on the render thread.
+        fn advanceScrollAnim(self: *Self) void {
+            if (!self.scroll_anim.active()) return;
+
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const last = self.scroll_anim.last orelse {
+                // First frame of this animation: nothing to integrate yet.
+                self.scroll_anim.last = now;
+                return;
+            };
+            self.scroll_anim.last = now;
+
+            const duration: f32 = @floatFromInt(@max(1, self.config.scroll_animation_duration_ms));
+            const dt: f32 = @floatFromInt(@divTrunc(
+                last.durationTo(now).nanoseconds,
+                std.time.ns_per_ms,
+            ));
+
+            // Retire the full displacement over the duration, so the rate is
+            // proportional to how far this scroll had to travel and a big jump
+            // does not crawl.
+            const step = (dt / duration) * @abs(self.scroll_anim.offset_px);
+            if (@abs(self.scroll_anim.offset_px) <= step) {
+                self.scroll_anim.offset_px = 0;
+                self.scroll_anim.last = null;
+                return;
+            }
+            self.scroll_anim.offset_px -= std.math.sign(self.scroll_anim.offset_px) * step;
+
+            // Below a fraction of a pixel there is nothing left to show, and
+            // holding a sub-pixel offset would keep requesting frames forever.
+            if (@abs(self.scroll_anim.offset_px) < 0.5) {
+                self.scroll_anim.offset_px = 0;
+                self.scroll_anim.last = null;
+            }
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1469,11 +1551,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // it fires on every newline at the bottom of the screen, and we
             // want to know what the deliberate-scroll traffic looks like on
             // its own first.
-            if (critical.scroll_event) |ev| {
+            if (critical.scroll_event) |ev| scroll: {
                 log.debug(
                     "scroll event: rows={d} region={d}..{d} source={s}",
                     .{ ev.rows, ev.top, ev.bottom, @tagName(ev.source) },
                 );
+
+                if (!self.config.scroll_animation) break :scroll;
+                if (ev.rows == 0) break :scroll;
+
+                // Displace by exactly the distance just scrolled, so the first
+                // animated frame reproduces the pre-scroll screen, and ease to
+                // zero from there. The model is already current -- writes land
+                // during the animation and must not be delayed (SPEC stage 2)
+                // -- so this only ever moves what is drawn.
+                const cell_h: f32 = @floatFromInt(self.size.cell.height);
+                const rows: f32 = @floatFromInt(ev.rows);
+                const offset = rows * cell_h;
+
+                // A scroll arriving mid-animation supersedes it rather than
+                // queueing: the animation can only chase the latest position.
+                // Clamp so a burst cannot displace more than one screen, which
+                // would just look like a flash of unrelated content.
+                const limit = cell_h * @as(f32, @floatFromInt(self.size.grid().rows));
+                self.scroll_anim = .{
+                    .offset_px = std.math.clamp(offset, -limit, limit),
+                    .top = @floatFromInt(ev.top),
+                    .bottom = @floatFromInt(ev.bottom),
+                    .last = null,
+                };
             }
 
             // Outside the critical area, complete the update we began
@@ -1774,6 +1880,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try self.updateCustomShaderUniformsForFrame();
 
             // Setup our frame data
+            // Advance any scroll animation and publish it to the shaders.
+            // Done here, immediately before upload, so the value drawn is the
+            // value computed for this frame.
+            self.advanceScrollAnim();
+            self.uniforms.scroll_anim = .{
+                self.scroll_anim.offset_px,
+                self.scroll_anim.top,
+                self.scroll_anim.bottom,
+                0,
+            };
+
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
             const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);

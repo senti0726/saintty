@@ -13,6 +13,20 @@ layout(binding = 1, std430) readonly buffer bg_cells {
 vec4 cell_bg() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
     ivec2 grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+
+    // Scroll animation: the text pass shifts cells inside the region, so the
+    // background must sample the same shifted cell or text slides over a
+    // stationary background. Undo the shift to find which cell is under this
+    // pixel. Rows that shift out of the region are the gap left behind by the
+    // scroll and draw as nothing.
+    if (scroll_anim.x != 0.0 &&
+        float(grid_pos.y) >= scroll_anim.y &&
+        float(grid_pos.y) <= scroll_anim.z) {
+        float shifted = (gl_FragCoord.y - grid_padding.x - scroll_anim.x) / cell_size.y;
+        int gy = int(floor(shifted));
+        if (float(gy) < scroll_anim.y || float(gy) > scroll_anim.z) return vec4(0.0);
+        grid_pos.y = gy;
+    }
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
     vec4 bg = vec4(0.0);

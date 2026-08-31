@@ -1032,6 +1032,28 @@ palette: Palette = .{},
 /// so raising this also makes repeated flicks build speed more readily.
 @"mouse-scroll-momentum-decay": f64 = 0.45,
 
+/// Animate scrolling that an application performs, rather than snapping.
+///
+/// When a program scrolls part of the screen -- tmux moving a pane in
+/// copy-mode, a pager, an editor -- the affected rows slide into place over a
+/// few frames instead of jumping. Only the rows the application actually
+/// scrolled move; anything outside the scrolling region, such as tmux's status
+/// line, stays put.
+///
+/// This trades a few milliseconds of latency for continuity: the content is
+/// shown arriving rather than already arrived. The duration is
+/// `scroll-animation-duration`.
+///
+/// Experimental. Currently only implemented on the OpenGL renderer.
+@"scroll-animation": bool = false,
+
+/// How long an application scroll takes to settle, in milliseconds.
+///
+/// Longer is smoother but delays the content further; past roughly 150ms it
+/// starts to feel like lag rather than motion. Has no effect unless
+/// `scroll-animation` is enabled.
+@"scroll-animation-duration": u32 = 80,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.

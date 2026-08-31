@@ -49,6 +49,16 @@ void main() {
     // Convert the grid x, y into world space x, y by accounting for cell size
     vec2 cell_pos = cell_size * vec2(grid_pos);
 
+    // Scroll animation: rows inside the animated region are drawn offset from
+    // where they now live in the model, so a scroll can be shown part-way
+    // through. Rows outside the region -- tmux's status line, for one -- must
+    // not move, which is why this is bounded rather than a whole-grid shift.
+    if (scroll_anim.x != 0.0 &&
+        float(grid_pos.y) >= scroll_anim.y &&
+        float(grid_pos.y) <= scroll_anim.z) {
+        cell_pos.y += scroll_anim.x;
+    }
+
     int vid = gl_VertexID;
 
     // We use a triangle strip with 4 vertices to render quads,

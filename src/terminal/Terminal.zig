@@ -79,6 +79,9 @@ scrolling_region: ScrollingRegion,
 /// only ever chase it.
 scroll_event: ?ScrollEvent = null,
 
+/// Set while SU/SD/RI delegate to insertLines/deleteLines, so the scroll is
+/// recorded once by the wrapper rather than twice. See noteScroll.
+scroll_note_suppress: bool = false,
 
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
@@ -202,10 +205,7 @@ pub const ScrollEvent = struct {
     /// most likely to need separate treatment from deliberate scrolling.
     source: Source = .index,
 
-    /// Note there is no `scroll_down`: SD and RI are implemented on top of
-    /// `insertLines`, so downward scrolls all arrive tagged `insert_lines`.
-    /// `scrollUp` does have its own implementation and so is distinguishable.
-    pub const Source = enum { index, scroll_up, insert_lines, delete_lines };
+    pub const Source = enum { index, scroll_up, scroll_down, insert_lines, delete_lines };
 };
 
 /// Record a region scroll for the renderer. Coalesces with any event not yet
@@ -217,6 +217,12 @@ pub fn noteScroll(
     top: usize,
     source: ScrollEvent.Source,
 ) void {
+    // SU/SD/RI are implemented on top of insertLines/deleteLines, but only
+    // on some paths -- scrollUp has a fast path for a full-screen region that
+    // does not delegate at all. Hooking only the primitives therefore misses
+    // full-screen SU; hooking both double-counts the margin case. The wrapper
+    // records, and suppresses whatever it delegates to.
+    if (self.scroll_note_suppress) return;
     const bottom = self.scrolling_region.bottom;
     if (self.scroll_event) |*ev| {
         if (ev.top == top and ev.bottom == bottom) {
@@ -2679,10 +2685,9 @@ pub fn setLeftAndRightMargin(self: *Terminal, left_req: usize, right_req: usize)
 
 /// Scroll the text down by one row.
 pub fn scrollDown(self: *Terminal, count: usize) void {
-    // No noteScroll here on purpose: this delegates to insertLines below,
-    // which records the scroll itself. Recording in both places double-counted
-    // the rows -- SD 2 reported 4. It moves the cursor to the region top
-    // first, so the region insertLines records is the right one.
+    self.noteScroll(-@as(isize, @intCast(count)), self.scrolling_region.top, .scroll_down);
+    self.scroll_note_suppress = true;
+    defer self.scroll_note_suppress = false;
 
     // Preserve our x/y to restore.
     const old_x = self.screens.active.cursor.x;
@@ -2725,6 +2730,8 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
 /// Does not change the (absolute) cursor position.
 pub fn scrollUp(self: *Terminal, count: usize) !void {
     self.noteScroll(@intCast(count), self.scrolling_region.top, .scroll_up);
+    self.scroll_note_suppress = true;
+    defer self.scroll_note_suppress = false;
 
     // Preserve our x/y to restore.
     const old_x = self.screens.active.cursor.x;
@@ -4403,6 +4410,91 @@ test "Terminal setScrollback only affects primary screen" {
     );
     try testing.expect(alternate.no_scrollback);
     try testing.expectEqual(alternate, t.screens.active);
+}
+
+test "Terminal: noteScroll records rows and region" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(3, 8);
+    try t.scrollUp(2);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 2), ev.rows);
+    try testing.expectEqual(@as(usize, 2), ev.top);
+    try testing.expectEqual(@as(usize, 7), ev.bottom);
+    try testing.expectEqual(Terminal.ScrollEvent.Source.scroll_up, ev.source);
+}
+
+test "Terminal: noteScroll coalesces within a region" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    // Several scrolls between two frames accumulate rather than queue: an
+    // animation can only chase the latest position.
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    t.insertLines(2);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, -3), ev.rows);
+}
+
+test "Terminal: noteScroll opposing scrolls cancel" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    try t.scrollUp(2);
+    // scrollDown delegates to insertLines, which records -2 over the same
+    // region, so the pair nets to zero rather than double-counting.
+    t.scrollDown(2);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 0), ev.rows);
+}
+
+test "Terminal: noteScroll region change replaces rather than accumulates" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    try t.scrollUp(3);
+    // A different region means the pending event describes a layout that no
+    // longer exists, so it must be dropped, not added to.
+    t.setTopAndBottomMargin(2, 6);
+    try t.scrollUp(1);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 1), ev.rows);
+    try testing.expectEqual(@as(usize, 1), ev.top);
+    try testing.expectEqual(@as(usize, 5), ev.bottom);
+}
+
+test "Terminal: insertLines records from the cursor row, not the region top" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(2, 9);
+    t.setCursorPos(5, 1);
+    t.insertLines(1);
+
+    const ev = t.scroll_event.?;
+    // Content moves down, so rows is negative.
+    try testing.expectEqual(@as(isize, -1), ev.rows);
+    // Cursor row (0-indexed 4), NOT the region top of 1.
+    try testing.expectEqual(@as(usize, 4), ev.top);
+}
+
+test "Terminal: deleteLines clamps the recorded count to the region" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(1, 5);
+    t.setCursorPos(4, 1);
+    // Ask for far more than fits: rows 4..5 leaves 2.
+    t.deleteLines(50);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 2), ev.rows);
 }
 
 test "Terminal: resize resets synchronized output" {
