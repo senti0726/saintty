@@ -22,6 +22,7 @@ const Overlay = @import("Overlay.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
+const ScrollAnim = @import("scroll_anim.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -164,6 +165,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reports a region scroll and eased to zero over the following
         /// frames. See SPEC.md stage 2.
         scroll_anim: ScrollAnim = .{},
+
+        /// When the scroll animation was last advanced.
+        scroll_anim_last: ?std.Io.Timestamp = null,
 
         /// Custom shader uniform values.
         custom_shader_uniforms: shadertoy.Uniforms,
@@ -1024,27 +1028,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// A point in the future when the renderer needs to be driven
         /// again to keep animating, and what kind of drive it needs.
-        pub const ScrollAnim = struct {
-            /// Pixels the animated rows are currently displaced by. Decays to
-            /// zero, at which point the animation is over.
-            offset_px: f32 = 0,
-
-            /// Inclusive row range the offset applies to. Rows outside it do
-            /// not move: tmux keeps its status line outside the scrolling
-            /// margins precisely so it stays put.
-            top: f32 = 0,
-            bottom: f32 = 0,
-
-            /// When the animation was last advanced, so the decay is
-            /// time-based rather than frame-count-based and does not change
-            /// character with the refresh rate.
-            last: ?std.Io.Timestamp = null,
-
-            pub fn active(self: ScrollAnim) bool {
-                return self.offset_px != 0;
-            }
-        };
-
         pub const AnimationWake = struct {
             /// Delay in milliseconds until the wake is due.
             delay_ms: u64,
@@ -1116,47 +1099,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return null;
         }
 
-        /// Ease an in-flight scroll animation toward zero.
-        ///
-        /// Linear over the configured duration rather than exponential: a
-        /// scroll has a definite end, and an exponential tail would leave a
-        /// fraction of a row hanging around looking like a misaligned grid.
+        /// Advance any in-flight scroll animation. The easing itself lives in
+        /// scroll_anim.zig so it can be unit tested; this only supplies the
+        /// clock.
         ///
         /// Must be called on the render thread.
         fn advanceScrollAnim(self: *Self) void {
             if (!self.scroll_anim.active()) return;
 
             const now: std.Io.Timestamp = .now(global.io(), .awake);
-            const last = self.scroll_anim.last orelse {
-                // First frame of this animation: nothing to integrate yet.
-                self.scroll_anim.last = now;
+            const last = self.scroll_anim_last orelse {
+                // First frame of this animation: no interval to integrate yet.
+                self.scroll_anim_last = now;
                 return;
             };
-            self.scroll_anim.last = now;
+            self.scroll_anim_last = now;
 
-            const duration: f32 = @floatFromInt(@max(1, self.config.scroll_animation_duration_ms));
-            const dt: f32 = @floatFromInt(@divTrunc(
+            const dt_ms: f32 = @floatFromInt(@divTrunc(
                 last.durationTo(now).nanoseconds,
                 std.time.ns_per_ms,
             ));
-
-            // Retire the full displacement over the duration, so the rate is
-            // proportional to how far this scroll had to travel and a big jump
-            // does not crawl.
-            const step = (dt / duration) * @abs(self.scroll_anim.offset_px);
-            if (@abs(self.scroll_anim.offset_px) <= step) {
-                self.scroll_anim.offset_px = 0;
-                self.scroll_anim.last = null;
-                return;
-            }
-            self.scroll_anim.offset_px -= std.math.sign(self.scroll_anim.offset_px) * step;
-
-            // Below a fraction of a pixel there is nothing left to show, and
-            // holding a sub-pixel offset would keep requesting frames forever.
-            if (@abs(self.scroll_anim.offset_px) < 0.5) {
-                self.scroll_anim.offset_px = 0;
-                self.scroll_anim.last = null;
-            }
+            self.scroll_anim.advance(
+                dt_ms,
+                @floatFromInt(self.config.scroll_animation_duration_ms),
+            );
+            if (!self.scroll_anim.active()) self.scroll_anim_last = null;
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1574,12 +1541,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Clamp so a burst cannot displace more than one screen, which
                 // would just look like a flash of unrelated content.
                 const limit = cell_h * @as(f32, @floatFromInt(self.size.grid().rows));
-                self.scroll_anim = .{
-                    .offset_px = std.math.clamp(offset, -limit, limit),
-                    .top = @floatFromInt(ev.top),
-                    .bottom = @floatFromInt(ev.bottom),
-                    .last = null,
-                };
+                self.scroll_anim.start(
+                    std.math.clamp(offset, -limit, limit),
+                    @floatFromInt(ev.top),
+                    @floatFromInt(ev.bottom),
+                );
+                self.scroll_anim_last = null;
             }
 
             // Outside the critical area, complete the update we began

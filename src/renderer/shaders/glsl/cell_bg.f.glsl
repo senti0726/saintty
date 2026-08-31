@@ -24,8 +24,13 @@ vec4 cell_bg() {
         float(grid_pos.y) <= scroll_anim.z) {
         float shifted = (gl_FragCoord.y - grid_padding.x - scroll_anim.x) / cell_size.y;
         int gy = int(floor(shifted));
-        if (float(gy) < scroll_anim.y || float(gy) > scroll_anim.z) return vec4(0.0);
-        grid_pos.y = gy;
+        // Rows displaced past the edge of the region are the gap the scroll
+        // left behind. Clamp to the edge row's background rather than
+        // returning nothing: with a transparent background, "nothing" is a
+        // band of desktop showing through mid-scroll. Clamping renders the
+        // gap as a blank line in the surrounding background, which is what a
+        // scroll should look like anyway.
+        grid_pos.y = clamp(gy, int(scroll_anim.y), int(scroll_anim.z));
     }
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 

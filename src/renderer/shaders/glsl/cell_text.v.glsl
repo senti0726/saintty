@@ -53,10 +53,20 @@ void main() {
     // where they now live in the model, so a scroll can be shown part-way
     // through. Rows outside the region -- tmux's status line, for one -- must
     // not move, which is why this is bounded rather than a whole-grid shift.
+    bool scroll_clipped = false;
     if (scroll_anim.x != 0.0 &&
         float(grid_pos.y) >= scroll_anim.y &&
         float(grid_pos.y) <= scroll_anim.z) {
         cell_pos.y += scroll_anim.x;
+
+        // A row displaced past the edge of the region must not be drawn: it
+        // would land on rows that are deliberately stationary, painting
+        // glyphs over tmux's status line. The background pass leaves a blank
+        // line there instead.
+        float displaced = float(grid_pos.y) + scroll_anim.x / cell_size.y;
+        if (displaced < scroll_anim.y - 0.999 || displaced > scroll_anim.z + 0.999) {
+            scroll_clipped = true;
+        }
     }
 
     int vid = gl_VertexID;
@@ -116,6 +126,10 @@ void main() {
     // and glyph offset to create the correct bounding box for the glyph.
     cell_pos = cell_pos + size * corner + offset;
     gl_Position = projection_matrix * vec4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
+
+    // Push a scroll-clipped glyph outside the clip volume so it is discarded
+    // before rasterization, rather than drawing over a stationary row.
+    if (scroll_clipped) gl_Position = vec4(-2.0, -2.0, -2.0, 1.0);
 
     // Calculate the texture coordinate in pixels. This is NOT normalized
     // (between 0.0 and 1.0), and does not need to be, since the texture will

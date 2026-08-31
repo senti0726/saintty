@@ -4117,6 +4117,10 @@ pub fn resize(
     // Validate before changing any terminal state.
     if (opts.cols == 0 or opts.rows == 0) return error.InvalidValue;
 
+    // A pending scroll records row indices into the grid that is about to be
+    // replaced, so it cannot be animated meaningfully afterwards.
+    self.scroll_event = null;
+
     // Pixel geometry and synchronized output are updated on every valid
     // resize attempt, including one that doesn't change the grid dimensions.
     // Save their old values so later allocation failures can roll them back.
@@ -4410,6 +4414,33 @@ test "Terminal setScrollback only affects primary screen" {
     );
     try testing.expect(alternate.no_scrollback);
     try testing.expectEqual(alternate, t.screens.active);
+}
+
+test "Terminal: resize discards a pending scroll" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    try testing.expect(t.scroll_event != null);
+
+    // The recorded rows index a grid that no longer exists after this.
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 20 });
+    try testing.expect(t.scroll_event == null);
+}
+
+test "Terminal: switching screens discards a pending scroll" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    try testing.expect(t.scroll_event != null);
+
+    // Entering the alternate screen replaces the grid wholesale; animating the
+    // old scroll would slide unrelated content on entry to tmux or vim.
+    _ = try t.switchScreen(.alternate);
+    try testing.expect(t.scroll_event == null);
 }
 
 test "Terminal: noteScroll records rows and region" {
@@ -4949,6 +4980,12 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
 
     // Mark our terminal as dirty to redraw the grid.
     self.flags.dirty.clear = true;
+
+    // Switching screens replaces the whole grid, so a scroll recorded against
+    // the old one describes content that is no longer displayed. Animating it
+    // would slide unrelated rows on entry to and exit from tmux, vim, and
+    // anything else that uses the alternate screen.
+    self.scroll_event = null;
 
     // Finalize the switch
     self.screens.switchTo(key);
