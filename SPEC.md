@@ -141,6 +141,30 @@ The functions that receive what §3.3 measured:
 - `index` — **`:2316`**  ← `IND` / `ESC D`
 - `setTopAndBottomMargin` — **`:2594`**  ← `DECSTBM`, `CSI r`
 
+### 3.4b GTK hands us the fling velocity — we do not have to estimate it
+
+`src/apprt/gtk/ui/1.2/surface.blp` declares the vertical
+`EventControllerScroll`, and `scroll-begin` / `scroll-end` are already wired to
+`ecMouseScrollVerticalPrecision{Begin,End}` (`src/apprt/gtk/class/surface.zig:3049`,
+`:3056`) to track `precision_scroll`.
+
+`GtkEventControllerScrollFlags` has `GTK_EVENT_CONTROLLER_SCROLL_KINETIC`
+(`= 1 << 3`, verified in `/usr/include/gtk-4.0/gtk/gtkeventcontrollerscroll.h:66`):
+*"Emit ::decelerate after continuous scroll finishes."* Adding `kinetic` to the
+controller's flags gives a `decelerate(vel_x, vel_y)` signal carrying the
+gesture's exit velocity in px/s, measured by GTK.
+
+**This supersedes an earlier assumption in this document** that Wayland gives no
+"fingers lifted" event and that momentum would need gap-detection plus a
+home-grown EWMA velocity estimate. It does, via GTK, and using it means the
+fling matches the feel of every other app on the desktop instead of being
+invented here.
+
+Also note `src/apprt/gtk/class/surface.zig:3074`: precision scrolls are
+multiplied by a hardcoded `10.0` in the GTK layer before reaching
+`scrollCallback`, on top of `mouse-scroll-multiplier`. Synthesised momentum
+events must apply the same factor or they will be 10x too slow.
+
 ### 3.5 Renderer and timing anchors
 
 - `projection_matrix` — **`src/renderer/generic.zig:2160`** (`math.ortho2d`)
@@ -172,12 +196,9 @@ logic. Cheapest real win.
 **Design.**
 - New state on `Surface`, beside the existing `mouse.pending_scroll_*`:
   current velocity (px/s), last-event timestamp, tick-callback id.
-- On each precision scroll event, update a velocity estimate (EWMA over recent
-  deltas — resistant to a single jittery frame).
-- Wayland/libinput does **not** deliver kinetic/momentum phases for touchpads
-  the way macOS does, so the fling must be *synthesised*. There is no "fingers
-  lifted" event to rely on; detect end-of-gesture by a gap in events.
-- On gesture end, start a frame-clock tick (§3.5). Each frame: decay velocity
+- Velocity comes from GTK's `decelerate` signal (§3.4b) — no estimation, no
+  gap-detection. Enable it with the `kinetic` controller flag.
+- On that signal, start a frame-clock tick (§3.5). Each frame: decay velocity
   by a time-constant, convert elapsed velocity into a pixel delta, feed it
   through the *same* accumulator path as a real precision event so all three
   dispatch branches keep working unchanged. Stop below threshold.
@@ -187,10 +208,12 @@ logic. Cheapest real win.
 Scrolling still tracks the finger 1:1 during contact. `mouse-scroll-multiplier`
 still behaves. No runaway scroll when the surface loses focus or closes.
 
-**Risks.** Feeding synthesised events into `mouseReport` means writing to the
-pty from a timer — check thread/lock discipline against `renderer_state.mutex`
-usage already in `scrollCallback`. Must not fire after surface teardown
-(mirror the `removeTickCallback` in `imgui_widget.zig:258`).
+**Threading — settled.** Frame-clock ticks run on the GTK main thread, exactly
+like the input events in `ecMouseScrollVertical`. Calling `scrollCallback` from
+a tick is therefore no different from calling it from a real scroll event, and
+momentum needs no locking of its own. The remaining hazard is lifetime, not
+concurrency: the tick dereferences `core_surface` every frame, so it must be
+removed in `dispose()` (mirroring `imgui_widget.zig:258`).
 
 **Config.** `mouse-scroll-momentum = true|false` (default false while
 experimental) and a decay constant. Follow upstream config conventions in

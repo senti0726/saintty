@@ -18,12 +18,11 @@ they were expensive. Do re-verify them if `git merge-base` has moved.
 | Stage | Feature | Status |
 |-------|---------|--------|
 | 0 | Toolchain + unmodified build | **DONE, verified** |
-| 1 | Momentum | **NOT STARTED** ← next |
+| 1 | Momentum | **IMPLEMENTED, UNVERIFIED** ← needs a touchpad test |
 | 2 | Scroll-region animation | not started |
 | 3 | Pixel viewport scroll | not started |
 
-Nothing in `src/` has been modified yet. The only files this branch adds are
-`SPEC.md` and `PROGRESS.md`. `git diff main --stat` should show exactly that.
+Commits on this branch: `ff0b00271` (docs), `d312bef5a` (stage 1).
 
 ### Stage 0 — done 2026-08-31
 
@@ -131,21 +130,65 @@ done.
 
 ---
 
+## Stage 1 — implemented 2026-08-31, NOT yet verified
+
+Builds clean, runs, registers `mouse-scroll-momentum = false`. **The gesture
+itself has not been tested — that needs a hand on the touchpad.** Do not mark
+this done until someone has actually flung a pane.
+
+Files touched: `src/apprt/gtk/ui/1.2/surface.blp` (kinetic flag + decelerate
+handler), `src/apprt/gtk/class/surface.zig` (fling state, callbacks, dispose),
+`src/config/Config.zig` (the option).
+
+### The test
+
+```bash
+cd ~/dev/ghostty
+./zig-out/bin/ghostty -e 'tmux new -A -s flingtest'
+```
+
+In that new window: `--mouse-scroll-momentum` is off by default, so first
+confirm the build behaves like upstream, then relaunch with
+
+```bash
+./zig-out/bin/ghostty --mouse-scroll-momentum=true
+```
+
+Fill a pane with output (`seq 1 5000`), scroll up into copy-mode, and flick.
+
+**Reading the result.** The `decelerate` handler logs at debug level:
+
+```
+scroll momentum: decelerate vel_y=<N> px/s
+```
+
+- **Log line appears, screen keeps moving** → working; tune
+  `momentum_decay_tau` (0.18 s) and `momentum_min_velocity` (12 px/s) to taste.
+- **Log line appears, screen does not move** → the fling runs but the delta is
+  being swallowed. Suspect the `10.0` precision multiplier (SPEC §3.4b) or the
+  accumulator threshold in `scrollCallback`.
+- **No log line at all** → GTK is not emitting `decelerate`. Check the
+  `kinetic` flag survived into the compiled blueprint, and whether the
+  compositor delivers a kinetic phase for this touchpad.
+
+Run with `GHOSTTY_LOG=debug` or check stderr of the launching terminal.
+
+---
+
 ## Next action
 
-**Stage 1, Momentum.** SPEC §4 Feature 1 has the design and acceptance
-criteria. Concretely, the first three things to do:
+1. **Run the test above.** Everything else is blocked on it.
+2. If it works: tune the two constants, then turn the debug log into something
+   permanent or remove it, and flip the default only once it has been lived
+   with for a while.
+3. Then Stage 2 (SPEC §4 Feature 2) — the real prize, and the risky one. Re-read
+   the hazard note there before writing code: **animate the pixel offset used at
+   draw time, never the grid model.**
 
-1. Read `scrollCallback` (`src/Surface.zig:3456`) end to end, including all
-   three dispatch branches (SPEC §3.2). Understand the `pending_scroll_y`
-   accumulator before adding a second source of deltas into it.
-2. Read the tick-callback pattern at `src/apprt/gtk/class/imgui_widget.zig:244`
-   and its teardown at `:258`. That is the timer to copy.
-3. Decide where velocity state lives — most likely beside
-   `pending_scroll_x/y` at `src/Surface.zig:243`.
+### Known-unknown carried forward
 
-Open question to settle early: synthesised momentum events must reach the same
-accumulator path so all three dispatch branches keep working, but
-`scrollCallback` takes the `renderer_state.mutex` and can write to the pty.
-Work out the thread/lock discipline for firing it from a frame-clock tick
-*before* writing much code.
+`ecMouseScrollVertical` applies a hardcoded `10.0` multiplier to precision
+scrolls (SPEC §3.4b). The momentum path copies it so the two agree, but nobody
+has checked *why* it is 10, or whether it interacts badly with a
+`mouse-scroll-multiplier` far from 1. If fling speed feels wrong relative to
+dragging, look here first.
