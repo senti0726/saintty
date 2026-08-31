@@ -19,7 +19,7 @@ they were expensive. Do re-verify them if `git merge-base` has moved.
 |-------|---------|--------|
 | 0 | Toolchain + unmodified build | **DONE, verified** |
 | 1 | Momentum | **WORKS** — verified by hand; tuning open |
-| 2 | Scroll-region animation | **2a detection DONE + verified**; 2b animation not started |
+| 2 | Scroll-region animation | 2a done; **2b implemented, NOT visually verified** |
 | 3 | Pixel viewport scroll | not started |
 
 Commits on this branch: `ff0b00271` (docs), `d312bef5a` (stage 1).
@@ -214,19 +214,79 @@ scroll event: rows=<N> region=<top>..<bottom> source=<which>
 
 ---
 
+## Stage 2b — animation implemented 2026-09-01, needs eyes
+
+`scroll-animation = true` displaces rows inside a scrolled region by the
+distance just scrolled and eases them to zero over
+`scroll-animation-duration` (default 80ms). Off by default.
+
+Unit tested (`zig build test -Dtest-filter=noteScroll`, 6 tests) for the
+detection and delegation logic. **The visual result has not been seen by
+anyone.** That is the open item.
+
+### Try it
+
+```
+scroll-animation = true
+scroll-animation-duration = 80     # try 120 for more obvious, 40 for subtle
+```
+
+Scroll in tmux copy-mode or nvim. What to look for, in order:
+
+1. **Does it animate at all** rather than snapping.
+2. **Does tmux's status line stay put.** If it jiggles, the region bounds are
+   being ignored somewhere.
+3. **Is there a band of background at the trailing edge** during the slide.
+   This one is *expected* — see below — and the question is whether it is
+   noticeable enough to matter.
+4. **Does text slide over a stationary background**, which would mean the two
+   passes disagree.
+
+### The known artifact
+
+`insertLines` erases the outgoing row, and on the alternate screen (where tmux
+lives) there is no scrollback to recover it from. So during the animation the
+trailing edge of the region has nothing to draw and shows background — one row
+for a one-row scroll. SPEC §4 Feature 2 has the analysis and the fix
+(composite the previous frame); this first cut does not implement it.
+
+If it is invisible at 80ms, leave it. If it is ugly, that is the trigger for
+the compositing work rather than fiddling with the duration.
+
+---
+
+## Harness traps — both cost real time, do not rediscover them
+
+**Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a
+daemon (`--gtk-single-instance=true`), and the fork's default is `detect`, so
+launching the fork *hands off to the packaged binary* and your code never runs.
+Symptom: zero `generic_renderer` log lines and no scroll events, looking exactly
+like a regression. Always pass `--gtk-single-instance=false` when testing.
+
+**The `-e` GUI harness is currently broken in this session.** `ghostty -e <cmd>`
+no longer exits when the command finishes; it idles until killed, and buffered
+log output is lost with it. **The packaged 1.3.1 hangs identically under the
+same flags**, so it is environmental, not a fork regression — that control
+experiment is the fast way to tell the difference and is worth re-running before
+blaming the code.
+
+Consequence: prefer `zig build test` for anything testable headlessly. It is
+faster, deterministic, and it caught two real bugs that the GUI harness had
+already been mis-reporting.
+
+---
+
 ## Next action
 
 1. Live with the current feel; adjust `mouse-scroll-momentum-decay` in config.
    Only revisit code if the *character* is wrong, not the distance.
 2. Once settled: consider flipping `mouse-scroll-momentum` to default true,
    and decide whether the debug log stays.
-3. **Stage 2b: the animation itself.** SPEC §4 Feature 2 now carries the full
-   design analysis — read it before writing code, especially the outgoing-row
-   problem and the recommendation to composite the previous frame rather than
-   stash rows. Attach continuous frames to `animationWake()`
-   (`src/renderer/generic.zig:1039`); do not invent a timer. And the standing
-   hazard: **animate the pixel offset used at draw time, never the grid
-   model.**
+3. **Look at stage 2b** (above) and decide whether the trailing-edge artifact
+   justifies the compositing work in SPEC §4 Feature 2.
+4. Open question deferred from 2a: whether to hook `index`
+   (`src/terminal/Terminal.zig`), which would animate *all* output scrolling
+   rather than deliberate scrolls. Decide after living with 2b.
 
 ### Known-unknown carried forward
 
