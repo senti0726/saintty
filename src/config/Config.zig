@@ -1001,6 +1001,26 @@ palette: Palette = .{},
 /// The default value is "3" for discrete devices and "1" for precision devices.
 @"mouse-scroll-multiplier": MouseScrollMultiplier = .default,
 
+/// Continue scrolling with decaying momentum after a touchpad scroll
+/// gesture ends, instead of stopping the instant the fingers lift.
+///
+/// This only applies to precision (touchpad) scrolling. A notched mouse
+/// wheel has no gesture to end, so this setting does nothing for one.
+///
+/// The velocity comes from the windowing system, which measures the
+/// gesture, so the feel matches other applications on the desktop rather
+/// than being invented here. The fling decays exponentially and stops once
+/// it falls below a speed that would read as a stuck screen rather than
+/// motion.
+///
+/// Momentum works by synthesizing further scroll events, so it applies
+/// wherever a real scroll would: the terminal's own scrollback, an
+/// application receiving mouse reports (tmux), and alternate-scroll cursor
+/// keys alike.
+///
+/// Currently only implemented on Linux (GTK).
+@"mouse-scroll-momentum": bool = false,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.

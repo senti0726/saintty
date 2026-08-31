@@ -734,6 +734,22 @@ pub const Surface = extern struct {
         /// stops scrolling.
         pending_horizontal_scroll_reset: ?c_uint = null,
 
+        /// Momentum ("fling") state. GTK's scroll controller carries the
+        /// `kinetic` flag, so it emits ::decelerate with a velocity in px/s
+        /// when a touchpad gesture ends and we do not have to estimate one
+        /// ourselves. We then decay that velocity on the frame clock and feed
+        /// the result back through the normal scroll path.
+        ///
+        /// Velocity is in pixels/second, in GTK's sign convention (the same
+        /// one `scroll` delivers, i.e. before the inversion applied in
+        /// ecMouseScrollVertical).
+        momentum_velocity: f64 = 0.0,
+
+        /// Frame-clock tick driving the fling, and the timestamp of the last
+        /// frame we integrated. Non-null id means a fling is in flight.
+        momentum_tick: ?c_uint = null,
+        momentum_last_us: i64 = 0,
+
         overrides: struct {
             command: ?configpkg.Command = null,
             shell_integration: ?configpkg.Config.ShellIntegration = null,
@@ -1924,6 +1940,10 @@ pub const Surface = extern struct {
             priv.progress_bar_timer = null;
         }
 
+        // A momentum fling must not outlive the widget: its tick callback
+        // dereferences core_surface every frame.
+        self.momentumStop();
+
         if (priv.idle_rechild) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove idle source", .{});
@@ -3060,6 +3080,126 @@ pub const Surface = extern struct {
         self.private().precision_scroll = false;
     }
 
+    /// Stop any in-flight momentum scroll. Safe to call when none is running.
+    fn momentumStop(self: *Self) void {
+        const priv = self.private();
+        if (priv.momentum_tick) |v| {
+            self.as(gtk.Widget).removeTickCallback(v);
+            priv.momentum_tick = null;
+        }
+        priv.momentum_velocity = 0.0;
+        priv.momentum_last_us = 0;
+    }
+
+    /// GTK emits ::decelerate when a continuous (touchpad) scroll gesture
+    /// ends, giving us the gesture's exit velocity in px/s. That is the
+    /// "fingers lifted" signal: without the kinetic flag there is none on
+    /// Wayland, and we would have to infer it from a gap between events.
+    fn ecMouseScrollVerticalDecelerate(
+        _: *gtk.EventControllerScroll,
+        _: f64,
+        vel_y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        if (priv.core_surface == null) return;
+
+        // Respect the config. Off by default while this is experimental.
+        const enabled = if (priv.config) |c| c.get().@"mouse-scroll-momentum" else false;
+        if (!enabled) return;
+
+        self.momentumStop();
+
+        // Logged because this is the signal the whole feature depends on:
+        // if a fling feels wrong, the first question is whether GTK emitted
+        // ::decelerate at all and with what velocity. Without this, "nothing
+        // happened" is ambiguous between "never fired" and "decayed too fast".
+        log.debug("scroll momentum: decelerate vel_y={d:.1} px/s", .{vel_y});
+
+        if (@abs(vel_y) < momentum_min_velocity) return;
+
+        priv.momentum_velocity = vel_y;
+        // 0 means "no baseline yet"; the first tick establishes it.
+        priv.momentum_last_us = 0;
+        priv.momentum_tick = self.as(gtk.Widget).addTickCallback(
+            momentumTickCallback,
+            null,
+            null,
+        );
+    }
+
+    /// Below this speed (px/s) a fling is over. Roughly a tenth of a cell per
+    /// second: any slower and it reads as a stuck screen, not motion.
+    const momentum_min_velocity: f64 = 12.0;
+
+    /// Exponential decay time constant in seconds. Velocity falls by 1/e every
+    /// this many seconds, so a fling lasts on the order of half a second.
+    const momentum_decay_tau: f64 = 0.18;
+
+    /// Integrate the fling once per frame and feed the resulting pixel delta
+    /// through the ordinary scroll path.
+    ///
+    /// Threading: frame-clock ticks run on the GTK main thread, exactly like
+    /// the input events in ecMouseScrollVertical, so calling scrollCallback
+    /// from here is no different from calling it from a real scroll event.
+    /// This is why momentum needs no locking of its own.
+    fn momentumTickCallback(
+        widget: *gtk.Widget,
+        frame_clock: *gdk.FrameClock,
+        _: ?*anyopaque,
+    ) callconv(.c) c_int {
+        const self: *Self = gobject.ext.cast(Self, widget) orelse return 0;
+        const priv = self.private();
+
+        const surface = priv.core_surface orelse {
+            self.momentumStop();
+            return 0;
+        };
+
+        // The frame clock's own timestamp (microseconds, monotonic) rather
+        // than a wall clock: it is what the frame is actually scheduled
+        // against, and it does not jump if the system clock is adjusted.
+        const now_us = frame_clock.getFrameTime();
+        if (priv.momentum_last_us == 0) {
+            // First frame of the fling: we have no interval to integrate over
+            // yet, so just establish the baseline.
+            priv.momentum_last_us = now_us;
+            return 1;
+        }
+        const dt: f64 = @as(f64, @floatFromInt(now_us - priv.momentum_last_us)) / std.time.us_per_s;
+        priv.momentum_last_us = now_us;
+
+        // A hidden or stalled surface can hand us a huge dt; clamp so we never
+        // teleport the viewport on the first frame after a stall.
+        const dt_clamped = @min(@max(dt, 0.0), 0.05);
+
+        // Distance covered this frame, then decay for the next one.
+        const dy = priv.momentum_velocity * dt_clamped;
+        priv.momentum_velocity *= @exp(-dt_clamped / momentum_decay_tau);
+
+        if (@abs(priv.momentum_velocity) < momentum_min_velocity) {
+            self.momentumStop();
+            // Fall through and deliver this last delta before stopping.
+        }
+
+        if (dy != 0) {
+            const scaled = self.scaledCoordinates(0, dy);
+            surface.scrollCallback(
+                0,
+                // Same inversion and precision multiplier as a real precision
+                // scroll event, so the fling is indistinguishable downstream.
+                scaled.y * -1 * 10.0,
+                .{ .precision = true },
+            ) catch |err| {
+                log.warn("error in momentum scroll callback err={}", .{err});
+                self.momentumStop();
+                return 0;
+            };
+        }
+
+        return if (priv.momentum_tick == null) 0 else 1;
+    }
+
     fn ecMouseScrollVertical(
         _: *gtk.EventControllerScroll,
         x: f64,
@@ -3068,6 +3208,9 @@ pub const Surface = extern struct {
     ) callconv(.c) c_int {
         const priv: *Private = self.private();
         const surface = priv.core_surface orelse return 0;
+
+        // A real scroll always wins over a fling still in flight.
+        self.momentumStop();
 
         // Multiply precision scrolls by 10 to get a better response from
         // touchpad scrolling
@@ -3908,6 +4051,7 @@ pub const Surface = extern struct {
             class.bindTemplateCallback("scroll_vertical", &ecMouseScrollVertical);
             class.bindTemplateCallback("scroll_vertical_begin", &ecMouseScrollVerticalPrecisionBegin);
             class.bindTemplateCallback("scroll_vertical_end", &ecMouseScrollVerticalPrecisionEnd);
+            class.bindTemplateCallback("scroll_vertical_decelerate", &ecMouseScrollVerticalDecelerate);
             class.bindTemplateCallback("scroll_horizontal", &ecMouseScrollHorizontal);
             class.bindTemplateCallback("drop", &dtDrop);
             class.bindTemplateCallback("gl_realize", &glareaRealize);

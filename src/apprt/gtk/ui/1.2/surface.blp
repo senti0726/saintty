@@ -59,7 +59,8 @@ Overlay terminal_page {
       scroll => $scroll_vertical();
       scroll-begin => $scroll_vertical_begin();
       scroll-end => $scroll_vertical_end();
-      flags: vertical;
+      decelerate => $scroll_vertical_decelerate();
+      flags: vertical | kinetic;
     }
 
     EventControllerScroll {
