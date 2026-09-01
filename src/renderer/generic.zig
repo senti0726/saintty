@@ -1527,6 +1527,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (!self.config.scroll_animation) break :scroll;
                 if (ev.rows == 0) break :scroll;
 
+                // A jump this large is a page move, a full-screen redraw or a
+                // burst of output, not a scroll. Animating it would sweep a
+                // screenful of text past the eye more slowly than the instant
+                // change it replaces. Drop any animation in flight too: it
+                // describes rows that just stopped being where it thought.
+                if (@abs(ev.rows) > ScrollAnim.max_animated_rows) {
+                    self.scroll_anim.stop();
+                    break :scroll;
+                }
+
                 // Displace by exactly the distance just scrolled, so the first
                 // animated frame reproduces the pre-scroll screen, and ease to
                 // zero from there. The model is already current -- writes land
@@ -1536,11 +1546,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const rows: f32 = @floatFromInt(ev.rows);
                 const offset = rows * cell_h;
 
-                // A scroll arriving mid-animation supersedes it rather than
-                // queueing: the animation can only chase the latest position.
-                // Clamp so a burst cannot displace more than one screen, which
-                // would just look like a flash of unrelated content.
-                const limit = cell_h * @as(f32, @floatFromInt(self.size.grid().rows));
+                // Cap how far behind the model the drawn position may fall.
+                // Scrolls arrive faster than the ramp retires them during a
+                // fling, so without a tight cap the offset winds up until the
+                // whole block sits half a screen from where it belongs.
+                const limit = cell_h * ScrollAnim.max_lag_rows;
                 // Accumulate rather than replace, and only reset the clock
                 // when starting from idle. Resetting it on every scroll would
                 // skip the integration frame each time, so during continuous

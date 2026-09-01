@@ -35,6 +35,25 @@ span_px: f32 = 0,
 /// offset would keep requesting frames forever for no visible benefit.
 pub const min_offset_px: f32 = 0.5;
 
+/// A single scroll larger than this many rows is not smoothed at all.
+///
+/// Past a few rows this stops being a scroll and becomes a jump: a page move,
+/// a tmux full-screen redraw, or a burst of program output. Sliding a whole
+/// screen's worth of text past the eye is slower and harder to read than the
+/// instant change it replaces, so those snap.
+pub const max_animated_rows: isize = 8;
+
+/// The drawn position may never fall further behind the model than this many
+/// rows.
+///
+/// Displacement accumulates while scrolls keep arriving, and during a
+/// momentum fling they arrive faster than the ramp retires them. Without a
+/// tight cap the offset winds up to whatever the limit allows and the whole
+/// block of text is drawn half a screen from where it belongs, leaving the
+/// rest of the region empty. Being briefly a row or two behind reads as
+/// motion; being half a screen behind reads as lag, because it *is* lag.
+pub const max_lag_rows: f32 = 2;
+
 pub fn active(self: ScrollAnim) bool {
     return self.offset_px != 0;
 }
@@ -213,6 +232,20 @@ test "ScrollAnim: opposing scrolls net out rather than compounding" {
     a.push(-20, 0, 10, 10_000);
     a.push(20, 0, 10, 10_000);
     try testing.expect(!a.active());
+}
+
+test "ScrollAnim: a fling cannot wind the offset past a couple of rows" {
+    // The failure this guards: scrolls arrive faster than the ramp retires
+    // them, the offset winds up, and the whole block of text is drawn half a
+    // screen from where it belongs with the rest of the region empty.
+    const cell_h: f32 = 38;
+    var a: ScrollAnim = .{};
+    const limit = cell_h * max_lag_rows;
+    for (0..200) |_| {
+        a.push(-cell_h, 1, 52, limit);
+        a.advance(16, 80);
+    }
+    try testing.expect(@abs(a.offset_px) <= limit);
 }
 
 test "ScrollAnim: accumulation is capped by the limit" {

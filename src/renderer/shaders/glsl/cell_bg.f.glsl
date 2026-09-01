@@ -25,12 +25,19 @@ vec4 cell_bg() {
         float shifted = (gl_FragCoord.y - grid_padding.x - scroll_anim.x) / cell_size.y;
         int gy = int(floor(shifted));
         // Rows displaced past the edge of the region are the gap the scroll
-        // left behind. Clamp to the edge row's background rather than
-        // returning nothing: with a transparent background, "nothing" is a
-        // band of desktop showing through mid-scroll. Clamping renders the
-        // gap as a blank line in the surrounding background, which is what a
-        // scroll should look like anyway.
-        grid_pos.y = clamp(gy, int(scroll_anim.y), int(scroll_anim.z));
+        // left behind, and the gap must read as a blank line.
+        //
+        // Returning nothing is right: the full-screen `bg_color` pass has
+        // already painted the global background underneath, and this pass
+        // blends over it, so a transparent fragment here is exactly what a
+        // cell with the default background looks like. It is *not* a hole
+        // through to the desktop.
+        //
+        // Clamping to the edge row instead replicates that row's colors down
+        // the whole gap, which turns tmux's blue copy-mode row into a solid
+        // blue block the height of the scroll.
+        if (gy < int(scroll_anim.y) || gy > int(scroll_anim.z)) return vec4(0.0);
+        grid_pos.y = gy;
     }
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 

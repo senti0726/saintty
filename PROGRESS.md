@@ -385,6 +385,64 @@ mouse-wheel-through-scrollback -- probably the most common scrolling there is
 one: the renderer only builds cells for the viewport rows, so a partial-row
 offset needs one row above or below the viewport to be rendered too.
 
+## 2026-09-01, later — the two bugs the first working build exposed
+
+With the animation finally visible, two real defects showed up immediately.
+Both are fixed and verified by screenshot.
+
+### 1. A fling wound the offset up to half a screen
+
+Reported as: "when I flick up, 4950-5000 goes to 4950-4975 but now located at
+the bottom half of the screen, with the upper half empty."
+
+`push()` accumulates displacement, and during a fling scrolls arrive faster
+than the ramp retires them. The cap was `cell_h * grid.rows` -- a whole
+screen -- so the offset wound up until the block of text was drawn half a
+screen from where it belonged. That is not smoothing, it is lag, and it is
+what "it got a lot laggier" was describing. The GPU was idle because nothing
+was working hard; the picture was just stale.
+
+Two changes:
+
+  * `max_lag_rows = 2`. The drawn position may never fall more than two rows
+    behind the model.
+  * `max_animated_rows = 8`. A single scroll bigger than this is a page move,
+    a tmux full-screen redraw, or an output burst, not a scroll. Those snap,
+    and drop any animation in flight. This is what kills the `rows=416` and
+    `rows=52` events that were previously being animated as full-screen
+    sweeps.
+
+### 2. The trailing gap smeared tmux's blue row into a solid block
+
+Reported as: "the blue box containing the line count dragged down into a whole
+blue box."
+
+The overnight session had changed the gap in `cell_bg.f.glsl` from
+`return vec4(0.0)` to clamping to the region's edge row, on the reasoning that
+transparent would show the desktop through. **That reasoning was wrong**, and
+this is worth remembering: the `bg_color` pipeline paints the global
+background across the whole surface *before* `cell_bg`, which blends over it.
+A transparent fragment in `cell_bg` is therefore exactly what a
+default-background cell looks like -- not a hole to the desktop.
+
+Clamping instead replicated the edge row's colors down the entire gap, so when
+the edge row was tmux's blue copy-mode status line you got a solid blue block
+the height of the scroll. Reverted to returning nothing, with the reasoning
+recorded in the shader so it does not get "fixed" again.
+
+### Verified
+
+Sustained fling (300 rapid `scroll-up` sends), screenshot mid-fling: text
+fills the region top to bottom, no empty half, no blue block, copy-mode
+indicator in its normal place.
+
+### Tuning knobs, if it still feels wrong
+
+Both are constants in `src/renderer/scroll_anim.zig`, not config: `max_lag_rows`
+(lower = crisper, less smoothing) and `max_animated_rows`. Use the **default**
+`scroll-animation-duration` of 80ms now -- the 250ms used for testing was
+deliberately exaggerated and will read as lag on its own.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a
