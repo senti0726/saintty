@@ -1,5 +1,9 @@
 #include "common.glsl"
 
+// Position the origin to the upper left, so the scroll clip below can be
+// compared against the same coordinates the region is expressed in.
+layout(origin_upper_left) in vec4 gl_FragCoord;
+
 layout(binding = 0) uniform sampler2DRect atlas_grayscale;
 layout(binding = 1) uniform sampler2DRect atlas_color;
 
@@ -18,6 +22,21 @@ const uint ATLAS_COLOR = 1u;
 layout(location = 0) out vec4 out_FragColor;
 
 void main() {
+    // Scroll animation: clip text to the scrolling region.
+    //
+    // The vertex stage can only drop *whole* rows, so a row displaced by a
+    // fraction of a cell was drawn in full and spilled past the region edge:
+    // over nvim's status bar, and past the last line, where a row arriving
+    // from off-screen appeared beyond its final position and then slid back
+    // to it instead of entering from the edge. Clipping per fragment is what
+    // makes a row slide in from the boundary rather than materialise outside
+    // it.
+    if (scroll_anim.x != 0.0) {
+        float band_top = grid_padding.x + scroll_anim.y * cell_size.y;
+        float band_bot = grid_padding.x + (scroll_anim.z + 1.0) * cell_size.y;
+        if (gl_FragCoord.y < band_top || gl_FragCoord.y >= band_bot) discard;
+    }
+
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
 
