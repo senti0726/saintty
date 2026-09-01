@@ -34,6 +34,11 @@ out CellTextVertexOut {
     flat vec4 color;
     flat vec4 bg_color;
     vec2 tex_coord;
+    // 1.0 when this glyph belongs to a row the scroll animation displaced, so
+    // the fragment stage knows to clip it to the region. Rows outside the
+    // region never move and must be left alone -- clipping them too erases
+    // exactly the things an application parks outside its margins.
+    flat float scroll_clip;
 } out_data;
 
 layout(binding = 1, std430) readonly buffer bg_cells {
@@ -54,10 +59,12 @@ void main() {
     // through. Rows outside the region -- tmux's status line, for one -- must
     // not move, which is why this is bounded rather than a whole-grid shift.
     bool scroll_clipped = false;
+    out_data.scroll_clip = 0.0;
     if (scroll_anim.x != 0.0 &&
         float(grid_pos.y) >= scroll_anim.y &&
         float(grid_pos.y) <= scroll_anim.z) {
         cell_pos.y += scroll_anim.x;
+        out_data.scroll_clip = 1.0;
 
         // A row displaced past the edge of the region must not be drawn: it
         // would land on rows that are deliberately stationary, painting

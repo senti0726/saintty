@@ -12,6 +12,7 @@ in CellTextVertexOut {
     flat vec4 color;
     flat vec4 bg_color;
     vec2 tex_coord;
+    flat float scroll_clip;
 } in_data;
 
 // Values `atlas` can take.
@@ -31,7 +32,12 @@ void main() {
     // to it instead of entering from the edge. Clipping per fragment is what
     // makes a row slide in from the boundary rather than materialise outside
     // it.
-    if (scroll_anim.x != 0.0) {
+    // Only rows the vertex stage actually displaced may be clipped. Testing
+    // the band alone erased every glyph outside the scrolling region --
+    // tmux's status line, nvim's bars, a prompt box an application keeps
+    // pinned to the bottom -- for as long as any offset was live, so they
+    // vanished and reappeared on every scrolled frame.
+    if (in_data.scroll_clip > 0.5) {
         float band_top = grid_padding.x + scroll_anim.y * cell_size.y;
         float band_bot = grid_padding.x + (scroll_anim.z + 1.0) * cell_size.y;
         if (gl_FragCoord.y < band_top || gl_FragCoord.y >= band_bot) discard;

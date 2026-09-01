@@ -823,6 +823,48 @@ That was not a regression: `realesrgan-ncnn` was running at ~79% CPU and it is
 a *GPU* upscaler, competing for the 780M. Check `ps` before trusting a frame
 interval from this harness.
 
+## 2026-09-02 — the clip was erasing every interface outside the region
+
+Confirmed by A/B: Claude Code's prompt box misbehaved only with pixel-perfect
+on, so it was ours. Narrowing the remembered region did not help, and hunting
+for why found the actual bug.
+
+`cell_text.f.glsl` clipped **every** fragment falling outside the scrolling
+region's pixel band:
+
+    if (scroll_anim.x != 0.0) {
+        ... if (outside band) discard;
+    }
+
+Not just displaced rows -- *all* of them. So for as long as any offset was
+live, every glyph an application parks outside its margins was discarded:
+tmux's status line, nvim's bars, Claude Code's prompt box. They vanished and
+reappeared on every scrolled frame.
+
+The tell was in the reports and I missed it twice: "the status **bar's word**
+disappears". The bar stayed and the words went, because backgrounds come from
+`cell_bg.f.glsl`, which correctly touches only rows inside the region. Only the
+text pass had the bug. Reported later as the prompt box "scrolling down a line
+and directly back up" -- it was flickering out, not moving.
+
+Fixed by carrying a `flat float scroll_clip` from the vertex stage, set only on
+rows the vertex stage actually displaced, and clipping only those.
+
+### Verification, given no display
+
+The session's display appeared to be asleep -- the window never reached
+`info(opengl): loaded OpenGL`, so nothing rendered and the harness traced no
+frames. GLSL compiles at *runtime*, so `zig build` proves nothing about it.
+
+Control experiment instead: preprocess the `#include` by hand and compile both
+the modified and the **unmodified** shaders with `glslc --target-env=opengl`.
+Both produce exactly one identical diagnostic ("SPIR-V requires location for
+user input/output", the interface block, same line number). It is a SPIR-V
+requirement that does not apply to Ghostty's direct-GLSL path, and the change
+introduces no new diagnostics. Useful trick to remember: `glslc` is installed
+and the original file is the control that separates a real error from a
+target-environment artifact.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a
