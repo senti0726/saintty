@@ -528,6 +528,76 @@ removes the ~1 row of lag this design structurally cannot (`mean 1.33 rows` on
 `fast`) and makes slow scrolling genuinely sub-pixel rather than
 sub-pixel-after-the-fact. **Not attempted yet; this is the next decision.**
 
+## 2026-09-01 — clipping, and pixel-perfect scrolling (NEEDS EYES)
+
+### Clipping: two symptoms, one bug
+
+Reported as text drawing over nvim's status bar, and as a row at the bottom
+appearing *below* its final position and sliding up to it rather than entering
+from the edge.
+
+Both were the same thing. The vertex stage can only drop **whole** rows, so a
+row displaced by a fraction of a cell was drawn in full and spilled past the
+region. `cell_text.f.glsl` now clips per fragment against the region's pixel
+band, which is what makes a row slide in from the boundary.
+
+### Pixel-perfect scrolling: `scroll-pixel-perfect`, default off
+
+This is the redesign, and it is the answer to "you scroll 0.5 line expecting
+0.5 line but it jumps a whole one".
+
+`Surface.mouse.pending_scroll_y` already holds the sub-row remainder in
+pixels -- Ghostty accumulates it and only acts once it exceeds a cell. It was
+simply never drawn. The renderer now draws it.
+
+The non-obvious half is the second term. When the fraction crosses a row,
+`pending_scroll_y` resets to ~0 and a scroll event goes to the app -- but the
+app is at the far end of a pty and has not moved yet. Drawing only the
+fraction would snap the picture back a full row and then jump forward when
+tmux catches up. So the offset is
+
+    pending_px + (requested_rows - applied_rows) * cell_h
+
+`requested_rows` is sent by the Surface, `applied_rows` is counted in the
+renderer from scroll events, crediting only scrolls that move the way we
+asked (a program writing output scrolls the model too, and crediting those
+would displace the picture for a gesture that never happened). At the crossing
+the outstanding term is exactly the row the fraction gave up, so the content
+does not move at all until the model arrives underneath it. **Zero lag by
+construction**, unlike the ease-after-the-fact design.
+
+Because the position is already continuous, the catch-up animation is skipped
+entirely when this is on -- it would pull content backwards at the very moment
+the gesture moved it forwards.
+
+`settleScrollPixel` retires the displacement `settle_idle_ms` after the last
+input, handing it to the ordinary ramp so it eases onto the character grid
+rather than snapping. This is not optional: a standing fraction holds text
+permanently off the grid, and if the app never scrolls at all -- a plain shell
+scrolls its *viewport*, which never touches the terminal model, or an app
+already at the top of its scrollback -- the outstanding rows would never
+unwind and the picture would stay displaced for good.
+
+### Why this one needs a human
+
+**The harness cannot test it.** `emit.py` drives the terminal's byte stream,
+which is downstream of everything this feature touches; the whole mechanism
+lives in the *input* path, and synthesising touchpad events needs uinput
+(root). The sign convention in particular is reasoned, not measured: GTK
+reports positive y for scrolling down and `ecMouseScrollVertical` inverts it,
+so `pending_scroll_y` is negative scrolling down, and content moving up the
+screen is a negative offset -- the two agree, so the terms add. If scrolling
+turns out doubled or inverted, that sign is the first thing to check.
+
+Off by default for exactly this reason.
+
+### Still open
+
+Quick flicks in large documents were reported as hanging and then arriving.
+Not investigated. The harness measures the render path, and this smells like
+the app (nvim) or the pty, so the next step is to find out which before
+touching anything.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

@@ -243,6 +243,11 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
+    /// Cumulative rows we have turned into scroll events, so the renderer can
+    /// tell how much of the gesture the model has caught up with. Signed the
+    /// same way as `ScrollAmount.delta`.
+    scroll_requested_rows: i64 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -3520,8 +3525,23 @@ pub fn scrollCallback(
         const delta: isize = @intFromFloat(@trunc(amount));
         assert(@abs(delta) >= 1);
 
+        self.mouse.scroll_requested_rows += @intCast(delta);
+
         break :y .{ .delta = delta };
     };
+
+    // Tell the renderer where the gesture actually is, so it can draw
+    // sub-row positions instead of waiting for a whole row to accumulate.
+    // Sent unconditionally: the renderer decides whether it is enabled, and
+    // the value must keep flowing as the fraction resets across a row.
+    if (yoff != 0) {
+        _ = self.renderer_thread.mailbox.push(global.io(), .{
+            .scroll_pixel = .{
+                .pending_px = @floatCast(self.mouse.pending_scroll_y),
+                .requested_rows = self.mouse.scroll_requested_rows,
+            },
+        }, .{ .instant = {} });
+    }
 
     // For detailed comments see the y calculation above.
     const x: ScrollAmount = if (xoff == 0) .{} else x: {

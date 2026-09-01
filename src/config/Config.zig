@@ -1045,6 +1045,18 @@ palette: Palette = .{},
 /// `scroll-animation-duration`.
 ///
 /// Experimental. Currently only implemented on the OpenGL renderer.
+/// Draw sub-row scroll positions instead of snapping to whole rows.
+///
+/// A touchpad reports a fraction of a row at a time. Without this, that
+/// fraction is accumulated invisibly and the screen only moves once a whole
+/// row has built up, so scrolling half a row shows nothing and scrolling a
+/// bit more jumps a full line. With it, content is drawn where the gesture
+/// actually is.
+///
+/// This supersedes `scroll-animation` for scrolls you drive yourself: the
+/// position is already continuous, so there is nothing to ease afterwards.
+@"scroll-pixel-perfect": bool = false,
+
 @"scroll-animation": bool = false,
 
 /// Emit a per-frame trace of the scroll animation to the debug log.

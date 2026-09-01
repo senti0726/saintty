@@ -438,6 +438,10 @@ fn drainMailbox(self: *Thread) !void {
                 self.flags.has_inspector = v;
             },
 
+            .scroll_pixel => |v| {
+                self.renderer.setScrollPixel(v.pending_px, v.requested_rows);
+            },
+
             .macos_display_id => |v| {
                 if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
                     try self.renderer.setMacOSDisplayID(v, &self.draw_now);
