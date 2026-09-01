@@ -166,6 +166,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// frames. See SPEC.md stage 2.
         scroll_anim: ScrollAnim = .{},
 
+        /// Cumulative rows the terminal model has scrolled, and the clock
+        /// base, both only for `scroll-trace`. Together with the per-frame
+        /// offset these reconstruct where content was actually drawn.
+        scroll_trace_rows: i64 = 0,
+        scroll_trace_base: ?std.Io.Timestamp = null,
+
+        /// When the last frame was actually drawn, so the scroll animation
+        /// can pace itself against every draw rather than adding its own on
+        /// top of them.
+        last_draw_ts: ?std.Io.Timestamp = null,
+
         /// When the scroll animation was last advanced.
         scroll_anim_last: ?std.Io.Timestamp = null,
 
@@ -570,6 +581,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background_opacity_cells: bool,
             scroll_animation: bool,
             scroll_animation_duration_ms: u32,
+            scroll_trace: bool,
             foreground: terminal.color.RGB,
             selection_background: ?configpkg.Config.TerminalColor,
             selection_foreground: ?configpkg.Config.TerminalColor,
@@ -650,6 +662,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     .scroll_animation = config.@"scroll-animation",
                     .scroll_animation_duration_ms = config.@"scroll-animation-duration",
+                    .scroll_trace = config.@"scroll-trace",
                     .padding_color = config.@"window-padding-color",
 
                     .selection_background = config.@"selection-background",
@@ -1089,11 +1102,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (shader_delay) |s| return .{ .delay_ms = s, .kind = .draw };
 
-            // A scroll animation needs draw-only wakes until it settles. This
-            // rides the existing mechanism rather than adding a timer, so it
-            // composes with the shader and Kitty sources above for free.
+            // A scroll animation needs draw-only wakes until it settles.
+            //
+            // Pace them against the *last actual draw*, not on a fixed
+            // interval. A scroll animation runs precisely when the terminal
+            // is also being updated, so a fixed 8ms wake stacks animation
+            // draws on top of the update-driven ones. At 4K on an iGPU that
+            // overruns the vsync budget and halves the observed frame rate --
+            // measured at 33ms/frame with the animation on versus 18ms with
+            // it off, which reads as the animation making scrolling *worse*.
             if (self.scroll_anim.active()) {
-                return .{ .delay_ms = draw_interval_ms, .kind = .draw };
+                const min_interval_ms: u64 = 16;
+                const delay: u64 = delay: {
+                    const last = self.last_draw_ts orelse break :delay 1;
+                    const now: std.Io.Timestamp = .now(global.io(), .awake);
+                    const since_ns = last.durationTo(now).nanoseconds;
+                    if (since_ns <= 0) break :delay min_interval_ms;
+                    const since_ms: u64 = @intCast(@divTrunc(since_ns, std.time.ns_per_ms));
+                    break :delay min_interval_ms -| since_ms;
+                };
+                return .{ .delay_ms = @max(delay, 1), .kind = .draw };
             }
 
             return null;
@@ -1124,6 +1152,33 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(self.config.scroll_animation_duration_ms),
             );
             if (!self.scroll_anim.active()) self.scroll_anim_last = null;
+        }
+
+        /// Emit one `scroll-trace` line for this frame.
+        ///
+        /// `model_rows` is where the terminal thinks the content is;
+        /// `off_px` is how far from that it is actually being drawn. The
+        /// analyzer reconstructs the drawn position as
+        /// `-(model_rows * cell_h) + off_px` and checks that curve for the
+        /// things eyes are bad at judging: reversals, stalls, and jumps.
+        fn traceScrollFrame(self: *Self) void {
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const base = self.scroll_trace_base orelse base: {
+                self.scroll_trace_base = now;
+                break :base now;
+            };
+            const t_us = @divTrunc(base.durationTo(now).nanoseconds, std.time.ns_per_us);
+            log.info(
+                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} top={d} bot={d} cell_h={d}",
+                .{
+                    t_us,
+                    self.scroll_trace_rows,
+                    self.scroll_anim.offset_px,
+                    self.scroll_anim.top,
+                    self.scroll_anim.bottom,
+                    self.size.cell.height,
+                },
+            );
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1519,10 +1574,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // want to know what the deliberate-scroll traffic looks like on
             // its own first.
             if (critical.scroll_event) |ev| scroll: {
-                log.debug(
-                    "scroll event: rows={d} region={d}..{d} source={s} enabled={} cell_h={d}",
-                    .{ ev.rows, ev.top, ev.bottom, @tagName(ev.source), self.config.scroll_animation, self.size.cell.height },
-                );
+                // Promote to info while tracing so the harness works against
+                // a release build; debug logs are compiled out of those, and a
+                // debug build runs at ~40fps which swamps what we measure.
+                if (self.config.scroll_trace) {
+                    log.info(
+                        "scroll event: rows={d} region={d}..{d} source={s} enabled={} cell_h={d}",
+                        .{ ev.rows, ev.top, ev.bottom, @tagName(ev.source), self.config.scroll_animation, self.size.cell.height },
+                    );
+                } else {
+                    log.debug(
+                        "scroll event: rows={d} region={d}..{d} source={s} enabled={} cell_h={d}",
+                        .{ ev.rows, ev.top, ev.bottom, @tagName(ev.source), self.config.scroll_animation, self.size.cell.height },
+                    );
+                }
+
+                // Before any filtering: the trace needs the model's true
+                // position, including scrolls we deliberately do not animate.
+                self.scroll_trace_rows += @intCast(ev.rows);
 
                 if (!self.config.scroll_animation) break :scroll;
                 if (ev.rows == 0) break :scroll;
@@ -1796,6 +1865,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             }
             self.cells_rebuilt = false;
+            self.last_draw_ts = .now(global.io(), .awake);
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();
@@ -1868,6 +1938,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Done here, immediately before upload, so the value drawn is the
             // value computed for this frame.
             self.advanceScrollAnim();
+            if (self.config.scroll_trace) self.traceScrollFrame();
             self.uniforms.scroll_anim = .{
                 self.scroll_anim.offset_px,
                 self.scroll_anim.top,

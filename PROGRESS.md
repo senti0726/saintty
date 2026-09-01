@@ -443,6 +443,91 @@ Both are constants in `src/renderer/scroll_anim.zig`, not config: `max_lag_rows`
 `scroll-animation-duration` of 80ms now -- the 250ms used for testing was
 deliberately exaggerated and will read as lag on its own.
 
+## 2026-09-01 — the measurement harness, and what it found
+
+Eyeballing had taken this as far as it could go. `tools/scroll-harness/` now
+measures scroll feel instead.
+
+### How it works
+
+`emit.py` runs *inside* the terminal under test and writes the byte stream a
+scrolling tmux produces, on a scripted cadence. Driving the real touchpad is
+not reproducible, and driving `tmux send-keys` from outside costs a process
+spawn per event -- slower than the fling being measured. Patterns: `slow`,
+`medium`, `fast`, `burst`, `reverse`, `tmuxish` (which interleaves status-line
+repaints in their own small region, as real tmux does).
+
+`harness.py` launches the fork with `--scroll-trace`, runs a pattern, then
+reconstructs where content sat on every frame as
+`-(model_rows * cell_h) + off_px` and reports reversals, lag, per-frame step
+size, stalls and frame interval.
+
+    zig build -Doptimize=ReleaseFast --prefix zig-out-release
+    python3 tools/scroll-harness/harness.py fast --bin=$PWD/zig-out-release/bin/ghostty
+
+**Measure on a release build.** `--scroll-trace` deliberately logs at `info`
+so it survives one.
+
+### What it found immediately
+
+**The animation was halving the frame rate.** Same `fast` pattern, release
+build:
+
+| | frame interval p50 | step size p50 |
+|---|---|---|
+| animation off | 17.9ms (56fps) | 2.00 rows |
+| animation on (before) | 33.4ms (30fps) | 3.00 rows |
+| animation on (after) | 17.3ms (58fps) | 2.05 rows |
+
+`animationWake()` returned a fixed 8ms draw wake. A scroll animation runs
+precisely when the terminal is *also* being updated, so those wakes stacked on
+top of the update-driven draws; at 4K on the 780M that overruns the vsync
+budget and drops every other frame. The animation was making scrolling
+measurably worse than not having it.
+
+Fixed by pacing the wake against `last_draw_ts` -- the time of the last actual
+draw, whatever caused it -- so total draw rate is capped near 60fps instead of
+two sources competing.
+
+**This was not a debug-build artifact.** That was the first hypothesis and it
+was wrong: release and debug both sat at 33ms with the animation on.
+
+### The reversal: a single pending slot
+
+`Terminal.scroll_event` is one slot, and `noteScroll` *replaced* on a region
+change. tmux repaints its status line by scrolling a two-row region,
+interleaved with body scrolls, so a repaint landing between frames silently
+discarded the body scroll waiting there. The body then snapped, and when the
+repaint deleted rather than inserted, the text moved *against* the scroll.
+That is the "occasionally the words go down".
+
+Two fixes: `noteScroll` ignores scrolling regions under a quarter of the
+screen (decorations, not content), and `ScrollAnim.push` now accumulates
+across *overlapping* regions rather than only identical ones, because tmux
+jitters its region by a row between redraws and that was throwing the pending
+displacement away mid-slide.
+
+Note the subtlety that cost a test: for IL/DL, `noteScroll`'s `top` argument
+is the *cursor* row, not the region top, so the filter has to measure
+`scrolling_region`, not `bottom - top`.
+
+### The ceiling this design has
+
+At the `fast` pattern the content moves ~2 rows per drawn frame, and 81% of
+moving frames are still whole-row jumps. That is not the easing failing: the
+*input* is 100 rows/sec, so the model genuinely advances ~2 rows per frame at
+60fps. No amount of smoothing between model positions fixes it, and Chrome at
+an equivalent fling speed is equally unreadable.
+
+What Chrome does differently is upstream of all this: its scroll position is a
+continuous value driven by the input device and sampled once per frame, so it
+is never behind and never moves in row units. The equivalent here is to make
+the renderer own a fractional scroll position, send whole-row scrolls to tmux
+only as it crosses row boundaries, and draw the remainder as the offset. That
+removes the ~1 row of lag this design structurally cannot (`mean 1.33 rows` on
+`fast`) and makes slow scrolling genuinely sub-pixel rather than
+sub-pixel-after-the-fact. **Not attempted yet; this is the next decision.**
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

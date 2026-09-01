@@ -224,6 +224,26 @@ pub fn noteScroll(
     // records, and suppresses whatever it delegates to.
     if (self.scroll_note_suppress) return;
     const bottom = self.scrolling_region.bottom;
+
+    // A region only a few rows tall is a decoration, not content anyone is
+    // scrolling: tmux repaints its status line by scrolling a two-row region,
+    // interleaved with the body scrolls.
+    //
+    // Dropping those matters more than it looks. There is one pending slot,
+    // and a region change *replaces* rather than coalesces, so a status
+    // repaint landing between two frames silently discards the body scroll
+    // that was waiting there and substitutes its own two-row displacement.
+    // The body then snaps instead of sliding, and when the repaint deletes
+    // rather than inserts, the drawn text visibly moves against the scroll.
+    //
+    // Measure the app's *scrolling region*, not the span from the cursor:
+    // `top` here is where the insert or delete started, so a legitimate
+    // scroll near the bottom of a large region looks tiny.
+    const region = &self.scrolling_region;
+    if (region.bottom >= region.top) {
+        const height = region.bottom - region.top + 1;
+        if (height * 4 < self.rows) return;
+    }
     if (self.scroll_event) |*ev| {
         if (ev.top == top and ev.bottom == bottom) {
             ev.rows += rows;
@@ -4482,6 +4502,28 @@ test "Terminal: noteScroll opposing scrolls cancel" {
 
     const ev = t.scroll_event.?;
     try testing.expectEqual(@as(isize, 0), ev.rows);
+}
+
+test "Terminal: noteScroll ignores decoration-sized regions" {
+    // tmux repaints its status line by scrolling a two-row region. With a
+    // single pending slot, letting that through discards whatever real scroll
+    // was waiting, which the eye sees as the text jumping back.
+    var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 40 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(1, 40);
+    try t.scrollUp(3);
+    try testing.expect(t.scroll_event != null);
+    const before = t.scroll_event.?;
+
+    // A two-row status region must not displace the body scroll waiting in
+    // the single pending slot.
+    t.setTopAndBottomMargin(39, 40);
+    try t.scrollUp(1);
+    try testing.expect(t.scroll_event != null);
+    try testing.expectEqual(before.rows, t.scroll_event.?.rows);
+    try testing.expectEqual(before.top, t.scroll_event.?.top);
+    try testing.expectEqual(before.bottom, t.scroll_event.?.bottom);
 }
 
 test "Terminal: noteScroll region change replaces rather than accumulates" {

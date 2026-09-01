@@ -68,8 +68,11 @@ pub fn active(self: ScrollAnim) bool {
 /// constant one row behind during continuous scrolling and then snaps at the
 /// end, which reads as lag rather than motion.
 ///
-/// A scroll over a *different* region replaces, because the pending offset
-/// describes rows that are no longer the ones moving.
+/// A scroll over a *disjoint* region replaces, because the pending offset
+/// describes rows that are no longer the ones moving. Overlapping regions
+/// still accumulate: tmux jitters its scrolling region by a row as it redraws
+/// (1..52 one frame, 2..52 the next), and treating that as a new region threw
+/// the pending displacement away, so the content snapped instead of sliding.
 ///
 /// `limit` caps the accumulated displacement, so a burst cannot wind the
 /// offset up to something that flashes unrelated content when it unwinds.
@@ -80,10 +83,8 @@ pub fn push(
     bottom: f32,
     limit: f32,
 ) void {
-    const base: f32 = if (self.active() and self.top == top and self.bottom == bottom)
-        self.offset_px
-    else
-        0;
+    const overlaps = self.active() and self.top <= bottom and top <= self.bottom;
+    const base: f32 = if (overlaps) self.offset_px else 0;
 
     const combined = std.math.clamp(base + offset_px, -@abs(limit), @abs(limit));
     self.offset_px = if (@abs(combined) < min_offset_px) 0 else combined;
@@ -208,14 +209,25 @@ test "ScrollAnim: positive and negative decay symmetrically" {
     try testing.expectApproxEqAbs(up.offset_px, -down.offset_px, 0.001);
 }
 
-test "ScrollAnim: a scroll over a different region replaces" {
+test "ScrollAnim: a scroll over a disjoint region replaces" {
     var a: ScrollAnim = .{};
     a.push(-20, 0, 10, 10_000);
     a.advance(16, 80);
-    a.push(40, 2, 8, 10_000);
+    a.push(40, 20, 30, 10_000);
     try testing.expectEqual(@as(f32, 40), a.offset_px);
+    try testing.expectEqual(@as(f32, 20), a.top);
+    try testing.expectEqual(@as(f32, 30), a.bottom);
+}
+
+test "ScrollAnim: a one-row region jitter keeps the pending displacement" {
+    // tmux moves its scrolling region by a row between redraws. Treating that
+    // as a different region discarded the offset mid-slide, and the content
+    // snapped to the model instead of arriving there.
+    var a: ScrollAnim = .{};
+    a.push(-20, 1, 52, 10_000);
+    a.push(-20, 2, 52, 10_000);
+    try testing.expectEqual(@as(f32, -40), a.offset_px);
     try testing.expectEqual(@as(f32, 2), a.top);
-    try testing.expectEqual(@as(f32, 8), a.bottom);
 }
 
 test "ScrollAnim: successive scrolls over the same region accumulate" {

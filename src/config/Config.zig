@@ -1047,6 +1047,16 @@ palette: Palette = .{},
 /// Experimental. Currently only implemented on the OpenGL renderer.
 @"scroll-animation": bool = false,
 
+/// Emit a per-frame trace of the scroll animation to the debug log.
+///
+/// This exists so the scroll feel can be measured instead of eyeballed: each
+/// drawn frame logs a timestamp, the cumulative rows the model has scrolled
+/// and the current drawn offset, which is enough to reconstruct exactly where
+/// the content sat on screen at every frame. See tools/scroll-harness.
+///
+/// Debug builds only; it is very noisy.
+@"scroll-trace": bool = false,
+
 /// How long an application scroll takes to settle, in milliseconds.
 ///
 /// Longer is smoother but delays the content further; past roughly 150ms it
