@@ -1734,10 +1734,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Remember the region so a sub-row displacement arriving
                 // between scrolls moves the same rows, and leaves tmux's
                 // status line alone.
-                self.scroll_region = .{
+                // Only remember a region the application has actually
+                // narrowed. tmux and nvim set margins precisely so the rows
+                // outside them -- a status line, a mode line -- hold still,
+                // and that is the only signal we get about which rows are
+                // content and which are interface.
+                //
+                // A region spanning the whole screen carries no such signal.
+                // Claude Code, for one, sets no margins and redraws its prompt
+                // box in place, so treating full-screen as "everything may
+                // move" nudged the box and it sprang back on the next redraw.
+                // Without the signal, hold still.
+                const grid_rows = self.size.grid().rows;
+                const narrowed = ev.region_top > 0 or ev.bottom + 1 < grid_rows;
+                self.scroll_region = if (narrowed) .{
                     .top = @floatFromInt(ev.region_top),
                     .bottom = @floatFromInt(ev.bottom),
-                };
+                } else null;
 
                 if (self.config.scroll_pixel_perfect) {
                     // Retire this scroll against what we asked for, so the
