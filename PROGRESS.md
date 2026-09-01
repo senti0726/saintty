@@ -653,6 +653,72 @@ terminal's byte stream, so it cannot exercise it. Real hands required.
 
 Quick flicks hanging in large nvim documents. Still not investigated.
 
+## 2026-09-01 — take three: rounding *and* the in-flight term
+
+Take two stopped deleting lines but was still line-quantized: "the scroll is
+back, and then the previous problem was back: the not really pixel perfect".
+
+Take two removed too much. Dropping the in-flight term left a stutter at every
+row boundary: the instant the fraction rounds up, a wheel report goes down the
+pty and `pending_scroll_y` flips from +half a cell to -half a cell, but the app
+is a round trip away and has not moved, so the offset jumps a whole cell with
+nothing underneath it.
+
+The term that bridged that gap was never the problem. Take one was destructive
+because it *truncated* -- which always leaves the display owing the app a
+fraction, i.e. leading by up to a full row -- compounded by the remainder bug
+that pinned `pending_px` at zero. Rounding fixes the direction; the in-flight
+term fixes the discontinuity. Together:
+
+| finger | pending | in flight | offset |
+|---|---|---|---|
+| 0.5 cell, pre-emit | +0.5 | 0 | +0.5 |
+| 0.5 cell, post-emit | -0.5 | +1 | +0.5 (continuous) |
+| app catches up | -0.5 | 0 | -0.5 |
+
+Peak displacement is half a cell either way, so the lead -- which in the
+alternate screen is always a hole, since the incoming row has not arrived --
+is at most a half-row sliver.
+
+`scrollPixelOffset` clamps hard to +/- half a cell. That clamp is a safety net,
+not arithmetic: the in-flight term assumes one wheel report yields one row of
+app scrolling, which nothing enforces (an app may scroll three, or refuse at
+the top of its buffer). When that slips the term drifts, and the clamp stops
+drift from ever becoming a deleted line again.
+
+## The nvim flick-hang, root-caused (not yet fixed)
+
+"Quick flicks are laggy, sometimes it hangs for a while and then only arrives
+at the scroll target position."
+
+Not the renderer, which is why the harness never saw it:
+
+1. `Surface.scrollCallback` sends **one wheel report per row**:
+   `for (0..@abs(y.delta)) |_| { ... mouseReport(...) }` (src/Surface.zig:3624).
+   With the hardcoded 10x precision multiplier plus momentum, a hard flick
+   makes a lot of them.
+2. nvim is configured `mousescroll=ver:1` (our own dotfiles change), so every
+   report is a separate redraw of a large document.
+3. The app cannot keep up, the pty backs up, the writer thread stalls.
+4. The termio mailbox is **64 slots** (src/termio/mailbox.zig:15). When full,
+   `send` unlocks the renderer mutex and does a **`.forever` blocking push**
+   (src/termio/mailbox.zig:95) -- on the **GTK main thread**.
+
+So the UI thread blocks until nvim drains a queue the flick overfilled. Fix
+direction: stop amplifying. Cap reports per gesture, or drop them when the
+queue is backing up, rather than blocking the main thread. Deliberately not
+attempted yet.
+
+## Note on nvim smooth-scroll plugins
+
+Worth knowing before chasing one: neoscroll.nvim, vim-smoothie and
+mini.animate ease the *timing* of a jump by issuing a sequence of small
+scrolls. They cannot produce sub-line movement -- nvim draws into a character
+grid like everything else in a terminal. Sub-line positioning can only come
+from the terminal, which is what `scroll-pixel-perfect` is. They compose:
+a plugin smooths the timing, this smooths the position. A plugin would also
+*increase* the report traffic behind the flick-hang above.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

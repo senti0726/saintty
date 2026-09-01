@@ -243,6 +243,11 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
+    /// Cumulative rows we have turned into scroll events, signed like
+    /// `ScrollAmount.delta`. The renderer subtracts what the app has actually
+    /// done from this to find the rows still in flight down the pty.
+    scroll_requested_rows: i64 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -3520,7 +3525,9 @@ pub fn scrollCallback(
             const rows = @round(poff / cell_size);
             self.mouse.pending_scroll_y = poff - (rows * cell_size);
             const delta: isize = @intFromFloat(rows);
-            break :y if (delta == 0) .{} else .{ .delta = delta };
+            if (delta == 0) break :y .{};
+            self.mouse.scroll_requested_rows += @intCast(delta);
+            break :y .{ .delta = delta };
         }
 
         // If the new offset is less than a single unit of scroll, we save
@@ -3555,6 +3562,7 @@ pub fn scrollCallback(
         _ = self.renderer_thread.mailbox.push(global.io(), .{
             .scroll_pixel = .{
                 .pending_px = @floatCast(self.mouse.pending_scroll_y),
+                .requested_rows = self.mouse.scroll_requested_rows,
             },
         }, .{ .instant = {} });
     }

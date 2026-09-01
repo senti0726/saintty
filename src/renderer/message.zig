@@ -33,6 +33,7 @@ pub const Message = union(enum) {
     /// than leading it. See `Renderer.scrollPixelOffset`.
     scroll_pixel: struct {
         pending_px: f32,
+        requested_rows: i64,
     },
 
     /// Change the font grid. This can happen for any number of reasons

@@ -181,6 +181,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// `applied_rows` counts the ones the model has actually performed.
         /// See `setScrollPixel` and `scrollPixelOffset`.
         scroll_pending_px: f32 = 0,
+        scroll_requested_rows: i64 = 0,
+        scroll_applied_rows: i64 = 0,
 
         /// The last content scrolling region we saw, so a sub-row
         /// displacement that arrives before any scroll event still knows what
@@ -1186,8 +1188,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Record where a scroll gesture currently is.
         ///
         /// Called from the render thread's mailbox.
-        pub fn setScrollPixel(self: *Self, pending_px: f32) void {
+        pub fn setScrollPixel(self: *Self, pending_px: f32, requested_rows: i64) void {
             self.scroll_pending_px = pending_px;
+            self.scroll_requested_rows = requested_rows;
             self.scroll_input_ts = .now(global.io(), .awake);
         }
 
@@ -1212,6 +1215,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const offset = self.scrollPixelOffset();
             self.scroll_pending_px = 0;
+            self.scroll_applied_rows = self.scroll_requested_rows;
             self.scroll_input_ts = null;
             if (@abs(offset) < ScrollAnim.min_offset_px) return;
 
@@ -1231,18 +1235,43 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The sub-row displacement to draw, in pixels.
         ///
-        /// This is only ever a *trailing* offset: the app is rounded to the
-        /// nearest row and the display is held back from it by the leftover.
-        /// Leading is not available to us -- in the alternate screen the row
-        /// that would come into view has not arrived, tmux has it and we do
-        /// not, so drawing ahead leaves a hole exactly as tall as the lead.
-        /// Rounding to nearest in `scrollCallback` bounds the leftover to half
-        /// a row, so the worst case is a half-row sliver at the trailing edge
-        /// rather than a missing line.
+        /// Two terms that only work together.
+        ///
+        /// `scroll_pending_px` is how far the gesture sits from the row the
+        /// app has been rounded to. Drawing it is the whole point: otherwise
+        /// half a row of finger movement shows nothing and a bit more jumps a
+        /// full line.
+        ///
+        /// The second is the rows we have asked the app for and not yet seen
+        /// it perform. Without it the picture stutters at every row boundary:
+        /// the instant the fraction rounds up, a report goes down the pty and
+        /// `pending` flips from +half a cell to -half a cell, but the app is a
+        /// round trip away and has not moved, so the offset would jump a whole
+        /// cell with nothing underneath it. Holding the in-flight rows makes
+        /// the two cancel exactly, and the drawn position does not move at all
+        /// until the app arrives under it.
+        ///
+        /// Because `scrollCallback` rounds to *nearest* under this option, the
+        /// two together stay within half a cell, so the display leads the app
+        /// by at most half a row. That bound matters: in the alternate screen
+        /// the row that would come into view has not arrived -- tmux has it,
+        /// we do not -- so any lead is a hole exactly as tall as the lead.
+        /// Half a row is a sliver; a whole row is a missing line.
+        ///
+        /// The clamp is a hard safety net rather than arithmetic. It assumes
+        /// one wheel report produces one row of app scrolling, and nothing
+        /// enforces that -- an app can scroll by three, or refuse at the top
+        /// of its buffer. When that assumption slips the term drifts, and the
+        /// clamp keeps the drift from ever becoming a deleted line.
         fn scrollPixelOffset(self: *const Self) f32 {
             if (!self.config.scroll_pixel_perfect) return 0;
+
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
-            return std.math.clamp(self.scroll_pending_px, -cell_h / 2, cell_h / 2);
+            const in_flight: f32 = @floatFromInt(
+                self.scroll_requested_rows - self.scroll_applied_rows,
+            );
+            const offset = self.scroll_pending_px + in_flight * cell_h;
+            return std.math.clamp(offset, -cell_h / 2, cell_h / 2);
         }
 
         /// Emit one `scroll-trace` line for this frame.
@@ -1692,9 +1721,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .bottom = @floatFromInt(ev.bottom),
                 };
 
-                // The gesture already places the content continuously, so
-                // easing toward the model would fight it.
-                if (self.config.scroll_pixel_perfect) break :scroll;
+                if (self.config.scroll_pixel_perfect) {
+                    // Retire this scroll against what we asked for, so the
+                    // in-flight term unwinds as the app catches up. Only
+                    // scrolls going the way we asked count: a program writing
+                    // output scrolls the model too, and crediting those would
+                    // displace the picture for a gesture that never happened.
+                    //
+                    // ScrollEvent.rows counts content moving *up* as positive,
+                    // the opposite sense to the scroll delta, hence the negation.
+                    const asked = self.scroll_requested_rows - self.scroll_applied_rows;
+                    const did: i64 = -@as(i64, @intCast(ev.rows));
+                    if (asked > 0 and did > 0) {
+                        self.scroll_applied_rows += @min(did, asked);
+                    } else if (asked < 0 and did < 0) {
+                        self.scroll_applied_rows += @max(did, asked);
+                    }
+
+                    // The gesture already places the content continuously, so
+                    // easing toward the model would fight it.
+                    break :scroll;
+                }
 
                 if (!self.config.scroll_animation) break :scroll;
                 if (ev.rows == 0) break :scroll;
