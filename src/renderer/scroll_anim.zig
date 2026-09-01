@@ -24,6 +24,13 @@ offset_px: f32 = 0,
 top: f32 = 0,
 bottom: f32 = 0,
 
+/// Magnitude of the displacement at the most recent push, which sets the
+/// speed of the ramp. Retiring a *fixed* fraction of this per millisecond is
+/// what makes `duration_ms` mean what it says: decaying a fraction of the
+/// *remaining* offset instead is exponential, so it never actually arrives
+/// and spends most of its life creeping through the last pixel of a row.
+span_px: f32 = 0,
+
 /// Below this many pixels there is nothing left to see. Holding a sub-pixel
 /// offset would keep requesting frames forever for no visible benefit.
 pub const min_offset_px: f32 = 0.5;
@@ -61,12 +68,14 @@ pub fn push(
 
     const combined = std.math.clamp(base + offset_px, -@abs(limit), @abs(limit));
     self.offset_px = if (@abs(combined) < min_offset_px) 0 else combined;
+    self.span_px = @abs(self.offset_px);
     self.top = top;
     self.bottom = bottom;
 }
 
 pub fn stop(self: *ScrollAnim) void {
     self.offset_px = 0;
+    self.span_px = 0;
 }
 
 /// Advance the animation by `dt_ms`, retiring the displacement over
@@ -88,7 +97,7 @@ pub fn advance(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
         return;
     }
 
-    const step = (dt_ms / duration_ms) * @abs(self.offset_px);
+    const step = (dt_ms / duration_ms) * self.span_px;
     if (@abs(self.offset_px) <= step) {
         self.offset_px = 0;
         return;
@@ -96,6 +105,31 @@ pub fn advance(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
 
     self.offset_px -= std.math.sign(self.offset_px) * step;
     if (@abs(self.offset_px) < min_offset_px) self.offset_px = 0;
+}
+
+test "ScrollAnim: settles within the configured duration, not long after" {
+    // The whole point of a *duration*: a one-row scroll at 60fps must be done
+    // in the time asked for. Decaying a fraction of the remaining offset
+    // instead stretches an 80ms setting into hundreds of milliseconds of
+    // sub-pixel creep, which reads as smear rather than motion.
+    var a: ScrollAnim = .{};
+    a.push(-38, 1, 52, 10_000);
+    var elapsed: f32 = 0;
+    while (a.active() and elapsed < 1000) : (elapsed += 16) a.advance(16, 80);
+    try testing.expect(!a.active());
+    try testing.expect(elapsed <= 96);
+}
+
+test "ScrollAnim: the ramp is linear, so equal frames move equal distance" {
+    var a: ScrollAnim = .{};
+    a.push(-100, 0, 10, 10_000);
+    const start = a.offset_px;
+    a.advance(10, 100);
+    const first = a.offset_px - start;
+    const before = a.offset_px;
+    a.advance(10, 100);
+    const second = a.offset_px - before;
+    try testing.expectApproxEqAbs(first, second, 0.001);
 }
 
 const testing = std.testing;

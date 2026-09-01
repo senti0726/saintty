@@ -312,6 +312,79 @@ not consume it: scroll animation is OpenGL-only.
 
 ---
 
+## 2026-09-01 — stage 2b VERIFIED working, and the duration bug
+
+First eyeball report was "no artifacts, but the smooth scrolling doesn't
+apply -- dropping `--scroll-animation` made no difference", with the GPU at
+94% (flag on) vs 80% (flag off).
+
+The GPU delta was the useful clue: it meant `animationWake()` was firing, so
+the CPU side was alive and only the pixels were in question.
+
+### Verified, in order, with an automated harness (no eyeballing needed)
+
+A Wayland session is reachable from the agent shell, so this is all
+reproducible without a human:
+
+  * Drive scrolls with `tmux -L animtest` on a **dedicated socket**, so the
+    user's real sessions are untouched. `tmux -L animtest send-keys -t anim -X
+    scroll-up` produces exactly the same IL traffic a touchpad does.
+  * Capture with `spectacle -b -n -f -o shot.png`. It works headlessly on
+    Plasma 6 Wayland; `import` (ImageMagick/X11) does not.
+  * Compare with `magick ... -crop` + `montage`.
+
+1. **Detection**: 10 scroll-ups produced exactly 10
+   `rows=-1 region=1..52 source=insert_lines` events. Correct.
+2. **Config**: logged `enabled=true cell_h=38` at the scroll site. Reaching
+   the renderer.
+3. **Easing**: offset published every frame, -76px decaying smoothly over
+   ~400 frames. Correct.
+4. **std140 layout**: added a permanent `comptime` assertion that
+   `@offsetOf(Uniforms, "scroll_anim") == 144`. It holds. This one is worth
+   keeping -- a layout drift here fails *silently*, the shader just reads
+   neighbouring bytes.
+5. **Shader**: forced a constant `.{ -200, 5, 40, 0 }` and screenshotted.
+   Rows 5..40 shifted by ~10 rows and the display jumped `ROW-04` -> `ROW-10`.
+   The uniform reaches the GPU and the vertex shader honours it.
+6. **The animation itself**: with `--scroll-animation-duration=2000`, one
+   scroll-up, screenshot immediately and again after settling. Mid-flight
+   holds `ROW-12` exactly where settled has `ROW-11`.
+
+**So stage 2b works end to end.** The earlier "it does nothing" reading was
+not a plumbing failure.
+
+### The real defect: the decay was exponential, not linear
+
+`advance()` computed `step = (dt_ms / duration_ms) * @abs(self.offset_px)` --
+a fraction of the *remaining* offset, which is exponential decay. The doc
+comment right above it claimed linear, and the config option is called a
+*duration*, but nothing bounded the time: at the documented 80ms default a
+one-row scroll actually took ~370ms to settle, and spent most of that creeping
+through the last pixel of a row.
+
+That is the "soupy, can't quite see it" character, and it explains the GPU
+too: the animation stayed `active()` far longer than it should, holding the
+60fps draw-wake loop open.
+
+Fixed by storing `span_px` at push time and retiring a fixed fraction of
+*that* per frame, so `duration_ms` means what it says. Two tests added: one
+asserts it settles within the configured duration, one asserts equal frames
+move equal distance.
+
+### The gap that probably matters most
+
+`Terminal.scrollViewport()` does **not** call `noteScroll()` (verified:
+`src/terminal/Terminal.zig:2851`, and the only four `noteScroll` callers are
+`scrollUp`/`scrollDown`/`insertLines`/`deleteLines`). Scrollback scrolling in
+a plain shell is a renderer-level viewport move that never touches the
+terminal model, so **it produces no animation at all**.
+
+Everything verified above is the tmux/alt-screen path. Ordinary
+mouse-wheel-through-scrollback -- probably the most common scrolling there is
+-- is still unanimated. That is the next real decision, and it is not a small
+one: the renderer only builds cells for the viewport rows, so a partial-row
+offset needs one row above or below the viewport to be rendered too.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

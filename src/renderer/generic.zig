@@ -1520,8 +1520,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // its own first.
             if (critical.scroll_event) |ev| scroll: {
                 log.debug(
-                    "scroll event: rows={d} region={d}..{d} source={s}",
-                    .{ ev.rows, ev.top, ev.bottom, @tagName(ev.source) },
+                    "scroll event: rows={d} region={d}..{d} source={s} enabled={} cell_h={d}",
+                    .{ ev.rows, ev.top, ev.bottom, @tagName(ev.source), self.config.scroll_animation, self.size.cell.height },
                 );
 
                 if (!self.config.scroll_animation) break :scroll;
