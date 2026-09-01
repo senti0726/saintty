@@ -200,6 +200,15 @@ pub const ScrollEvent = struct {
     top: usize = 0,
     bottom: usize = 0,
 
+    /// The *true* top margin of the scrolling region.
+    ///
+    /// `top` above is where the scroll started, which for insert/delete lines
+    /// is the cursor row rather than the margin. Anything deciding which rows
+    /// may move on screen has to use this instead, or it will shift rows the
+    /// application deliberately parks outside the margins -- a status bar, a
+    /// prompt box.
+    region_top: usize = 0,
+
     /// Which primitive produced this. `index` fires on every newline at the
     /// bottom of the screen, so it is by far the most common and is the one
     /// most likely to need separate treatment from deliberate scrolling.
@@ -255,6 +264,7 @@ pub fn noteScroll(
         .rows = rows,
         .top = top,
         .bottom = bottom,
+        .region_top = region.top,
         .source = source,
     };
 }

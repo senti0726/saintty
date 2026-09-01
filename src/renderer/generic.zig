@@ -1229,10 +1229,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.scroll_pending_px = 0;
             if (@abs(offset) < ScrollAnim.min_offset_px) return;
 
-            const region: ScrollRegion = self.scroll_region orelse .{
-                .top = 0,
-                .bottom = @floatFromInt(self.size.grid().rows -| 1),
-            };
+            const region: ScrollRegion = self.scroll_region orelse return;
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             self.scroll_anim.push(
                 offset,
@@ -1275,6 +1272,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// clamp keeps the drift from ever becoming a deleted line.
         fn scrollPixelOffset(self: *const Self) f32 {
             if (!self.config.scroll_pixel_perfect) return 0;
+
+            // Only move rows the application has actually told us it scrolls.
+            //
+            // Without a known scrolling region the only honest choice is the
+            // whole grid, and that shifts things deliberately parked outside
+            // it: tmux's status line, nvim's bars, the prompt box an
+            // application keeps pinned to the bottom while it redraws its own
+            // history above. An application that redraws instead of scrolling
+            // never tells us a region, and gets no smoothing rather than a
+            // wobbling interface.
+            if (self.scroll_region == null) return 0;
 
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             const in_flight: f32 = @floatFromInt(
@@ -1727,7 +1735,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // between scrolls moves the same rows, and leaves tmux's
                 // status line alone.
                 self.scroll_region = .{
-                    .top = @floatFromInt(ev.top),
+                    .top = @floatFromInt(ev.region_top),
                     .bottom = @floatFromInt(ev.bottom),
                 };
 
@@ -2110,7 +2118,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             else if (self.scroll_region) |r|
                 .{ r.top, r.bottom }
             else
-                .{ 0, @floatFromInt(self.size.grid().rows -| 1) };
+                .{ 0, 0 };
             self.uniforms.scroll_anim = .{
                 if (@abs(total_off) < ScrollAnim.min_offset_px) 0 else total_off,
                 top,

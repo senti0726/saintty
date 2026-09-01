@@ -3286,8 +3286,18 @@ pub const Surface = extern struct {
         self.momentumPause();
 
         // Multiply precision scrolls by 10 to get a better response from
-        // touchpad scrolling
-        const multiplier: f64 = if (priv.precision_scroll) 10.0 else 1.0;
+        // touchpad scrolling.
+        //
+        // Not under pixel-perfect scrolling. Amplifying the touchpad tenfold
+        // means a few pixels of finger movement is already a whole row, so the
+        // position is quantised before anything downstream can draw it
+        // smoothly -- scrolling as slowly as you can still jumps a line. At
+        // 1:1 the content tracks the finger the way a browser does, and
+        // `mouse-scroll-multiplier` is there to taste it.
+        const multiplier: f64 = if (priv.precision_scroll)
+            (if (surface.config.scroll_pixel_perfect) 1.0 else 10.0)
+        else
+            1.0;
         const scroll_mods: input.ScrollMods = .{
             .precision = priv.precision_scroll,
         };

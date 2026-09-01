@@ -774,6 +774,55 @@ nvim draws into a character grid like every terminal program. Sub-line
 positioning can only come from the terminal. They compose with this, but a
 plugin also multiplies the report traffic behind the flick-hang above.
 
+## 2026-09-02 — the three things that actually stood between this and "Chrome"
+
+Feedback: still not pixel perfect even scrolling as slowly as possible; Claude
+Code's prompt box and hint text move when they should not; and text jumps up
+then straight back down as it approaches the next line.
+
+Three separate causes, all now fixed.
+
+### 1. The touchpad was being amplified 10x before we ever saw it
+
+`ecMouseScrollVertical` multiplied precision scrolls by a hardcoded 10. A few
+pixels of finger movement was therefore already a whole row, and the position
+was quantised long before anything downstream could draw it smoothly -- which
+is exactly why scrolling as slowly as possible still jumped a line.
+
+This was flagged as a known-unknown in the very first SPEC ("why 10?") and
+turned out to be the single biggest obstacle to pixel-perfectness. Under
+`scroll-pixel-perfect` the multiplier is now 1, so content tracks the finger
+the way a browser does; `mouse-scroll-multiplier` tunes it to taste.
+
+### 2. The in-flight term was being applied to synchronous scrolls
+
+`scroll_requested_rows` was counted for *every* scroll. It only makes sense for
+scrolls that go to the application over the pty and come back as a model change
+milliseconds later; the renderer holds the picture still across that gap.
+Viewport scrolling happens synchronously in-process, so counting those held the
+picture still for a gap that never existed -- the text jumping and immediately
+returning. Now counted only on the mouse-reporting path.
+
+### 3. The offset moved rows the application parks outside its margins
+
+Two bugs in one. `ScrollEvent.top` is where the scroll *started*, which for
+insert/delete lines is the cursor row, not the margin -- so it was never the
+right bound for deciding which rows may move. `ScrollEvent.region_top` now
+carries the true top margin.
+
+And with no known region at all the code fell back to the whole grid, which
+shifts everything an application deliberately pins outside it: tmux's status
+line, nvim's bars, Claude Code's prompt box and its hint line. An application
+that redraws rather than scrolls never reports a region, so it now gets **no
+smoothing** instead of a wobbling interface.
+
+### Measurement note
+
+Harness runs during this session read 30ms/frame rather than the usual 17ms.
+That was not a regression: `realesrgan-ncnn` was running at ~79% CPU and it is
+a *GPU* upscaler, competing for the 780M. Check `ps` before trusting a frame
+interval from this harness.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

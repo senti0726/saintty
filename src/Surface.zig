@@ -3526,7 +3526,6 @@ pub fn scrollCallback(
             self.mouse.pending_scroll_y = poff - (rows * cell_size);
             const delta: isize = @intFromFloat(rows);
             if (delta == 0) break :y .{};
-            self.mouse.scroll_requested_rows += @intCast(delta);
             break :y .{ .delta = delta };
         }
 
@@ -3641,6 +3640,15 @@ pub fn scrollCallback(
         // If we're scrolling up or down, then send a mouse event.
         if (self.isMouseReporting()) {
             if (y.delta != 0) {
+                // Count these as in flight only here. A scroll handled by the
+                // application travels down the pty and comes back as a model
+                // change some milliseconds later, and the renderer holds the
+                // picture still across that gap. Viewport scrolling below
+                // happens synchronously, so counting those would hold the
+                // picture still for a gap that never existed -- which looks
+                // like the text jumping and immediately coming back.
+                self.mouse.scroll_requested_rows += @intCast(y.delta);
+
                 const pos = try self.rt_surface.getCursorPos();
                 self.mouseReportRepeat(switch (y.direction()) {
                     .up_right => .four,
