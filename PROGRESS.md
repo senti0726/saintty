@@ -719,6 +719,61 @@ from the terminal, which is what `scroll-pixel-perfect` is. They compose:
 a plugin smooths the timing, this smooths the position. A plugin would also
 *increase* the report traffic behind the flick-hang above.
 
+## 2026-09-02 — the snap is now optional, and the flick-hang is fixed
+
+Take three landed well: "this has to be the fastest one yet, not a single lag
+I caught." Sub-row motion during a gesture works. Three things remained.
+
+### The autocorrect on release (`scroll-pixel-perfect-snap`)
+
+"It autocorrects to the original or the next/previous line depending on the
+scroll direction." That is `settleScrollPixel` doing what it was written to
+do: 120ms after input stops it eases the offset to zero, landing on the app's
+current row -- the original line if the gesture moved less than half a row,
+the next if more.
+
+It exists because a terminal has no content for a partially visible row, so a
+fractional rest leaves a blank sliver up to half a line tall at one edge.
+`scroll-pixel-perfect-snap=false` keeps the gesture's true resting position
+and accepts the sliver. Cheap experiment before committing to the compositing
+work in SPEC section 4 Feature 2, which is the only way to have both.
+
+Note the split in `settleScrollPixel`: the **in-flight term is retired
+either way**. It describes rows still travelling down the pty and once the
+gesture is over there are none, so leaving it would let a miscount pin the
+offset permanently. Only the *fraction* is kept when snapping is off.
+
+### Fast scrolling looks per-line, and always will
+
+Not the GPU -- frames measured 17ms through hard flicks. At fling speed the
+content genuinely advances two or more rows per drawn frame while the offset
+is bounded to half a row, so there is no sub-row detail left to show. This is
+an information limit, not a throughput one, and no tuning improves it.
+
+### The flick-hang: one message instead of hundreds
+
+Root cause was one mailbox message *per wheel report*
+(`for (0..@abs(y.delta)) |_| mouseReport(...)`) against a 64-slot termio
+mailbox. A big flick overran it, and `Mailbox.send` then falls back to a
+**blocking** push (src/termio/mailbox.zig:95) on the GTK main thread: the
+window froze until the app drained a queue the flick had overfilled, then
+jumped to the end position.
+
+Fixed by encoding the report once and queueing all repeats as a single
+message. `mouseEncode` splits encoding from queueing, `queueRepeatedWrite`
+packs the repeats into one `write_small` or `write_alloc`. Every report is
+kept, so the scroll travels exactly as far as asked -- it just costs one queue
+slot instead of hundreds. The alternate-scroll cursor-key path had the same
+flaw and got the same treatment.
+
+### nvim smooth-scroll plugins
+
+neoscroll.nvim, vim-smoothie and mini.animate ease the *timing* of a jump by
+issuing a sequence of small scrolls. They cannot produce sub-line movement --
+nvim draws into a character grid like every terminal program. Sub-line
+positioning can only come from the terminal. They compose with this, but a
+plugin also multiplies the report traffic behind the flick-hang above.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

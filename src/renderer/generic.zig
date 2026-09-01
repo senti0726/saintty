@@ -605,6 +605,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             scroll_animation: bool,
             scroll_animation_duration_ms: u32,
             scroll_pixel_perfect: bool,
+            scroll_pixel_perfect_snap: bool,
             scroll_trace: bool,
             foreground: terminal.color.RGB,
             selection_background: ?configpkg.Config.TerminalColor,
@@ -687,6 +688,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .scroll_animation = config.@"scroll-animation",
                     .scroll_animation_duration_ms = config.@"scroll-animation-duration",
                     .scroll_pixel_perfect = config.@"scroll-pixel-perfect",
+                    .scroll_pixel_perfect_snap = config.@"scroll-pixel-perfect-snap",
                     .scroll_trace = config.@"scroll-trace",
                     .padding_color = config.@"window-padding-color",
 
@@ -1213,10 +1215,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const idle_ms = @divTrunc(ts.durationTo(now).nanoseconds, std.time.ns_per_ms);
             if (idle_ms < settle_idle_ms) return;
 
-            const offset = self.scrollPixelOffset();
-            self.scroll_pending_px = 0;
+            // The in-flight term is always retired: it describes rows still
+            // travelling down the pty, and once the gesture is over there are
+            // none. Leaving it would let a miscount pin the offset for good.
             self.scroll_applied_rows = self.scroll_requested_rows;
             self.scroll_input_ts = null;
+
+            // Without snapping, the leftover fraction *is* the resting
+            // position, so keep it and stop here.
+            if (!self.config.scroll_pixel_perfect_snap) return;
+
+            const offset = self.scrollPixelOffset();
+            self.scroll_pending_px = 0;
             if (@abs(offset) < ScrollAnim.min_offset_px) return;
 
             const region: ScrollRegion = self.scroll_region orelse .{

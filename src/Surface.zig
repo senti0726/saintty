@@ -3628,9 +3628,7 @@ pub fn scrollCallback(
                         .down_left => "\x1b[B",
                     };
                 };
-                for (0..y.magnitude()) |_| {
-                    self.queueIo(.{ .write_stable = seq }, .locked);
-                }
+                self.queueRepeatedWrite(seq, y.magnitude());
             }
 
             return;
@@ -3642,20 +3640,20 @@ pub fn scrollCallback(
 
         // If we're scrolling up or down, then send a mouse event.
         if (self.isMouseReporting()) {
-            for (0..@abs(y.delta)) |_| {
+            if (y.delta != 0) {
                 const pos = try self.rt_surface.getCursorPos();
-                self.mouseReport(switch (y.direction()) {
+                self.mouseReportRepeat(switch (y.direction()) {
                     .up_right => .four,
                     .down_left => .five,
-                }, .press, self.mouse.mods, pos);
+                }, .press, self.mouse.mods, pos, @abs(y.delta));
             }
 
-            for (0..@abs(x.delta)) |_| {
+            if (x.delta != 0) {
                 const pos = try self.rt_surface.getCursorPos();
-                self.mouseReport(switch (x.direction()) {
+                self.mouseReportRepeat(switch (x.direction()) {
                     .up_right => .six,
                     .down_left => .seven,
-                }, .press, self.mouse.mods, pos);
+                }, .press, self.mouse.mods, pos, @abs(x.delta));
             }
 
             // If mouse reporting is on, we do not want to scroll the
@@ -3724,13 +3722,88 @@ pub fn mouseReportingActive(self: *Surface) bool {
     return self.isMouseReporting();
 }
 
-fn mouseReport(
+/// A mouse event encoded to its wire bytes, so it can be encoded once and
+/// written many times.
+const EncodedMouse = struct {
+    data: termio.Message.WriteReq.Small.Array,
+    len: usize,
+
+    fn slice(self: *const EncodedMouse) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
+/// Queue `count` copies of `bytes` to the pty as a **single** message.
+///
+/// One wheel notch is one scroll report, and a hard flick with momentum
+/// produces a great many of them. Queued individually they are one mailbox
+/// message each, and the termio mailbox holds 64 (src/termio/mailbox.zig): a
+/// big flick overruns it, at which point `Mailbox.send` falls back to a
+/// blocking push -- on the GTK main thread, which is where this runs. The
+/// window then freezes until the application at the far end drains a queue the
+/// flick overfilled, and afterwards jumps to wherever the scroll ended up.
+///
+/// Coalescing keeps every report, so the scroll travels exactly as far as
+/// asked; it just costs one queue slot instead of hundreds.
+fn queueRepeatedWrite(self: *Surface, bytes: []const u8, count: usize) void {
+    if (bytes.len == 0 or count == 0) return;
+
+    const total = bytes.len * count;
+    if (total <= @typeInfo(termio.Message.WriteReq.Small.Array).array.len) {
+        var data: termio.Message.WriteReq.Small.Array = undefined;
+        for (0..count) |i| {
+            @memcpy(data[i * bytes.len ..][0..bytes.len], bytes);
+        }
+        self.queueIo(.{ .write_small = .{
+            .data = data,
+            .len = @intCast(total),
+        } }, .locked);
+        return;
+    }
+
+    const buf = self.alloc.alloc(u8, total) catch {
+        // Out of memory is not a reason to lose the scroll entirely; fall
+        // back to the one-message-per-report path.
+        for (0..count) |_| {
+            self.queueIo(.{ .write_small = small: {
+                var data: termio.Message.WriteReq.Small.Array = undefined;
+                @memcpy(data[0..bytes.len], bytes);
+                break :small .{ .data = data, .len = @intCast(bytes.len) };
+            } }, .locked);
+        }
+        return;
+    };
+    for (0..count) |i| @memcpy(buf[i * bytes.len ..][0..bytes.len], bytes);
+    self.queueIo(.{ .write_alloc = .{
+        .alloc = self.alloc,
+        .data = buf,
+    } }, .locked);
+}
+
+/// Encode a mouse event once and queue it `count` times. See
+/// `queueRepeatedWrite` for why the repeats share one message.
+fn mouseReportRepeat(
     self: *Surface,
     button: ?input.MouseButton,
     action: input.MouseAction,
     mods: input.Mods,
     pos: apprt.CursorPos,
+    count: usize,
 ) void {
+    if (count == 0) return;
+    if (count == 1) return self.mouseReport(button, action, mods, pos);
+
+    const encoded = self.mouseEncode(button, action, mods, pos) orelse return;
+    self.queueRepeatedWrite(encoded.slice(), count);
+}
+
+fn mouseEncode(
+    self: *Surface,
+    button: ?input.MouseButton,
+    action: input.MouseAction,
+    mods: input.Mods,
+    pos: apprt.CursorPos,
+) ?EncodedMouse {
     // Mouse reporting must be enabled by both config and terminal state
     assert(self.config.mouse_reporting);
     assert(self.io.terminal.flags.mouse_event != .none);
@@ -3776,15 +3849,26 @@ fn mouseReport(
             // does, let's log it and return. No need to crash upstreams.
             // In the future we may want to fall back to allocation.
             log.warn("failed to encode mouse event err={}", .{err});
-            return;
+            return null;
         },
     };
     const written = writer.buffered();
-    if (written.len == 0) return;
+    if (written.len == 0) return null;
 
+    return .{ .data = data, .len = written.len };
+}
+
+fn mouseReport(
+    self: *Surface,
+    button: ?input.MouseButton,
+    action: input.MouseAction,
+    mods: input.Mods,
+    pos: apprt.CursorPos,
+) void {
+    const encoded = self.mouseEncode(button, action, mods, pos) orelse return;
     self.queueIo(.{ .write_small = .{
-        .data = data,
-        .len = @intCast(written.len),
+        .data = encoded.data,
+        .len = @intCast(encoded.len),
     } }, .locked);
 }
 
