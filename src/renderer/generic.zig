@@ -181,8 +181,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// `applied_rows` counts the ones the model has actually performed.
         /// See `setScrollPixel` and `scrollPixelOffset`.
         scroll_pending_px: f32 = 0,
-        scroll_requested_rows: i64 = 0,
-        scroll_applied_rows: i64 = 0,
 
         /// The last content scrolling region we saw, so a sub-row
         /// displacement that arrives before any scroll event still knows what
@@ -1188,9 +1186,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Record where a scroll gesture currently is.
         ///
         /// Called from the render thread's mailbox.
-        pub fn setScrollPixel(self: *Self, pending_px: f32, requested_rows: i64) void {
+        pub fn setScrollPixel(self: *Self, pending_px: f32) void {
             self.scroll_pending_px = pending_px;
-            self.scroll_requested_rows = requested_rows;
             self.scroll_input_ts = .now(global.io(), .awake);
         }
 
@@ -1215,7 +1212,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const offset = self.scrollPixelOffset();
             self.scroll_pending_px = 0;
-            self.scroll_applied_rows = self.scroll_requested_rows;
             self.scroll_input_ts = null;
             if (@abs(offset) < ScrollAnim.min_offset_px) return;
 
@@ -1235,39 +1231,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The sub-row displacement to draw, in pixels.
         ///
-        /// Two terms. `scroll_pending_px` is the part of the gesture too small
-        /// to have become a row yet -- drawing it is the whole point, since
-        /// otherwise half a row of finger movement shows nothing at all.
-        ///
-        /// The second is the rows we have asked the app for but not yet seen
-        /// it perform. Without it the picture lurches every time a fraction
-        /// becomes a row: the fraction resets to zero the instant the scroll
-        /// event is sent, but the app is at the far end of a pty and has not
-        /// moved yet, so content would snap back a full row and then jump
-        /// forward again when it does. Holding the outstanding rows keeps the
-        /// content exactly where the gesture left it until the model arrives
-        /// underneath it.
+        /// This is only ever a *trailing* offset: the app is rounded to the
+        /// nearest row and the display is held back from it by the leftover.
+        /// Leading is not available to us -- in the alternate screen the row
+        /// that would come into view has not arrived, tmux has it and we do
+        /// not, so drawing ahead leaves a hole exactly as tall as the lead.
+        /// Rounding to nearest in `scrollCallback` bounds the leftover to half
+        /// a row, so the worst case is a half-row sliver at the trailing edge
+        /// rather than a missing line.
         fn scrollPixelOffset(self: *const Self) f32 {
             if (!self.config.scroll_pixel_perfect) return 0;
-
-            const outstanding = self.scroll_requested_rows - self.scroll_applied_rows;
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
-
-            // Cap it. If the app ignores our scrolls -- already at the top of
-            // the scrollback, or not reading the mouse at all -- outstanding
-            // would grow without bound and drag the picture off screen.
-            const limit = ScrollAnim.max_lag_rows;
-            const rows = std.math.clamp(
-                @as(f32, @floatFromInt(outstanding)),
-                -limit,
-                limit,
-            );
-
-            // `requested_rows` is signed like the scroll delta, which is
-            // negative for scrolling down; content moving *up* the screen is a
-            // negative offset. The two agree, so this adds rather than
-            // subtracts.
-            return self.scroll_pending_px + rows * cell_h;
+            return std.math.clamp(self.scroll_pending_px, -cell_h / 2, cell_h / 2);
         }
 
         /// Emit one `scroll-trace` line for this frame.
@@ -1717,30 +1692,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .bottom = @floatFromInt(ev.bottom),
                 };
 
-                if (self.config.scroll_pixel_perfect) {
-                    // Credit this scroll against what we asked for, so the
-                    // outstanding term unwinds as the app catches up. Only
-                    // scrolls that move the way we asked count: a program
-                    // writing output scrolls the model too, and crediting
-                    // those would displace the picture for a gesture that
-                    // never happened.
-                    //
-                    // ScrollEvent.rows counts content moving *up* as
-                    // positive, the opposite of the scroll delta, hence the
-                    // negation.
-                    const asked = self.scroll_requested_rows - self.scroll_applied_rows;
-                    const did: i64 = -@as(i64, @intCast(ev.rows));
-                    if (asked > 0 and did > 0) {
-                        self.scroll_applied_rows += @min(did, asked);
-                    } else if (asked < 0 and did < 0) {
-                        self.scroll_applied_rows += @max(did, asked);
-                    }
-
-                    // The position is already continuous; easing toward it
-                    // would pull content backwards at the very moment the
-                    // gesture moved it forwards.
-                    break :scroll;
-                }
+                // The gesture already places the content continuously, so
+                // easing toward the model would fight it.
+                if (self.config.scroll_pixel_perfect) break :scroll;
 
                 if (!self.config.scroll_animation) break :scroll;
                 if (ev.rows == 0) break :scroll;

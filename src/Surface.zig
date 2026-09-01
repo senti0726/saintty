@@ -243,11 +243,6 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
-    /// Cumulative rows we have turned into scroll events, so the renderer can
-    /// tell how much of the gesture the model has caught up with. Signed the
-    /// same way as `ScrollAmount.delta`.
-    scroll_requested_rows: i64 = 0,
-
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -321,6 +316,7 @@ const DerivedConfig = struct {
     mouse_hide_while_typing: bool,
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
+    scroll_pixel_perfect: bool,
     mouse_shift_capture: configpkg.MouseShiftCapture,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
@@ -401,6 +397,7 @@ const DerivedConfig = struct {
             .mouse_hide_while_typing = config.@"mouse-hide-while-typing",
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
+            .scroll_pixel_perfect = config.@"scroll-pixel-perfect",
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
@@ -3509,6 +3506,23 @@ pub fn scrollCallback(
         // direction and undo a pending scroll.
         const poff: f64 = self.mouse.pending_scroll_y + yoff_adjusted;
 
+        // Pixel-perfect scrolling rounds to the *nearest* row instead of
+        // waiting for a whole one to accumulate.
+        //
+        // The point is which side of the app the leftover falls on. Truncating
+        // means the display is always asked to run ahead of the app, and in
+        // the alternate screen the row it would need to show has not arrived
+        // yet -- tmux has it, we do not -- so leading by a row leaves a row
+        // shaped hole. Rounding to nearest bounds the leftover to half a row
+        // in *either* direction, so the worst case is a half-row sliver at one
+        // edge rather than a deleted line.
+        if (self.config.scroll_pixel_perfect) {
+            const rows = @round(poff / cell_size);
+            self.mouse.pending_scroll_y = poff - (rows * cell_size);
+            const delta: isize = @intFromFloat(rows);
+            break :y if (delta == 0) .{} else .{ .delta = delta };
+        }
+
         // If the new offset is less than a single unit of scroll, we save
         // the new pending value and do not scroll yet.
         if (@abs(poff) < cell_size) {
@@ -3519,13 +3533,16 @@ pub fn scrollCallback(
         // We scroll by the number of rows in the offset and save the remainder
         const amount = poff / cell_size;
         assert(@abs(amount) >= 1);
-        self.mouse.pending_scroll_y = poff - (amount * cell_size);
 
         // Round towards zero.
         const delta: isize = @intFromFloat(@trunc(amount));
         assert(@abs(delta) >= 1);
 
-        self.mouse.scroll_requested_rows += @intCast(delta);
+        // Save the remainder. This has to use the *rounded* delta: `amount`
+        // is poff/cell_size unrounded, so `poff - amount * cell_size` is
+        // identically zero and the sub-cell remainder was being discarded on
+        // every scroll rather than carried into the next one.
+        self.mouse.pending_scroll_y = poff - (@as(f64, @floatFromInt(delta)) * cell_size);
 
         break :y .{ .delta = delta };
     };
@@ -3538,7 +3555,6 @@ pub fn scrollCallback(
         _ = self.renderer_thread.mailbox.push(global.io(), .{
             .scroll_pixel = .{
                 .pending_px = @floatCast(self.mouse.pending_scroll_y),
-                .requested_rows = self.mouse.scroll_requested_rows,
             },
         }, .{ .instant = {} });
     }

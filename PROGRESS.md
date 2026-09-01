@@ -598,6 +598,61 @@ Not investigated. The harness measures the render path, and this smells like
 the app (nvim) or the pty, so the next step is to find out which before
 touching anything.
 
+## 2026-09-01 — pixel-perfect, take two: you can only draw *behind* the app
+
+Take one shipped and was worse than nothing: "hard flick throws off two lines,
+soft flick one, flick up throws off from the bottom and down from the top, and
+the status bar's words disappear."
+
+### The geometry I got wrong
+
+The offset drew content **ahead** of the terminal model. In the alternate
+screen the row that would come into view has not arrived -- tmux has it, we do
+not -- so leading by N rows leaves a hole exactly N rows tall, at the bottom
+when scrolling up and at the top when scrolling down. Precisely the report.
+The new per-fragment clip then did its job and deleted those rows, which is
+why it read as text disappearing rather than as a gap.
+
+**The display can only ever trail the app.** Take one's whole "outstanding
+rows" term existed to hold the display forward across the moment a fraction
+becomes a row, and that is the one thing that cannot be done.
+
+### The upstream bug underneath it
+
+`Surface.scrollCallback` claimed to save the sub-cell remainder:
+
+    const amount = poff / cell_size;                       // f64, unrounded
+    self.mouse.pending_scroll_y = poff - (amount * cell_size);
+
+`amount * cell_size` is `poff`, so this is identically zero. The remainder was
+discarded on every scroll rather than carried into the next one. So during any
+real scrolling `pending_px` was zero and the offset was *purely whole rows*,
+which is what turned a design error into deleted lines. Fixed to use the
+truncated `delta`; this makes precision scrolling more accurate regardless of
+the flag.
+
+### Take two
+
+Round to the **nearest** row instead of truncating, under the flag. Truncating
+always leaves the display owing the app a fraction, i.e. leading. Rounding
+puts the leftover on either side, bounded to half a row, and the offset is
+then just that leftover, clamped to +/- half a cell. Worst case is a half-row
+sliver at the trailing edge instead of a missing line, and the display tracks
+the finger continuously rather than snapping at row boundaries.
+
+The `requested_rows`/`applied_rows` reconciliation is gone entirely, along
+with its assumption that one wheel report always produces exactly one row of
+app scrolling -- an assumption nothing enforces.
+
+### Still unverifiable here
+
+Same as before: this lives in the input path and the harness drives the
+terminal's byte stream, so it cannot exercise it. Real hands required.
+
+### Untouched
+
+Quick flicks hanging in large nvim documents. Still not investigated.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

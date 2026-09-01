@@ -26,17 +26,13 @@ pub const Message = union(enum) {
     /// restarting the timer.
     reset_cursor_blink,
 
-    /// Sub-row scroll state, for pixel-perfect scrolling.
+    /// Sub-row scroll position, for pixel-perfect scrolling.
     ///
-    /// `pending_px` is the part of a scroll gesture too small to have become a
-    /// whole row yet, and `requested_rows` is the cumulative count of rows we
-    /// *have* turned into scroll events. The renderer draws content at
-    /// `pending_px` minus whatever it has asked for but not yet seen the model
-    /// do, which is what keeps the picture continuous across the moment a
-    /// fraction becomes a row.
+    /// How far the gesture sits from the row the app has been scrolled to,
+    /// signed so that it always describes the display trailing the app rather
+    /// than leading it. See `Renderer.scrollPixelOffset`.
     scroll_pixel: struct {
         pending_px: f32,
-        requested_rows: i64,
     },
 
     /// Change the font grid. This can happen for any number of reasons

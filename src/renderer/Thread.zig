@@ -439,7 +439,7 @@ fn drainMailbox(self: *Thread) !void {
             },
 
             .scroll_pixel => |v| {
-                self.renderer.setScrollPixel(v.pending_px, v.requested_rows);
+                self.renderer.setScrollPixel(v.pending_px);
             },
 
             .macos_display_id => |v| {
