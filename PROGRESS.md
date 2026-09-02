@@ -865,6 +865,49 @@ introduces no new diagnostics. Useful trick to remember: `glslc` is installed
 and the original file is the control that separates a real error from a
 target-environment artifact.
 
+## 2026-09-02 — the reverse-scroll oscillation
+
+Report, scrolling steadily in one direction: "down, down, down, up one line and
+directly back down one line, down, down, repeat."
+
+A **full line** is the tell. The sub-row offset is clamped to half a cell and
+can never move a whole line, so the application really was scrolling backwards
+for one step -- meaning we sent it a wheel event in the wrong direction.
+
+Cause, self-inflicted by take two. Rounding to nearest leaves the remainder
+sitting *exactly* on the half-row threshold immediately after a scroll is
+emitted -- the precise point where the next rounding tips over. A touchpad
+always reports a little jitter of the opposite sign, so one stray sample
+rounded backwards and emitted a reverse scroll, which the next sample undid.
+Truncation had hidden this behind a full-row deadband; rounding removed the
+deadband without replacing it.
+
+Fixed with hysteresis: reversing takes a whole row of accumulated offset rather
+than half of one. Turning around still needs only half a row of genuine
+movement, because the remainder is already half a row past.
+
+Very likely the same bug as the nvim complaint ("jumps a lot more now", "jump
+up when scrolling down"): one spurious reverse notch there scrolls a whole
+*logical* line, which with wrapped text is several rows.
+
+### The clip fix verified, and a display trap
+
+The previous commit could not be render-tested because the screen had gone to
+sleep -- the window never reached `info(opengl): loaded OpenGL` and the harness
+traced nothing. Worth recognising: **no OpenGL line in the log means nothing
+rendered, not that the code is broken.** Once the display was awake, a capture
+during an active offset shows the word "STATUS" -- which sits outside the
+scrolling region -- rendering normally. Before the fix it was discarded.
+
+### Two repo hygiene notes
+
+`zig-out-release/` had been committed by a `git add -A` (722 files, including a
+33MB binary). Untracked and added to `.gitignore`.
+
+And do not `pkill -f` a pattern that also matches the shell running it: the
+agent shell matched `emit.py slow` and killed itself mid-command twice, losing
+the commit both times.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

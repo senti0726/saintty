@@ -248,6 +248,10 @@ const Mouse = struct {
     /// done from this to find the rows still in flight down the pty.
     scroll_requested_rows: i64 = 0,
 
+    /// Direction of the last row we emitted under pixel-perfect scrolling,
+    /// for the hysteresis in `scrollCallback`. Zero before the first one.
+    scroll_emit_dir: i8 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -3522,7 +3526,36 @@ pub fn scrollCallback(
         // in *either* direction, so the worst case is a half-row sliver at one
         // edge rather than a deleted line.
         if (self.config.scroll_pixel_perfect) {
-            const rows = @round(poff / cell_size);
+            const raw = poff / cell_size;
+            var rows = @round(raw);
+
+            // Reversing direction takes a whole row, not half of one.
+            //
+            // Rounding to nearest leaves the remainder sitting exactly on the
+            // half-row threshold right after a scroll is emitted -- the precise
+            // point where the next rounding tips over. A touchpad always
+            // reports a little jitter of the opposite sign, so a single stray
+            // sample rounded *backwards* and emitted a scroll the other way,
+            // which the next sample immediately undid: one line up and
+            // straight back down, while the finger moved steadily in one
+            // direction. Truncating used to hide this behind a full-row
+            // deadband.
+            //
+            // Half a row of genuine movement against the current direction is
+            // still enough to turn around, because the remainder is already
+            // half a row over.
+            if (rows != 0) {
+                const dir: i8 = if (rows > 0) 1 else -1;
+                if (self.mouse.scroll_emit_dir != 0 and
+                    dir != self.mouse.scroll_emit_dir and
+                    @abs(raw) < 1.0)
+                {
+                    rows = 0;
+                } else {
+                    self.mouse.scroll_emit_dir = dir;
+                }
+            }
+
             self.mouse.pending_scroll_y = poff - (rows * cell_size);
             const delta: isize = @intFromFloat(rows);
             if (delta == 0) break :y .{};
