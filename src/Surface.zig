@@ -326,6 +326,7 @@ const DerivedConfig = struct {
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     scroll_pixel_perfect: bool,
+    scroll_trace: bool,
     mouse_shift_capture: configpkg.MouseShiftCapture,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
@@ -407,6 +408,7 @@ const DerivedConfig = struct {
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
             .scroll_pixel_perfect = config.@"scroll-pixel-perfect",
+            .scroll_trace = config.@"scroll-trace",
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
@@ -3558,6 +3560,19 @@ pub fn scrollCallback(
 
             self.mouse.pending_scroll_y = poff - (rows * cell_size);
             const delta: isize = @intFromFloat(rows);
+            if (self.config.scroll_trace) log.info(
+                "scrollemit yoff={d:.2} adj={d:.2} poff={d:.2} raw={d:.3} rows={d} dir={d} pending={d:.2} cell={d}",
+                .{
+                    yoff,
+                    yoff_adjusted,
+                    poff,
+                    raw,
+                    delta,
+                    self.mouse.scroll_emit_dir,
+                    self.mouse.pending_scroll_y,
+                    cell_size,
+                },
+            );
             if (delta == 0) break :y .{};
             break :y .{ .delta = delta };
         }
