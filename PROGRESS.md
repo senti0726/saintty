@@ -950,6 +950,36 @@ fault was ours, after several rounds of arguing from symptoms.
 Also: the harness's event regex has to track the log format. Changing the
 scroll-event line silently made `scroll events: 0` in every report.
 
+## 2026-09-02 — "reserved at the bottom" was wrong too; freeze the region instead
+
+The bottom-margin rule from an hour earlier killed smoothing in tmux outright.
+Measured with the tmux harness:
+
+    region=1..54  rows_total=55  src=insert_lines  pixoff=0.00
+
+tmux reserves the row at the **top**, because this user runs
+`status-position top`. A rule keyed on the bottom margin rejected every tmux
+scroll. Which end an application reserves says nothing useful.
+
+The real difference between tmux and Claude Code was never which end, it was
+**stability**: tmux holds one region, Claude Code alternates `0..54` /
+`1..54` as it redraws, and re-deciding per event toggled smoothing between
+frames.
+
+So: adopt a region *between* gestures, never during one. Freezing the choice
+for the duration of a scroll removes the toggling regardless of what the
+application does with its margins, and an application with a stable region is
+unaffected because there is nothing to re-decide.
+
+### Harness limitation worth remembering
+
+`tools/scroll-harness` drives scrolls through `tmux send-keys -X scroll-up`,
+which is command-driven, not mouse-driven. `scroll_pending_px` is only set by
+real pointer input, so **`pixoff` is always 0.00 in harness runs** and the
+harness cannot measure pixel-perfect behaviour at all. It still measures the
+region decision, frame pacing and the animation path. Anything touching the
+input path continues to need a human.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a
