@@ -908,6 +908,48 @@ And do not `pkill -f` a pattern that also matches the shell running it: the
 agent shell matched `emit.py slow` and killed itself mid-command twice, losing
 the commit both times.
 
+## 2026-09-02 — the Claude Code glitch, found by measurement
+
+Four consecutive fixes changed nothing the user could see, because all four
+were reasoned from descriptions. Logging the decision directly found it in one
+capture.
+
+### What the log showed
+
+    region=0..54  rows_total=55  ->  pixoff=0.00
+    region=1..54  rows_total=55  ->  pixoff=-16.28
+
+Claude Code **alternates** its scrolling region between `0..54` and `1..54` as
+it redraws. The rule at the time trusted a region that had been narrowed at
+either end, so `1..54` enabled smoothing and `0..54` disabled it -- switching
+on and off between frames, snapping the whole screen half a row back and forth.
+That is the "goes down one line and directly back up" that survived four fixes.
+
+### The rule that was wrong
+
+Reserving rows at the *top* says nothing about where an interface lives. The
+rows that must not move are the ones pinned *below* the content: tmux's status
+line, nvim's mode line, a prompt box. The test is now `ev.bottom + 1 <
+grid_rows` alone. Claude Code never satisfies it, so it gets no smoothing and
+holds still; tmux and nvim both reserve at the bottom and are unaffected.
+
+### Two lessons worth keeping
+
+**The log printed the wrong field for six rounds.** `ScrollEvent.top` is the
+cursor row for insert/delete lines, not the margin, and the margin is what the
+decision uses. Reading `top` as the region led to a confident and wrong
+conclusion that smoothing was inactive in Claude Code -- which a user A/B then
+flatly contradicted. Log the value the branch actually tests, not a neighbour
+of it.
+
+**An A/B with one variable beats any amount of reasoning.** Running the *old*
+code at the *new* speed (`mouse-scroll-multiplier = precision:0.1`, no
+pixel-perfect) isolated speed from smoothing in a single test and proved the
+fault was ours, after several rounds of arguing from symptoms.
+
+Also: the harness's event regex has to track the log format. Changing the
+scroll-event line silently made `scroll events: 0` in every report.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

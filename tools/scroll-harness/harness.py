@@ -27,7 +27,8 @@ TRACE = re.compile(
     r"top=(-?[\d.]+) bot=(-?[\d.]+) cell_h=(\d+)"
 )
 EVENT = re.compile(
-    r"scroll event: rows=(-?\d+) region=(-?\d+)\.\.(-?\d+) source=(\w+)"
+    r"scroll event: rows=(-?\d+) start=-?\d+ region=(-?\d+)\.\.(-?\d+) "
+    r"rows_total=\d+ src=(\w+)"
 )
 
 

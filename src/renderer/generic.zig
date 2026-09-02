@@ -1760,8 +1760,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // box in place, so treating full-screen as "everything may
                 // move" nudged the box and it sprang back on the next redraw.
                 // Without the signal, hold still.
+                // Trust a region only when it reserves rows at the *bottom*.
+                //
+                // The rows that must not move are the ones an application
+                // pins below its content: tmux's status line, nvim's mode
+                // line, a prompt box. Reserving rows at the top says nothing
+                // about that, and treating it as permission to move
+                // everything else was actively harmful: Claude Code
+                // alternates between `0..54` and `1..54` as it redraws, so
+                // smoothing switched on and off between frames and the whole
+                // screen snapped half a row back and forth.
                 const grid_rows = self.size.grid().rows;
-                const narrowed = ev.region_top > 0 or ev.bottom + 1 < grid_rows;
+                const narrowed = ev.bottom + 1 < grid_rows;
                 self.scroll_region = if (narrowed) .{
                     .top = @floatFromInt(ev.region_top),
                     .bottom = @floatFromInt(ev.bottom),
