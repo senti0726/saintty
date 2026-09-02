@@ -30,7 +30,7 @@ EMIT = re.compile(
 )
 TRACE = re.compile(
     r"scrolltrace t_us=(-?\d+) model_rows=(-?\d+) off_px=(-?[\d.]+) "
-    r"top=(-?[\d.]+) bot=(-?[\d.]+) cell_h=(\d+)"
+    r"inflight=(-?\d+) pending=(-?[\d.]+) top=(-?[\d.]+) bot=(-?[\d.]+) cell_h=(\d+)"
 )
 EVENT = re.compile(r"scroll event: .*region=(-?\d+)\.\.(-?\d+) rows_total=(\d+)")
 
@@ -147,7 +147,7 @@ def analyze(lines: list[str], label: str) -> bool:
         print("  no frames traced")
         return ok
 
-    cell = int(frames[0].group(6))
+    cell = int(frames[0].group(8))
     # The replay has a lead-in; ignore everything before the first emitted
     # scroll so startup output is not mistaken for the gesture.
     first_us = None

@@ -1042,6 +1042,52 @@ between this and the goal.
 `traceScrollFrame` logs `top`/`bot` from `scroll_anim`, not the region actually
 published to the shader. Reading `top=0 bot=0` as "no region" cost an hour.
 
+## 2026-09-02 — measured: tmux answers in 0.3ms, the 200ms was ours
+
+The freezing was blamed on tmux being slow. Measuring it directly, outside
+Ghostty, with a pty harness sending SGR wheel events:
+
+    tmux wheel->output latency: n=12 min=0.3ms median=0.3ms max=0.5ms
+
+So the ~200ms was entirely inside Ghostty, and therefore fixable. **Measure the
+other end before concluding something external is slow.**
+
+### What was actually stuck
+
+`inflight=1` permanently. The compensation for "a scroll we asked for that the
+application has not performed yet" was never retired, so the offset sat on its
+half-row clamp for the whole gesture and only whole-row model steps showed.
+
+The cause is an ordering race, and it defeated two designs in a row. tmux
+answers a wheel event in 0.3ms -- **faster than our own cross-thread message
+announcing that we asked for it**. So the model's scroll can be seen *before*
+the request. A pair of counters guarded by `asked > 0` skipped the credit and
+stayed one apart for ever; a flag retired on the matching event was cleared
+before the request that set it, then set again and never cleared.
+
+Now: count both sides, take the difference, and clamp it towards zero from the
+far side, so seeing the scroll first reads as "nothing in flight" rather than
+as a scroll the other way. A deadline (`scroll_outstanding_ms`) expires the
+compensation as well, so an application that ignores the wheel makes the
+picture lag instead of freezing.
+
+### Result, from the input harness
+
+| | before | after |
+|---|---|---|
+| frames where the picture moved | 25 | 107 |
+| median step | 36.6px (0.96 rows) | 4.8px (0.13 rows) |
+| full-row jumps | 56% | 13% |
+
+Genuine sub-row motion for the first time.
+
+### Still failing
+
+One full-row jump and one reversal per emitted scroll remain, at the moment the
+remainder wraps: the display steps back a row before the compensation covers
+it. Reproducible in `input.py`, so it can be chased without a human. `jitter`
+is worst (28% reversals) and is the closest gesture to real use.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

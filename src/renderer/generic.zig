@@ -182,7 +182,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// See `setScrollPixel` and `scrollPixelOffset`.
         scroll_pending_px: f32 = 0,
         scroll_requested_rows: i64 = 0,
-        scroll_applied_rows: i64 = 0,
+
+        /// Direction of a scroll we have asked for and not yet seen the
+        /// application perform, or 0 for none.
+        ///
+        /// This compensation is bounded by *time*, not by a matching event,
+        /// and that is deliberate. It was first a pair of counters and then a
+        /// flag retired when the application scrolled, and both got stuck on
+        /// the same race: tmux answers a wheel event in about 0.3ms, faster
+        /// than our own cross-thread message announcing that we asked for it,
+        /// so the retire ran before the request and the compensation was never
+        /// cleared. It then pinned the offset at its clamp for the whole
+        /// gesture and only whole-row steps showed -- the exact symptom this
+        /// feature exists to remove.
+        ///
+        /// A deadline cannot get stuck. The gap being bridged is the frame or
+        /// so between asking and seeing it happen; if an application is slower
+        /// than that, the compensation expires and the picture simply lags
+        /// rather than freezing.
+        scroll_outstanding: i8 = 0,
+        scroll_outstanding_ts: ?std.Io.Timestamp = null,
+
+        /// Rows the application has scrolled during this gesture, in the same
+        /// sign convention as `scroll_requested_rows`. The difference between
+        /// the two is what is still in flight, and counting both ways is what
+        /// makes it robust to the ordering: the application answers a wheel
+        /// event faster than our own message announcing it, so either can be
+        /// seen first, and a difference that comes out on the wrong side of
+        /// zero simply clamps away.
+        scroll_model_rows: i64 = 0,
 
         /// The last content scrolling region we saw, so a sub-row
         /// displacement that arrives before any scroll event still knows what
@@ -1080,6 +1108,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// as a delay once the fingers lift.
         pub const settle_idle_ms: i64 = 120;
 
+        /// How long a requested-but-unseen scroll keeps its compensation. Long
+        /// enough to cover the round trip to a responsive application, short
+        /// enough that a slow one lags rather than freezing.
+        pub const scroll_outstanding_ms: i64 = 40;
+
         /// A point in the future when the renderer needs to be driven
         /// again to keep animating, and what kind of drive it needs.
         pub const AnimationWake = struct {
@@ -1203,6 +1236,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // may not be the one that was scrolling last time.
             if (self.scroll_input_ts == null) self.scroll_region_locked = false;
             self.scroll_pending_px = pending_px;
+            const asked = requested_rows - self.scroll_requested_rows;
+            if (asked != 0) {
+                self.scroll_outstanding = if (asked > 0) 1 else -1;
+                self.scroll_outstanding_ts = .now(global.io(), .awake);
+            }
             self.scroll_requested_rows = requested_rows;
             self.scroll_input_ts = .now(global.io(), .awake);
         }
@@ -1229,7 +1267,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // The in-flight term is always retired: it describes rows still
             // travelling down the pty, and once the gesture is over there are
             // none. Leaving it would let a miscount pin the offset for good.
-            self.scroll_applied_rows = self.scroll_requested_rows;
+            self.scroll_outstanding = 0;
+            self.scroll_outstanding_ts = null;
+            self.scroll_model_rows = self.scroll_requested_rows;
             self.scroll_input_ts = null;
             self.scroll_region_locked = false;
 
@@ -1297,9 +1337,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.scroll_region == null) return 0;
 
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
-            const in_flight: f32 = @floatFromInt(
-                self.scroll_requested_rows - self.scroll_applied_rows,
-            );
+            const in_flight: f32 = flight: {
+                if (self.scroll_outstanding == 0) break :flight 0;
+
+                // A request that never produced a scroll expires, so an
+                // application that ignores the wheel makes the picture lag
+                // rather than hold a compensation for ever.
+                const ts = self.scroll_outstanding_ts orelse break :flight 0;
+                const now: std.Io.Timestamp = .now(global.io(), .awake);
+                const age_ms = @divTrunc(
+                    ts.durationTo(now).nanoseconds,
+                    std.time.ns_per_ms,
+                );
+                if (age_ms > scroll_outstanding_ms) break :flight 0;
+
+                // Outstanding is what we asked for less what the application
+                // has done. Clamped towards zero from the far side, so seeing
+                // the scroll before the request reads as "nothing in flight"
+                // rather than as a scroll in the opposite direction.
+                const diff = self.scroll_requested_rows - self.scroll_model_rows;
+                const f: f32 = @floatFromInt(diff);
+                break :flight if (self.scroll_outstanding > 0)
+                    std.math.clamp(f, 0, 1)
+                else
+                    std.math.clamp(f, -1, 0);
+            };
             const offset = self.scroll_pending_px + in_flight * cell_h;
             return std.math.clamp(offset, -cell_h / 2, cell_h / 2);
         }
@@ -1319,7 +1381,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             const t_us = @divTrunc(base.durationTo(now).nanoseconds, std.time.ns_per_us);
             log.info(
-                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} top={d} bot={d} cell_h={d}",
+                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} inflight={d} pending={d:.2} top={d} bot={d} cell_h={d}",
                 .{
                     t_us,
                     self.scroll_trace_rows,
@@ -1328,6 +1390,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // scrolling, which is exactly the part that keeps
                     // breaking.
                     self.scroll_anim.offset_px + self.scrollPixelOffset(),
+                    self.scroll_outstanding,
+                    self.scroll_pending_px,
                     self.scroll_anim.top,
                     self.scroll_anim.bottom,
                     self.size.cell.height,
@@ -1747,7 +1811,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             @tagName(ev.source),
                             self.config.scroll_pixel_perfect,
                             self.scroll_requested_rows,
-                            self.scroll_applied_rows,
+                            self.scroll_outstanding,
                             self.scroll_pending_px,
                             self.scrollPixelOffset(),
                             self.size.cell.height,
@@ -1801,21 +1865,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 if (self.config.scroll_pixel_perfect) {
-                    // Retire this scroll against what we asked for, so the
-                    // in-flight term unwinds as the app catches up. Only
-                    // scrolls going the way we asked count: a program writing
-                    // output scrolls the model too, and crediting those would
-                    // displace the picture for a gesture that never happened.
+                    // The application moved the way we asked, so nothing is
+                    // outstanding any more. Only matching directions count: a
+                    // program writing output scrolls the model too, and
+                    // retiring on those would drop the compensation for a
+                    // scroll still in flight.
                     //
                     // ScrollEvent.rows counts content moving *up* as positive,
                     // the opposite sense to the scroll delta, hence the negation.
-                    const asked = self.scroll_requested_rows - self.scroll_applied_rows;
                     const did: i64 = -@as(i64, @intCast(ev.rows));
-                    if (asked > 0 and did > 0) {
-                        self.scroll_applied_rows += @min(did, asked);
-                    } else if (asked < 0 and did < 0) {
-                        self.scroll_applied_rows += @max(did, asked);
+                    if ((self.scroll_outstanding > 0 and did > 0) or
+                        (self.scroll_outstanding < 0 and did < 0))
+                    {
+                        self.scroll_outstanding = 0;
+                        self.scroll_outstanding_ts = null;
                     }
+                    self.scroll_model_rows += did;
 
                     // The gesture already places the content continuously, so
                     // easing toward the model would fight it.
