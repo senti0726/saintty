@@ -24,12 +24,12 @@ offset_px: f32 = 0,
 top: f32 = 0,
 bottom: f32 = 0,
 
-/// Magnitude of the displacement at the most recent push, which sets the
-/// speed of the ramp. Retiring a *fixed* fraction of this per millisecond is
-/// what makes `duration_ms` mean what it says: decaying a fraction of the
-/// *remaining* offset instead is exponential, so it never actually arrives
-/// and spends most of its life creeping through the last pixel of a row.
-span_px: f32 = 0,
+/// The displacement at the most recent push, signed, and how long ago that
+/// was. The drawn offset is this curved down to zero over `duration_ms`
+/// rather than integrated frame by frame, so the shape of the motion is a
+/// property of the curve and not of the frame timing.
+start_px: f32 = 0,
+elapsed_ms: f32 = 0,
 
 /// Below this many pixels there is nothing left to see. Holding a sub-pixel
 /// offset would keep requesting frames forever for no visible benefit.
@@ -88,23 +88,40 @@ pub fn push(
 
     const combined = std.math.clamp(base + offset_px, -@abs(limit), @abs(limit));
     self.offset_px = if (@abs(combined) < min_offset_px) 0 else combined;
-    self.span_px = @abs(self.offset_px);
+
+    // Restart the curve from wherever we now are. A scroll arriving mid-flight
+    // should accelerate away from the current position, not resume a curve
+    // aimed at a total that is no longer true.
+    self.start_px = self.offset_px;
+    self.elapsed_ms = 0;
     self.top = top;
     self.bottom = bottom;
 }
 
 pub fn stop(self: *ScrollAnim) void {
     self.offset_px = 0;
-    self.span_px = 0;
+    self.start_px = 0;
+    self.elapsed_ms = 0;
+}
+
+/// Cubic ease-out: quick away from the old position, decelerating into the
+/// new one.
+///
+/// A linear ramp arrives at full speed and stops dead, which reads as
+/// mechanical next to a browser however short it is. This is the difference a
+/// person actually notices, and it matters most for a mouse wheel, where one
+/// notch is a large discrete jump rather than a finger's worth of pixels.
+fn easeOut(t: f32) f32 {
+    const inv = 1.0 - t;
+    return 1.0 - inv * inv * inv;
 }
 
 /// Advance the animation by `dt_ms`, retiring the displacement over
 /// `duration_ms`.
 ///
-/// Linear rather than exponential: a scroll has a definite end, and an
-/// exponential tail leaves a fraction of a row hanging around looking like a
-/// misaligned grid rather than motion. The rate is proportional to how far
-/// this particular scroll had to travel, so a large jump does not crawl.
+/// Eased rather than linear, and computed from elapsed time rather than
+/// integrated, so a dropped or long frame lands where it should instead of
+/// accumulating error.
 pub fn advance(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
     if (!self.active()) return;
 
@@ -112,19 +129,15 @@ pub fn advance(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
     // the right failure: the model is already correct, so snapping to it
     // shows the truth rather than a stale intermediate position.
     if (!(dt_ms > 0) or !(duration_ms > 0)) return;
-    if (dt_ms >= duration_ms) {
+
+    self.elapsed_ms += dt_ms;
+    if (self.elapsed_ms >= duration_ms) {
         self.offset_px = 0;
         return;
     }
 
-    const step = (dt_ms / duration_ms) * self.span_px;
-    if (@abs(self.offset_px) <= step) {
-        self.offset_px = 0;
-        return;
-    }
-
-    self.offset_px -= std.math.sign(self.offset_px) * step;
-    if (@abs(self.offset_px) < min_offset_px) self.offset_px = 0;
+    const remaining = self.start_px * (1.0 - easeOut(self.elapsed_ms / duration_ms));
+    self.offset_px = if (@abs(remaining) < min_offset_px) 0 else remaining;
 }
 
 test "ScrollAnim: settles within the configured duration, not long after" {
@@ -140,16 +153,32 @@ test "ScrollAnim: settles within the configured duration, not long after" {
     try testing.expect(elapsed <= 96);
 }
 
-test "ScrollAnim: the ramp is linear, so equal frames move equal distance" {
+test "ScrollAnim: eases out, so early frames move further than late ones" {
+    // The property a person notices: leave the old position quickly, arrive at
+    // the new one gently. A linear ramp arrives at full speed and stops dead.
     var a: ScrollAnim = .{};
     a.push(-100, 0, 10, 10_000);
     const start = a.offset_px;
     a.advance(10, 100);
-    const first = a.offset_px - start;
+    const first = @abs(a.offset_px - start);
     const before = a.offset_px;
     a.advance(10, 100);
-    const second = a.offset_px - before;
-    try testing.expectApproxEqAbs(first, second, 0.001);
+    const second = @abs(a.offset_px - before);
+    try testing.expect(first > second);
+}
+
+test "ScrollAnim: position comes from elapsed time, not accumulated frames" {
+    // One long frame must land where several short ones would, so a dropped
+    // frame does not leave the animation behind.
+    var a: ScrollAnim = .{};
+    var b: ScrollAnim = .{};
+    a.push(-100, 0, 10, 10_000);
+    b.push(-100, 0, 10, 10_000);
+    a.advance(30, 100);
+    b.advance(10, 100);
+    b.advance(10, 100);
+    b.advance(10, 100);
+    try testing.expectApproxEqAbs(a.offset_px, b.offset_px, 0.001);
 }
 
 const testing = std.testing;

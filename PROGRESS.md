@@ -1266,6 +1266,35 @@ sounds: the animation machinery is already written and measures clean.
   * `harness.py`'s trace pattern, which the new trace format had silently
     broken into reporting zero frames
 
+## 2026-09-03 — ease-out, which is what a browser is doing
+
+User, on the animation path: "much better really... but it's lacking a little
+compared to Chrome. Is there some sort of curve in Chrome's mouse scroll?"
+
+Correct diagnosis. The ramp was deliberately *linear* -- constant speed, chosen
+earlier to kill an exponential tail that never arrived. Linear motion leaves at
+full speed and stops dead, which reads as mechanical however short it is. A
+browser eases out: most of the travel immediately, decelerating into place.
+
+`advance` now computes position from elapsed time along a cubic ease-out rather
+than integrating a fixed step. Two consequences worth having:
+
+  * **Feel.** Step sizes on the same gesture went from a flat 7.6-8.1px to
+    7.3px median with a 22.8px maximum -- early frames travel far, late frames
+    barely move.
+  * **Less lag, not more.** Mean lag behind the model fell from 0.40 rows to
+    0.29, because most of the distance is covered in the first third.
+
+Computing from elapsed time also makes a dropped frame land where it should
+instead of leaving the animation behind, which the old integrating form could
+not do. There is a test for that.
+
+Default duration 80ms -> 120ms. A linear ramp had to be short or it felt like
+lag; an eased one spends its tail decelerating, so a longer curve reads as
+smoother rather than slower, and it is closer to what a browser uses.
+
+Still 0 reversals and 0 whole-row jumps.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

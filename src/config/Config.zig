@@ -1096,10 +1096,12 @@ palette: Palette = .{},
 
 /// How long an application scroll takes to settle, in milliseconds.
 ///
-/// Longer is smoother but delays the content further; past roughly 150ms it
-/// starts to feel like lag rather than motion. Has no effect unless
+/// The motion is eased, not constant speed: most of the travel happens in the
+/// first third and the rest decelerates into place, which is what a browser
+/// does and why a longer duration reads as smoother rather than slower. Past
+/// roughly 200ms it starts to feel like lag. Has no effect unless
 /// `scroll-animation` is enabled.
-@"scroll-animation-duration": u32 = 80,
+@"scroll-animation-duration": u32 = 120,
 
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
