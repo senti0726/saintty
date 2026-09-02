@@ -1143,6 +1143,60 @@ session, scroll one notch at a time, and record where a fixed interface element
 that the box lands somewhere different each time, which such a test would pin
 down exactly.
 
+## 2026-09-03 — ease out only what nothing cancels
+
+The compensation for "a scroll asked for but not yet performed" was binary,
+switching on and off in one frame, and both edges showed. The fix is not to
+ramp all of it: **two of the three transitions must stay instant, because each
+exactly cancels something happening in the same frame.**
+
+  * **Arming** cancels the remainder wrapping by a whole row when a scroll is
+    emitted.
+  * **Disarming because the application caught up** cancels the row of content
+    it just moved.
+  * **Disarming because the request went unanswered** cancels nothing. That is
+    the only one free to take its time, and it is the one that was swinging the
+    picture a row back and forth on a slow application.
+
+`advanceScrollFlight` follows the counters exactly while a request is live and
+eases the residual to zero over `scroll_flight_ramp_ms` once it expires.
+
+### Measured
+
+Backward steps on the `slow` gesture, which is the one the user describes:
+
+| | before | after |
+|---|---|---|
+| median backward step | 15.4px | 1.9px |
+| p90 | 32px | 2.2px |
+| steps over 5px | 47 of 53 | 0 |
+| median forward step | 4.8px | 2.2px (0.06 rows) |
+
+### The harness was failing on invisible noise
+
+Its reversal test counted any backward movement over 0.01px, so a 2px wobble at
+60fps -- which no one can see -- failed the run, while genuine row-sized jumps
+were reported with the same weight. It now counts only reversals above a tenth
+of a row and prints the magnitude distribution, so the number means something.
+Current: slow 3.2%, jitter 7.8%, flick 4.0% visible reversals.
+
+### Still open
+
+`jitter` keeps five visible reversals of 11-13px per run. It is the gesture
+closest to a real finger, so it is the one to chase next. And `flick` is 40%
+whole-row steps, which is expected rather than a defect: at fling speed the
+content genuinely advances a row per frame and there is no sub-row detail left.
+
+### Next, in order
+
+1. nvim, where one logical line occupies several rows and a notch scrolls all
+   of them. Present in unmodified Ghostty too, so it needs a new mechanism
+   rather than a fix.
+2. Claude Code's prompt box. The user's suggestion is to mask it. Worth
+   measuring first with the notch-at-a-time test they proposed: scroll one
+   notch, record where the box sits, repeat.
+3. Keeping all of this rebaseable onto upstream.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

@@ -216,6 +216,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// zero simply clamps away.
         scroll_model_rows: i64 = 0,
 
+        /// The compensation actually drawn, which follows the counters exactly
+        /// but eases away when a request goes unanswered. See
+        /// `advanceScrollFlight`.
+        scroll_flight: f32 = 0,
+        scroll_flight_last: ?std.Io.Timestamp = null,
+
         /// The last content scrolling region we saw, so a sub-row
         /// displacement that arrives before any scroll event still knows what
         /// to move. Null means we have not seen one and the whole grid is
@@ -1117,6 +1123,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// enough that a slow one lags rather than freezing.
         pub const scroll_outstanding_ms: i64 = 40;
 
+        /// How long an unanswered scroll's compensation takes to fade away.
+        /// Slow enough not to read as a jump, quick enough that the picture is
+        /// not left leaning on a stale request.
+        pub const scroll_flight_ramp_ms: f32 = 140;
+
         /// A point in the future when the renderer needs to be driven
         /// again to keep animating, and what kind of drive it needs.
         pub const AnimationWake = struct {
@@ -1249,6 +1260,77 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.scroll_input_ts = .now(global.io(), .awake);
         }
 
+        /// Bring `scroll_flight` to what should be drawn this frame.
+        ///
+        /// Two of the three transitions have to be *instant*, because each is
+        /// an exact cancellation of something happening in the same frame.
+        /// Arming cancels the remainder wrapping by a whole row when a scroll
+        /// is emitted; disarming because the application caught up cancels the
+        /// row of content it just moved. Ramping either of those would put the
+        /// jump back rather than removing it.
+        ///
+        /// The third transition is the one to ease: a request the application
+        /// never answered. Dropping that in a single frame -- and re-arming on
+        /// the next request -- is what swung the picture a whole row back and
+        /// forth several times a second on a slow application. Nothing cancels
+        /// it, so it is free to take its time.
+        fn advanceScrollFlight(self: *Self) void {
+            if (!self.config.scroll_pixel_perfect) {
+                self.scroll_flight = 0;
+                self.scroll_flight_last = null;
+                return;
+            }
+
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const last = self.scroll_flight_last;
+            self.scroll_flight_last = now;
+
+            var expired = false;
+            const target: f32 = target: {
+                if (self.scroll_outstanding == 0) break :target 0;
+                const ts = self.scroll_outstanding_ts orelse break :target 0;
+                const age_ms = @divTrunc(
+                    ts.durationTo(now).nanoseconds,
+                    std.time.ns_per_ms,
+                );
+                if (age_ms > scroll_outstanding_ms) {
+                    expired = true;
+                    break :target 0;
+                }
+
+                // What we asked for less what the application has done,
+                // clamped towards zero from the far side so that seeing the
+                // scroll before the request reads as nothing in flight rather
+                // than as a scroll the other way.
+                const diff: f32 = @floatFromInt(
+                    self.scroll_requested_rows - self.scroll_model_rows,
+                );
+                break :target if (self.scroll_outstanding > 0)
+                    std.math.clamp(diff, 0, 1)
+                else
+                    std.math.clamp(diff, -1, 0);
+            };
+
+            if (!expired) {
+                self.scroll_flight = target;
+                return;
+            }
+
+            const prev = last orelse return;
+            const dt_ms: f32 = @floatFromInt(@divTrunc(
+                prev.durationTo(now).nanoseconds,
+                std.time.ns_per_ms,
+            ));
+            if (!(dt_ms > 0)) return;
+
+            const step = dt_ms / scroll_flight_ramp_ms;
+            if (@abs(self.scroll_flight) <= step) {
+                self.scroll_flight = 0;
+            } else {
+                self.scroll_flight -= std.math.sign(self.scroll_flight) * step;
+            }
+        }
+
         /// Once the gesture is over, retire the sub-row displacement.
         ///
         /// Two reasons this is not optional. A fraction of a row left standing
@@ -1273,6 +1355,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // none. Leaving it would let a miscount pin the offset for good.
             self.scroll_outstanding = 0;
             self.scroll_outstanding_ts = null;
+            self.scroll_flight = 0;
             self.scroll_model_rows = self.scroll_requested_rows;
             self.scroll_input_ts = null;
             self.scroll_region_locked = false;
@@ -1341,35 +1424,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.scroll_region == null) return 0;
 
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
-            const in_flight: f32 = flight: {
-                if (self.scroll_outstanding == 0) break :flight 0;
-
-                // The deadline is load-bearing: without it the compensation
-                // stays clamped on for the whole gesture and the picture stops
-                // moving altogether (measured: 102 moving frames down to 6).
-                // It does have a cost -- expiry drops the compensation in a
-                // single frame, and a fresh request re-arms it, which is where
-                // the remaining back-and-forth comes from.
-                const ts = self.scroll_outstanding_ts orelse break :flight 0;
-                const now: std.Io.Timestamp = .now(global.io(), .awake);
-                const age_ms = @divTrunc(
-                    ts.durationTo(now).nanoseconds,
-                    std.time.ns_per_ms,
-                );
-                if (age_ms > scroll_outstanding_ms) break :flight 0;
-
-                // Outstanding is what we asked for less what the application
-                // has done. Clamped towards zero from the far side, so seeing
-                // the scroll before the request reads as "nothing in flight"
-                // rather than as a scroll in the opposite direction.
-                const diff = self.scroll_requested_rows - self.scroll_model_rows;
-                const f: f32 = @floatFromInt(diff);
-                break :flight if (self.scroll_outstanding > 0)
-                    std.math.clamp(f, 0, 1)
-                else
-                    std.math.clamp(f, -1, 0);
-            };
-            const offset = self.scroll_pending_px + in_flight * cell_h;
+            const offset = self.scroll_pending_px + self.scroll_flight * cell_h;
             return std.math.clamp(offset, -cell_h / 2, cell_h / 2);
         }
 
@@ -2240,6 +2295,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Done here, immediately before upload, so the value drawn is the
             // value computed for this frame.
             self.settleScrollPixel();
+            self.advanceScrollFlight();
             self.advanceScrollAnim();
             if (self.config.scroll_trace) self.traceScrollFrame();
             const pixel_off = self.scrollPixelOffset();

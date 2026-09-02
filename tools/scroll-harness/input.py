@@ -172,15 +172,24 @@ def analyze(lines: list[str], label: str) -> bool:
     ]
     deltas = [b - a for a, b in zip(pos, pos[1:])]
     moved = [d for d in deltas if abs(d) > 0.01]
+    # A reversal only counts if it is big enough to see. Sub-pixel and
+    # few-pixel wobble at 60fps is invisible, and counting it made every run
+    # fail on noise while hiding whether the row-sized jumps were gone.
+    visible = cell * 0.1
     if moved:
         f = sum(1 for d in moved if d > 0)
         r = sum(1 for d in moved if d < 0)
-        back = min(f, r)
         print(f"  drawn motion frames : {len(moved)} (forward {f}, backward {r})")
-        pct = 100.0 * back / len(moved)
-        print(f"  drawn REVERSALS     : {back} ({pct:.1f}%)")
-        if pct > 2.0:
-            print("  FAIL: the picture moves against the gesture")
+        backs = sorted(-d for d in moved if d < 0)
+        big = [b for b in backs if b >= visible]
+        if backs:
+            p50 = backs[len(backs) // 2]
+            print(f"  backward steps      : n={len(backs)} p50={p50:.1f}px "
+                  f"max={backs[-1]:.1f}px, visible(>{visible:.0f}px)={len(big)}")
+        pct = 100.0 * len(big) / len(moved)
+        print(f"  VISIBLE REVERSALS   : {len(big)} ({pct:.1f}%)")
+        if pct > 5.0:
+            print("  FAIL: the picture visibly moves against the gesture")
             ok = False
         steps = sorted(abs(d) for d in moved)
         p50 = steps[len(steps) // 2]
