@@ -757,6 +757,13 @@ pub const Surface = extern struct {
         /// 0 means there is no paused fling.
         momentum_paused_us: i64 = 0,
 
+        /// Recorded touchpad samples being replayed for testing, the index of
+        /// the next one, and the timer feeding them. See
+        /// `scroll-input-script`.
+        replay: ?[]f64 = null,
+        replay_idx: usize = 0,
+        replay_timer: c_uint = 0,
+
         overrides: struct {
             command: ?configpkg.Command = null,
             shell_integration: ?configpkg.Config.ShellIntegration = null,
@@ -3272,6 +3279,82 @@ pub const Surface = extern struct {
         return if (priv.momentum_tick == null) 0 else 1;
     }
 
+    /// Load `scroll-input-script` and start feeding it through the real
+    /// scroll handler.
+    ///
+    /// Synthesising touchpad events at the OS level needs uinput and root.
+    /// Feeding the samples in here instead costs nothing and still exercises
+    /// everything that has actually been breaking: the precision multiplier,
+    /// momentum, the rounding that decides when to scroll, the sub-row offset
+    /// and the region logic.
+    fn startScrollReplay(self: *Self) void {
+        const priv = self.private();
+        const surface = priv.core_surface orelse return;
+        const path = surface.config.scroll_input_script orelse return;
+
+        const alloc = Application.default().allocator();
+        const data = std.Io.Dir.cwd().readFileAlloc(
+            global.io(),
+            path,
+            alloc,
+            .limited(1024 * 1024),
+        ) catch |err| {
+            log.warn("scroll-input-script unreadable path={s} err={}", .{ path, err });
+            return;
+        };
+        defer alloc.free(data);
+
+        var list: std.ArrayList(f64) = .empty;
+        defer list.deinit(alloc);
+        var it = std.mem.tokenizeAny(u8, data, "\r\n");
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t");
+            if (line.len == 0 or line[0] == '#') continue;
+            if (line[0] == '@') {
+                // `@n` waits n frames, so pauses between gestures replay too.
+                const n = std.fmt.parseInt(usize, line[1..], 10) catch continue;
+                for (0..n) |_| list.append(alloc, 0) catch return;
+                continue;
+            }
+            const v = std.fmt.parseFloat(f64, line) catch continue;
+            list.append(alloc, v) catch return;
+        }
+        if (list.items.len == 0) return;
+
+        priv.replay = list.toOwnedSlice(alloc) catch return;
+        priv.replay_idx = 0;
+        log.info("scroll replay: {d} samples from {s}", .{ priv.replay.?.len, path });
+        priv.replay_timer = glib.timeoutAdd(8, scrollReplayTick, self);
+    }
+
+    fn scrollReplayTick(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const priv = self.private();
+        const samples = priv.replay orelse return 0;
+
+        if (priv.replay_idx >= samples.len) {
+            log.info("scroll replay: done", .{});
+            priv.replay_timer = 0;
+            return 0;
+        }
+
+        const dy = samples[priv.replay_idx];
+        priv.replay_idx += 1;
+
+        // A zero sample is a deliberate pause, not a scroll of nothing:
+        // delivering it would reset momentum and defeat the point.
+        if (dy != 0) {
+            // GTK reports precision deltas with the opposite sign to ours and
+            // sets the precision flag, so go through the same entry point
+            // rather than a shortcut, or the test stops testing the thing that
+            // breaks.
+            priv.precision_scroll = true;
+            _ = ecMouseScrollVertical(undefined, 0, dy, self);
+        }
+
+        return 1;
+    }
+
     fn ecMouseScrollVertical(
         _: *gtk.EventControllerScroll,
         x: f64,
@@ -3804,6 +3887,8 @@ pub const Surface = extern struct {
 
         // Store it!
         priv.core_surface = surface;
+
+        self.startScrollReplay();
 
         // Emit the signal that we initialized the surface.
         Surface.signals.init.impl.emit(

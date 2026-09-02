@@ -191,6 +191,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// tmux, until its first scroll names the region.
         scroll_region: ?ScrollRegion = null,
 
+        /// Whether `scroll_region` has been decided for the gesture in
+        /// progress. Decided once, on the first scroll of the gesture, then
+        /// held: re-deciding per event is what let Claude Code's alternating
+        /// margins toggle smoothing between frames, and deciding only between
+        /// gestures meant a gesture that began before any region was known
+        /// smoothed nothing at all.
+        scroll_region_locked: bool = false,
+
         /// When scroll input last arrived, so the sub-row displacement can be
         /// settled once the gesture is over.
         scroll_input_ts: ?std.Io.Timestamp = null,
@@ -1191,6 +1199,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Called from the render thread's mailbox.
         pub fn setScrollPixel(self: *Self, pending_px: f32, requested_rows: i64) void {
+            // A new gesture picks its region afresh; the application on screen
+            // may not be the one that was scrolling last time.
+            if (self.scroll_input_ts == null) self.scroll_region_locked = false;
             self.scroll_pending_px = pending_px;
             self.scroll_requested_rows = requested_rows;
             self.scroll_input_ts = .now(global.io(), .awake);
@@ -1220,6 +1231,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // none. Leaving it would let a miscount pin the offset for good.
             self.scroll_applied_rows = self.scroll_requested_rows;
             self.scroll_input_ts = null;
+            self.scroll_region_locked = false;
 
             // Without snapping, the leftover fraction *is* the resting
             // position, so keep it and stop here.
@@ -1311,7 +1323,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .{
                     t_us,
                     self.scroll_trace_rows,
-                    self.scroll_anim.offset_px,
+                    // The *drawn* offset, both terms. Logging only the
+                    // animation half made the trace blind to pixel-perfect
+                    // scrolling, which is exactly the part that keeps
+                    // breaking.
+                    self.scroll_anim.offset_px + self.scrollPixelOffset(),
                     self.scroll_anim.top,
                     self.scroll_anim.bottom,
                     self.size.cell.height,
@@ -1721,7 +1737,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // the *region* top (not the cursor row `top`), whether it
                     // counted as narrowed, and the offset actually drawn.
                     log.info(
-                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} pixel={} anim={} pixoff={d:.2} cell_h={d}",
+                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} pixel={} req={d} applied={d} pending={d:.2} pixoff={d:.2} cell_h={d}",
                         .{
                             ev.rows,
                             ev.top,
@@ -1730,7 +1746,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             self.size.grid().rows,
                             @tagName(ev.source),
                             self.config.scroll_pixel_perfect,
-                            self.config.scroll_animation,
+                            self.scroll_requested_rows,
+                            self.scroll_applied_rows,
+                            self.scroll_pending_px,
                             self.scrollPixelOffset(),
                             self.size.cell.height,
                         },
@@ -1774,12 +1792,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // unaffected because there is nothing to re-decide.
                 const grid_rows = self.size.grid().rows;
                 const narrowed = ev.region_top > 0 or ev.bottom + 1 < grid_rows;
-                const mid_gesture = self.scroll_input_ts != null;
-                if (!mid_gesture)
+                if (!self.scroll_region_locked) {
+                    self.scroll_region_locked = true;
                     self.scroll_region = if (narrowed) .{
                         .top = @floatFromInt(ev.region_top),
                         .bottom = @floatFromInt(ev.bottom),
                     } else null;
+                }
 
                 if (self.config.scroll_pixel_perfect) {
                     // Retire this scroll against what we asked for, so the

@@ -980,6 +980,68 @@ harness cannot measure pixel-perfect behaviour at all. It still measures the
 region decision, frame pacing and the animation path. Anything touching the
 input path continues to need a human.
 
+## 2026-09-02 — an input-path harness, and what it proved
+
+After ten rounds of the user testing by hand, the missing tool was obvious:
+`tools/scroll-harness/harness.py` drives *applications* through tmux commands,
+so the entire input path -- multiplier, momentum, rounding, sub-row offset --
+had never been under test, and that is where every bug had lived.
+
+### `scroll-input-script` and `tools/scroll-harness/input.py`
+
+Synthesising touchpad events at the OS level needs uinput and root. Feeding
+recorded samples in at the GTK handler costs nothing and exercises everything
+that actually breaks. `scroll-input-script` replays one signed pixel delta per
+8ms tick through the same handler a real touchpad reaches; `input.py` generates
+gestures (slow drag, jitter, flick, reversal), runs them against a
+self-contained tmux, and checks the drawn position for reversals, stalls and
+whole-row jumping.
+
+It found three real defects in its first hour, none of which needed a human:
+
+**1. The renderer was never woken.** `scrollCallback` pushed the sub-row
+position into the renderer mailbox but never called `queueRender`, so the
+message sat there until something else happened to wake the thread. The offset
+was read frames late or not at all -- it stayed put while the model stepped a
+row at a time, which is precisely the whole-row jumping the feature exists to
+remove. One line.
+
+**2. Deciding the region only between gestures smoothed nothing.** The previous
+fix froze the region for the duration of a gesture, but a gesture that began
+before any region was known froze on *nothing*. Now decided once, on the first
+scroll of the gesture, and held: `scroll_region_locked`.
+
+**3. The harness itself was wrong twice**, which is worth recording because
+both mistakes are easy to repeat: the replay began before tmux was in
+copy-mode, so it measured startup output rather than the gesture; and it
+inherited the user's `mouse-scroll-multiplier`, so it measured their settings
+rather than the code. It now pins the multiplier and ships its own `tmux.conf`.
+
+### What it then proved about the remaining jumping
+
+    req=1 applied=0     <- one scroll in flight
+    req=2 applied=1     <- still one in flight
+    req=3 applied=2     <- always one in flight
+
+The offset saturates at its half-row clamp and **freezes for ~12 frames
+(~200ms)** -- the time tmux takes to actually perform the scroll. That is
+longer than the finger takes to cross one row, so a scroll is *always* in
+flight, the offset is permanently clamped, and the only motion left is the
+model's whole-row steps.
+
+This is not a tuning problem. While a scroll is outstanding the display has to
+*lead* the model, and in the alternate screen a lead is a hole exactly as tall
+as the lead. Clamping the lead to half a row is what freezes it. The options
+are an application that answers within a frame -- not something we control --
+or keeping the previous frame so a full row of lead can be drawn without a
+hole. The second is SPEC section 4 Feature 2, and it is now the only thing left
+between this and the goal.
+
+### A trap in the trace itself
+
+`traceScrollFrame` logs `top`/`bot` from `scroll_anim`, not the region actually
+published to the shader. Reading `top=0 bot=0` as "no region" cost an hour.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

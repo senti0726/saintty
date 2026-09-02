@@ -327,6 +327,7 @@ const DerivedConfig = struct {
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     scroll_pixel_perfect: bool,
     scroll_trace: bool,
+    scroll_input_script: ?[]const u8,
     mouse_shift_capture: configpkg.MouseShiftCapture,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
@@ -409,6 +410,7 @@ const DerivedConfig = struct {
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
             .scroll_pixel_perfect = config.@"scroll-pixel-perfect",
             .scroll_trace = config.@"scroll-trace",
+            .scroll_input_script = config.@"scroll-input-script",
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
@@ -3612,6 +3614,15 @@ pub fn scrollCallback(
                 .requested_rows = self.mouse.scroll_requested_rows,
             },
         }, .{ .instant = {} });
+
+        // Wake the renderer. Without this the message sits in the mailbox
+        // until something else happens to wake the thread, so the sub-row
+        // position it carries is read frames late or not at all -- the offset
+        // then stays put while the model steps a row at a time, which is
+        // exactly the whole-row jumping this feature exists to remove.
+        self.queueRender() catch |err| {
+            log.warn("error queueing render for scroll err={}", .{err});
+        };
     }
 
     // For detailed comments see the y calculation above.

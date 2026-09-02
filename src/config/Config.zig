@@ -1055,6 +1055,19 @@ palette: Palette = .{},
 ///
 /// This supersedes `scroll-animation` for scrolls you drive yourself: the
 /// position is already continuous, so there is nothing to ease afterwards.
+/// Replay a recorded list of touchpad scroll samples on startup, for testing.
+///
+/// The file holds one signed pixel delta per line, in the units GTK reports
+/// for a precision device, and they are fed through exactly the path a real
+/// touchpad takes -- multiplier, momentum, rounding, offset and all. Blank
+/// lines and `#` comments are skipped; a line of the form `@<n>` waits n
+/// frames, so gestures and the pauses between them can be reproduced.
+///
+/// This exists because the scroll harness drives applications, not the
+/// pointer, and every scrolling bug so far has lived in the input path it
+/// could not reach. See tools/scroll-harness.
+@"scroll-input-script": ?[]const u8 = null,
+
 @"scroll-pixel-perfect": bool = false,
 
 /// Snap content back onto the character grid when a scroll gesture ends.
