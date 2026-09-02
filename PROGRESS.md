@@ -1088,6 +1088,61 @@ remainder wraps: the display steps back a row before the compensation covers
 it. Reproducible in `input.py`, so it can be chased without a human. `jitter`
 is worst (28% reversals) and is the closest gesture to real use.
 
+## 2026-09-03 — the wrap skip narrowed, and where it now sits
+
+User's description finally matches the harness exactly: "smooth until the lower
+half of the line, then it directly skips to the next line." That is the
+full-row jump `input.py` reports at every remainder wrap, so it can be chased
+without a human from here on.
+
+### Fixed: an event with no identity clearing the wrong compensation
+
+`scroll_outstanding` was cleared whenever *any* scroll arrived in a matching
+direction. Scroll events carry no identity, so a scroll belonging to an earlier
+request cleared the compensation for the request just made, and the picture
+stepped back a whole row exactly at the wrap. The counters already say what is
+outstanding; the flag is now only a direction and is never cleared by an event.
+
+Full-row jumps: slow 13% -> 11%, jitter 26% -> 14%, flick 27% -> 17%.
+
+### Tried and reverted: removing the expiry deadline
+
+The deadline drops the compensation in one frame, and a fresh request re-arms
+it, so when an application is slow the offset swings a whole row back and
+forth. Removing it looked obviously right and was badly wrong: with the
+compensation permanently clamped on, the picture stops moving altogether --
+**102 moving frames down to 6**. Restored, with the measurement recorded in the
+code so it is not "cleaned up" again.
+
+### Where it stands, measured
+
+| gesture | median step | full-row jumps | reversals |
+|---|---|---|---|
+| slow | 0.13 rows | 11% | 20% |
+| jitter | 0.34 rows | 14% | 48% |
+| flick | 0.26 rows | 17% | 33% |
+
+Against the 0.96 rows/step and 56% jumps of a few commits ago this is a large
+improvement, and sub-row motion is real. It is not finished: the reversals are
+genuine and large (jitter: median 15px backward, p90 32px -- not sub-pixel
+noise, verified), and they come from the expiry/re-arm cycle above.
+
+### The next thing to try
+
+The compensation is binary -- fully on or fully off -- and both edges are one
+frame wide. It should ramp instead: fade in over the frame after a request and
+out over a few frames if the application does not answer. That removes both the
+expiry snap and the re-arm snap without reintroducing the freeze, since it is
+never clamped on indefinitely.
+
+### Not yet done, requested
+
+Extend `input.py` to open a long nvim document and resume a Claude Code
+session, scroll one notch at a time, and record where a fixed interface element
+(nvim's mode line, the prompt box) sits after each notch. The user's report is
+that the box lands somewhere different each time, which such a test would pin
+down exactly.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a

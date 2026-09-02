@@ -183,8 +183,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scroll_pending_px: f32 = 0,
         scroll_requested_rows: i64 = 0,
 
-        /// Direction of a scroll we have asked for and not yet seen the
-        /// application perform, or 0 for none.
+        /// Direction of the gesture in progress, or 0 for none.
+        ///
+        /// Only a direction: which way to clamp the outstanding count. It is
+        /// never cleared by a scroll event, because events carry no identity
+        /// and clearing on one belonging to an earlier request is what made
+        /// the picture skip a row at every wrap.
         ///
         /// This compensation is bounded by *time*, not by a matching event,
         /// and that is deliberate. It was first a pair of counters and then a
@@ -1340,9 +1344,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const in_flight: f32 = flight: {
                 if (self.scroll_outstanding == 0) break :flight 0;
 
-                // A request that never produced a scroll expires, so an
-                // application that ignores the wheel makes the picture lag
-                // rather than hold a compensation for ever.
+                // The deadline is load-bearing: without it the compensation
+                // stays clamped on for the whole gesture and the picture stops
+                // moving altogether (measured: 102 moving frames down to 6).
+                // It does have a cost -- expiry drops the compensation in a
+                // single frame, and a fresh request re-arms it, which is where
+                // the remaining back-and-forth comes from.
                 const ts = self.scroll_outstanding_ts orelse break :flight 0;
                 const now: std.Io.Timestamp = .now(global.io(), .awake);
                 const age_ms = @divTrunc(
@@ -1873,14 +1880,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     //
                     // ScrollEvent.rows counts content moving *up* as positive,
                     // the opposite sense to the scroll delta, hence the negation.
-                    const did: i64 = -@as(i64, @intCast(ev.rows));
-                    if ((self.scroll_outstanding > 0 and did > 0) or
-                        (self.scroll_outstanding < 0 and did < 0))
-                    {
-                        self.scroll_outstanding = 0;
-                        self.scroll_outstanding_ts = null;
-                    }
-                    self.scroll_model_rows += did;
+                    // Count it and nothing else. Clearing a flag here was
+                    // wrong: the event carries no identity, so a scroll
+                    // belonging to an *earlier* request cleared the
+                    // compensation for the one that had just been made, and
+                    // the picture stepped back a whole row at the moment the
+                    // remainder wrapped -- smooth until half way down the
+                    // line, then a skip. The counters already say what is
+                    // outstanding.
+                    self.scroll_model_rows += -@as(i64, @intCast(ev.rows));
 
                     // The gesture already places the content continuously, so
                     // easing toward the model would fight it.
