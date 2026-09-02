@@ -36,7 +36,14 @@ EVENT = re.compile(r"scroll event: .*region=(-?\d+)\.\.(-?\d+) rows_total=(\d+)"
 
 
 def gesture(name: str) -> list[str]:
-    """Samples in GTK precision-device pixels, one per 8ms tick."""
+    """Samples in GTK precision-device pixels, one per 8ms tick.
+
+    Magnitudes scale with 1/multiplier so that a gesture scrolls the same
+    *distance* whatever the sensitivity. Without this a low multiplier made
+    every gesture barely scroll, and the harness reported a smooth picture
+    simply because almost nothing happened.
+    """
+    k = 1.0 / float(MULT)
     # Wait for the shell to finish printing and for the harness to put tmux
     # into copy-mode. Replaying before the application is ready to scroll
     # measures the startup output instead of the gesture.
@@ -44,23 +51,23 @@ def gesture(name: str) -> list[str]:
     if name == "slow":
         # A steady, deliberate drag -- the case the user calls "very small
         # scroll" and where quantisation is most visible.
-        out += [f"{-1.2:.2f}"] * 220
+        out += [f"{-1.2 * k:.2f}"] * 220
     elif name == "medium":
-        out += [f"{-4.0:.2f}"] * 120
+        out += [f"{-4.0 * k:.2f}"] * 120
     elif name == "flick":
         # A fast flick with a decaying tail, magnitudes taken from a real
         # captured log (yoff 11.7 decaying to 2.7).
-        v = 14.0
-        while v > 0.4:
+        v = 14.0 * k
+        while v > 0.4 * k:
             out.append(f"{-v:.2f}")
             v *= 0.94
     elif name == "jitter":
         # Steady movement carrying the small opposite-sign samples a real
         # touchpad reports. This is what produced reverse scrolls.
         for i in range(240):
-            out.append(f"{1.1:.2f}" if i % 9 == 3 else f"{-3.0:.2f}")
+            out.append(f"{1.1 * k:.2f}" if i % 9 == 3 else f"{-3.0 * k:.2f}")
     elif name == "reverse":
-        out += [f"{-3.0:.2f}"] * 90 + ["@25"] + [f"{3.0:.2f}"] * 90
+        out += [f"{-3.0 * k:.2f}"] * 90 + ["@25"] + [f"{3.0 * k:.2f}"] * 90
     else:
         raise SystemExit(f"unknown gesture {name}")
     out.append("@120")  # let everything settle inside the trace
@@ -81,7 +88,7 @@ def run(name: str, extra: list[str]) -> list[str]:
         # Pin the sensitivity. Otherwise the user's own config decides how far
         # a recorded sample scrolls and the test measures their settings
         # rather than the code.
-        "--mouse-scroll-multiplier=precision:1,discrete:3",
+        f"--mouse-scroll-multiplier=precision:{MULT},discrete:3",
         f"--scroll-input-script={script}",
         *extra,
         "-e",
@@ -148,6 +155,16 @@ def analyze(lines: list[str], label: str) -> bool:
         return ok
 
     cell = int(frames[0].group(8))
+
+    # If the application never scrolled, the run says nothing about the
+    # renderer: every request expires unanswered and the compensation arms and
+    # fades over and over, which looks exactly like a rendering bug. This has
+    # already been misread once, so make it impossible to miss.
+    model_seen = {int(m.group(2)) for m in frames}
+    if len(model_seen) <= 1:
+        print("  INVALID: the application never scrolled -- check copy-mode "
+              "and that wheel events are reaching it")
+        return False
     # The replay has a lead-in; ignore everything before the first emitted
     # scroll so startup output is not mistaken for the gesture.
     first_us = None
@@ -200,12 +217,16 @@ def analyze(lines: list[str], label: str) -> bool:
 
 
 def main() -> int:
-    global BINARY
+    global BINARY, MULT
     names = [a for a in sys.argv[1:] if not a.startswith("--")]
     extra = []
     for a in sys.argv[1:]:
         if a.startswith("--bin="):
             BINARY = Path(a.split("=", 1)[1])
+        elif a.startswith("--mult="):
+            MULT = a.split("=", 1)[1]
+        elif a.startswith("--mult="):
+            pass
         elif a.startswith("--"):
             extra.append(a)
     if not extra:
@@ -215,7 +236,7 @@ def main() -> int:
         return 1
     allok = True
     for n in names or ["slow", "jitter", "flick"]:
-        allok &= analyze(run(n, extra), f"{n}  {' '.join(extra)}")
+        allok &= analyze(run(n, extra), f"{n}  precision:{MULT}")
     print("\nRESULT:", "ok" if allok else "FAILURES")
     return 0 if allok else 1
 

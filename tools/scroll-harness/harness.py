@@ -24,6 +24,7 @@ EMIT = Path(__file__).resolve().parent / "emit.py"
 
 TRACE = re.compile(
     r"scrolltrace t_us=(-?\d+) model_rows=(-?\d+) off_px=(-?[\d.]+) "
+    r"inflight=-?\d+ pending=-?[\d.]+ "
     r"top=(-?[\d.]+) bot=(-?[\d.]+) cell_h=(\d+)"
 )
 EVENT = re.compile(

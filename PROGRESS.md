@@ -1197,6 +1197,75 @@ content genuinely advances a row per frame and there is no sub-row detail left.
    notch, record where the box sits, repeat.
 3. Keeping all of this rebaseable onto upstream.
 
+## 2026-09-03 — measuring honestly: the animation path is currently better
+
+The user reported the ramp fixed nothing and had added rapid up-and-down
+movement. That was right, and two of my measurements had been wrong.
+
+### Why the measurements lied
+
+**1. The harness did not notice when the application never scrolled.** In the
+run that produced the "fixed" numbers, `model_rows` never changed for the whole
+gesture: tmux was not scrolling at all, so every request expired unanswered and
+the compensation armed and faded repeatedly. That looks like a rendering bug and
+was reported as a good result. `input.py` now fails such runs as `INVALID`.
+
+**2. Frame rate changes the score.** The good run was taken while
+`realesrgan-ncnn` was using 79% CPU. Fewer frames drawn means fewer chances to
+observe a reversal, so load *improves* the numbers. Check `ps` before comparing
+two runs.
+
+Both mistakes flattered the result. Rerun under a quiet machine with a
+responsive application, the same binary and gesture score 15% whole-row jumps,
+not the 11% claimed.
+
+### Where the two approaches actually stand
+
+Same machine, same gesture, minutes apart:
+
+| | animation (`scroll-animation`) | pixel-perfect |
+|---|---|---|
+| visible reversals | 0 | 5 (4.9%) |
+| whole-row jumps | 0 | 15 (15%) |
+| median step | 0.20 rows | 0.06 rows |
+| frame interval | 16.7ms | 17ms |
+
+Pixel-perfect takes finer steps, and that is real. But it still skips a whole
+row at 15% of moving frames -- the "smooth until half way down the line, then a
+skip" the user keeps reporting -- and it oscillates whenever an application does
+not answer a wheel notch promptly, because the compensation has nothing to
+cancel against.
+
+**The animation path cannot oscillate**, because it never depends on an
+application answering: it renders the transition between two model states it
+already has. That is why it scores clean.
+
+### The conclusion this points to
+
+Pixel-perfect scrolling asks an application to move in sub-row steps it has no
+way to make, then papers over the round trip. Every remaining defect traces to
+that. Unless the terminal can render content the application has not sent -- it
+cannot, in the alternate screen -- the honest ceiling is: animate the transition
+between the states the application does give us, and drive the *progress* of
+that animation from the finger rather than from a timer.
+
+That keeps everything the finger-driven work bought (position tracks the
+gesture, no fixed duration) and drops the part that cannot work (asking for
+positions between two application states). It is a smaller change than it
+sounds: the animation machinery is already written and measures clean.
+
+### Harness fixes this round
+
+  * gesture magnitudes scale with `1/multiplier`, so a run scrolls the same
+    distance at any sensitivity -- at `precision:0.1` the old gestures emitted
+    one scroll and the harness called it smooth
+  * `--mult=` to reproduce a user's sensitivity
+  * reversals judged against a tenth of a row, with the magnitude distribution
+    printed
+  * `INVALID` when the application never scrolled
+  * `harness.py`'s trace pattern, which the new trace format had silently
+    broken into reporting zero frames
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a
