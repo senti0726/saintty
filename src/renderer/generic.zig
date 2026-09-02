@@ -1716,9 +1716,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // a release build; debug logs are compiled out of those, and a
                 // debug build runs at ~40fps which swamps what we measure.
                 if (self.config.scroll_trace) {
+                    // Everything that decides whether a sub-row offset is
+                    // applied here, so this does not have to be inferred:
+                    // the *region* top (not the cursor row `top`), whether it
+                    // counted as narrowed, and the offset actually drawn.
                     log.info(
-                        "scroll event: rows={d} region={d}..{d} source={s} enabled={} cell_h={d}",
-                        .{ ev.rows, ev.top, ev.bottom, @tagName(ev.source), self.config.scroll_animation, self.size.cell.height },
+                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} pixel={} anim={} pixoff={d:.2} cell_h={d}",
+                        .{
+                            ev.rows,
+                            ev.top,
+                            ev.region_top,
+                            ev.bottom,
+                            self.size.grid().rows,
+                            @tagName(ev.source),
+                            self.config.scroll_pixel_perfect,
+                            self.config.scroll_animation,
+                            self.scrollPixelOffset(),
+                            self.size.cell.height,
+                        },
                     );
                 } else {
                     log.debug(
