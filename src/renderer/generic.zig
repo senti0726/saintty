@@ -650,6 +650,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background_opacity_cells: bool,
             scroll_animation: bool,
             scroll_animation_duration_ms: u32,
+            scroll_animation_reserve_bottom: u8,
             scroll_pixel_perfect: bool,
             scroll_pixel_perfect_snap: bool,
             scroll_trace: bool,
@@ -733,6 +734,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     .scroll_animation = config.@"scroll-animation",
                     .scroll_animation_duration_ms = config.@"scroll-animation-duration",
+                    .scroll_animation_reserve_bottom = config.@"scroll-animation-reserve-bottom",
                     .scroll_pixel_perfect = config.@"scroll-pixel-perfect",
                     .scroll_pixel_perfect_snap = config.@"scroll-pixel-perfect-snap",
                     .scroll_trace = config.@"scroll-trace",
@@ -1982,11 +1984,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // skip the integration frame each time, so during continuous
                 // scrolling the offset would never decay and would simply
                 // wind up to the limit.
+                // Hold back rows the user has reserved for an interface the
+                // application pins but does not exclude from its own scrolling
+                // region. Use the region's *margin*, not `ev.top`, which for
+                // insert/delete lines is the cursor row.
+                const reserve: usize = self.config.scroll_animation_reserve_bottom;
+                const bottom = ev.bottom -| reserve;
+                if (bottom < ev.region_top) break :scroll;
+
                 const was_idle = !self.scroll_anim.active();
                 self.scroll_anim.push(
                     offset,
-                    @floatFromInt(ev.top),
-                    @floatFromInt(ev.bottom),
+                    @floatFromInt(ev.region_top),
+                    @floatFromInt(bottom),
                     limit,
                 );
                 if (was_idle) self.scroll_anim_last = null;

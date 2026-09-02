@@ -1082,6 +1082,24 @@ palette: Palette = .{},
 /// keep the position your gesture actually ended at, and accept the sliver.
 @"scroll-pixel-perfect-snap": bool = true,
 
+/// Rows at the bottom of the screen that a scroll animation never moves.
+///
+/// Well-behaved full-screen applications reserve the rows they pin an
+/// interface on -- tmux and nvim both set scrolling margins that exclude their
+/// status lines, so those hold still without any help. Some do not: Claude
+/// Code scrolls its history with a region running to the very last row and
+/// then redraws its prompt box inside it, so the terminal is told the box is
+/// ordinary content and animates it along with everything else.
+///
+/// Nothing distinguishes the two cases from outside: after a scroll every row
+/// in the region is dirty, whether it moved or was rewritten. So this is a
+/// manual reservation for applications that do not make one themselves. Two is
+/// enough for a prompt box and its hint line.
+///
+/// Costs only that the reserved rows do not animate, which for a status bar or
+/// prompt box is what you want anyway.
+@"scroll-animation-reserve-bottom": u8 = 0,
+
 @"scroll-animation": bool = false,
 
 /// Emit a per-frame trace of the scroll animation to the debug log.

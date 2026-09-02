@@ -66,6 +66,14 @@ def gesture(name: str) -> list[str]:
         # touchpad reports. This is what produced reverse scrolls.
         for i in range(240):
             out.append(f"{1.1 * k:.2f}" if i % 9 == 3 else f"{-3.0 * k:.2f}")
+    elif name == "notch":
+        # One notch, a pause, repeat -- the user's own proposal for pinning
+        # down an interface that "ends up somewhere different each time".
+        # Enough samples to cross exactly one row, then long enough to settle.
+        per_row = int(round(38 / (1.2)))
+        for _ in range(8):
+            out += [f"{-1.2 * k:.2f}"] * per_row
+            out.append("@40")
     elif name == "reverse":
         out += [f"{-3.0 * k:.2f}"] * 90 + ["@25"] + [f"{3.0 * k:.2f}"] * 90
     else:
@@ -94,9 +102,14 @@ def run(name: str, extra: list[str]) -> list[str]:
         "-e",
         "bash",
         "-lc",
-        f"tmux -L inputtest kill-server 2>/dev/null; "
-        f"tmux -L inputtest -f {Path(__file__).resolve().parent / 'tmux.conf'} "
-        f"new -A -s i 'seq 1 5000; sleep 90'",
+        (
+            f"python3 {Path(__file__).resolve().parent / 'pinned_box.py'}"
+            if name == "notch"
+            else
+            f"tmux -L inputtest kill-server 2>/dev/null; "
+            f"tmux -L inputtest -f {Path(__file__).resolve().parent / 'tmux.conf'} "
+            f"new -A -s i 'seq 1 5000; sleep 90'"
+        ),
     ]
     with log.open("wb") as fh:
         proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT)
@@ -127,15 +140,21 @@ def analyze(lines: list[str], label: str) -> bool:
     events = [m for m in events if m]
 
     print(f"\n=== {label} ===")
-    if not emits:
-        print("  NO SCROLL INPUT REPLAYED -- is scroll-input-script wired up?")
+    # The per-sample emit log only exists on the pixel-perfect path. Without it
+    # the run is still measurable -- scroll events and drawn frames tell us
+    # what happened -- so fall back rather than refusing to report.
+    if emits:
+        print(f"  samples delivered   : {len(emits)}")
+        rows = [int(m.group(5)) for m in emits]
+        fwd = sum(1 for r in rows if r > 0)
+        rev = sum(1 for r in rows if r < 0)
+        print(f"  scrolls emitted     : {fwd + rev}  (forward {fwd}, backward {rev})")
+    elif not events:
+        print("  NO SCROLL INPUT REACHED THE APPLICATION")
         return False
-    print(f"  samples delivered   : {len(emits)}")
-
-    rows = [int(m.group(5)) for m in emits]
-    fwd = sum(1 for r in rows if r > 0)
-    rev = sum(1 for r in rows if r < 0)
-    print(f"  scrolls emitted     : {fwd + rev}  (forward {fwd}, backward {rev})")
+    else:
+        fwd = rev = 0
+        print(f"  scroll events       : {len(events)} (no emit log; not pixel-perfect)")
 
     regions = {}
     for m in events:
@@ -146,6 +165,26 @@ def analyze(lines: list[str], label: str) -> bool:
         print(f"  regions seen        : {dict(list(regions.items())[:4])}")
 
     ok = True
+
+    # An interface the application pins to the bottom must never be inside the
+    # region we move. This is the Claude Code complaint, made measurable: the
+    # stand-in's box occupies the last two rows, so any frame that displaces
+    # content while the region reaches them is moving the box.
+    if events:
+        rows_total = int(events[0].group(3))
+        box_top = rows_total - 2
+        bad = [
+            m for m in frames
+            if abs(float(m.group(3))) > 0.5 and float(m.group(7)) >= box_top
+        ]
+        if bad:
+            worst = max(abs(float(m.group(3))) for m in bad)
+            print(f"  FAIL: pinned interface moved on {len(bad)} frames "
+                  f"(region reaches row {box_top}, up to {worst:.1f}px)")
+            ok = False
+        else:
+            print(f"  pinned interface     : held still (box rows >= {box_top})")
+
     if fwd and rev:
         print(f"  FAIL: {min(fwd, rev)} scrolls emitted against the gesture")
         ok = False
@@ -168,12 +207,9 @@ def analyze(lines: list[str], label: str) -> bool:
     # The replay has a lead-in; ignore everything before the first emitted
     # scroll so startup output is not mistaken for the gesture.
     first_us = None
-    for l in lines:
-        m = EMIT.search(l)
-        if m and int(m.group(5)) != 0:
-            break
+    marker = EMIT if emits else EVENT
     for i, l in enumerate(lines):
-        if EMIT.search(l):
+        if marker.search(l):
             t = TRACE.search(lines[max(0, i - 1)])
             first_us = int(t.group(1)) if t else None
             break

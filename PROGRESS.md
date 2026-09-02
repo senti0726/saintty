@@ -1295,6 +1295,56 @@ smoother rather than slower, and it is closer to what a browser uses.
 
 Still 0 reversals and 0 whole-row jumps.
 
+## 2026-09-03 — Claude Code's prompt box, made reproducible then held still
+
+The user's own proposal -- scroll one notch, record where the box sits, repeat
+-- turned into `tools/scroll-harness/pinned_box.py` and the `notch` gesture.
+
+### Reproducing it without Claude Code
+
+Running the real thing is not reproducible (it wants a session and a network,
+and renders differently every time), and it exits immediately under a bare pty.
+The stand-in reproduces the two behaviours that were actually measured from it:
+
+  * it scrolls its history with a region running to the **last row**, so it
+    never reserves the rows its box sits on
+  * it redraws the box afterwards, alternating the region's top margin between
+    1 and 2 exactly as Claude Code alternated `0..54` and `1..54`
+
+Two traps in writing it, both worth remembering for any future fake TUI:
+
+  * `sys.stdin.buffer.read()` on a non-blocking fd returns `None` even with
+    bytes waiting. Use `os.read`.
+  * without `tty.setraw`, the line discipline holds input until a newline, so
+    mouse reports never arrive at all.
+
+With those fixed the test fails on exactly the user's complaint:
+
+    FAIL: pinned interface moved on 178 frames (region reaches row 57, up to 40.0px)
+
+### Why it cannot be fixed automatically
+
+tmux and nvim both reserve the rows they pin an interface on, which is why
+their bars hold still without any help. Claude Code does not, so the terminal
+is told the box is ordinary content.
+
+Nothing distinguishes the two from outside. **After a scroll every row in the
+region is dirty, whether it moved or was rewritten**, so per-row dirty tracking
+-- the obvious candidate -- cannot separate them. Telling them apart needs the
+pre-scroll contents to compare against, which is the same machinery as
+compositing.
+
+### `scroll-animation-reserve-bottom`
+
+A manual reservation for applications that will not make one. `2` covers a
+prompt box and its hint line. Measured: box moves on 169 frames with `0`, holds
+still with `2`, and 0 reversals either way.
+
+Also switched the animation's region to `ev.region_top` rather than `ev.top`,
+which for insert/delete lines is the *cursor* row and was never the right bound
+for which rows may move. tmux path unchanged and still clean: 0 reversals, 0
+whole-row jumps, 0.23 rows/step, mean lag 0.29 rows.
+
 ## Harness traps — both cost real time, do not rediscover them
 
 **Ghostty is single-instance.** The packaged `/usr/bin/ghostty` runs as a
