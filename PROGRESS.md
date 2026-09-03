@@ -1406,3 +1406,85 @@ Then still open, needing a decision rather than a fix:
 scrolls (SPEC §3.4b). The momentum path copies it so the two agree, but nobody
 has checked *why* it is 10. If fling speed feels wrong *relative to dragging*,
 look here first — the decay knob will not fix that.
+
+## 2026-09-03 — Upstream exposure, measured
+
+The question was whether this fork can keep tracking upstream. Answer: yes,
+and the risk is much lower than the diffstat suggests.
+
+**Measured on 96 upstream commits (three days' worth).** All 36 commits
+rebased with zero conflicts; the result builds and `zig build test
+-Dtest-filter=scroll` passes.
+
+**Why it is not fragile.** Of ~5,100 changed lines, only **18 are upstream
+lines replaced**. Everything else is added alongside. Git only fights over
+lines both sides edited, so an additive patch survives churn that a rewrite
+would not.
+
+The 18 sit in:
+
+| Where | What | Upstream churn |
+|---|---|---|
+| `src/Surface.zig` — `scrollCallback`, `mouseReport` | genuinely rewritten | ~17 commits/yr (~1.4/mo) |
+| `src/apprt/gtk/class/surface.zig` | the `10.0` precision multiplier | rare |
+| `src/renderer/*`, `src/terminal/Terminal.zig` | one-line hooks at function ends | low |
+
+Expect a small conflict in `Surface.zig` roughly monthly. Rebase in small
+batches; a month of upstream is a five-minute conflict, a year of it is not.
+
+### The trap that actually bit
+
+The first real rebase attempt died at commit 16/36, not on upstream code:
+
+```
+error: The following untracked working tree files would be overwritten by merge:
+    zig-out-release/bin/ghostty
+    ... 722 files
+```
+
+`2be4d9e9f` had accidentally committed `zig-out-release/` (722 files, 33MB via
+`git add -A`); a later commit deleted them again, so **HEAD looked clean and
+the problem was invisible** — but replaying that commit still tries to write
+722 files that exist on disk untracked, and aborts. It would have blocked
+every future rebase.
+
+Note the trial rebase in a scratch worktree did **not** catch this, because a
+fresh worktree has no build output on disk. A rebase rehearsal must run
+somewhere with the same untracked files as the real tree, or it is testing a
+different question.
+
+Stripped with:
+
+```
+git branch -f smooth-scroll-backup smooth-scroll   # first
+FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --index-filter \
+  'git rm -r --cached --ignore-unmatch -q zig-out-release' \
+  --prune-empty main..smooth-scroll
+```
+
+Verified by tree hash: `b5d95d382…` before and after, all 36 commits kept, no
+commit anywhere on the branch touching build output. `zig-out-release/` was
+already in `.gitignore`, so it cannot come back by accident.
+
+### Silent-failure watch list
+
+A conflict is loud and therefore fine. These would rebase cleanly and stop
+working quietly:
+
+- **Uniform layout.** Already guarded — the `comptime` check in
+  `src/renderer/opengl/shaders.zig` asserts `scroll_anim` is at byte 144, so a
+  new uniform inserted ahead of it is a build error naming the real offset,
+  not a dead animation. GLSL compiles at *runtime*, so this guard is the only
+  thing standing between an upstream uniform change and a silent no-op.
+- **`noteScroll` hooks.** If upstream adds a new way to scroll the grid, our
+  hooks are not on it and that path silently stops animating. No error. This
+  is the standing argument for running `tools/scroll-harness/input.py` after
+  every rebase.
+
+### Routine
+
+```
+cd ~/dev/ghostty && git fetch origin main && git rebase origin/main \
+  && zig build && zig build test -Dtest-filter=scroll \
+  && python3 tools/scroll-harness/input.py
+```
