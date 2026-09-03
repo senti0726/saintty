@@ -1988,7 +1988,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // application pins but does not exclude from its own scrolling
                 // region. Use the region's *margin*, not `ev.top`, which for
                 // insert/delete lines is the cursor row.
-                const reserve: usize = self.config.scroll_animation_reserve_bottom;
+                // Only when the application tells us *nothing*. A region
+                // narrowed at either end is the application naming its own
+                // interface rows, and that is better information than a
+                // number typed into a config file -- subtracting from it as
+                // well steals content rows and freezes them mid-scroll while
+                // everything above slides, which is more jarring than the
+                // interface wobble the reserve exists to stop.
+                //
+                // tmux run with `status-position top` is the case that proves
+                // it: its region is 1..last, so it *reaches* the bottom row
+                // and "does the region touch the bottom" cannot tell it apart
+                // from Claude Code. That it narrows at the top can.
+                const reserve: usize = if (narrowed)
+                    0
+                else
+                    self.config.scroll_animation_reserve_bottom;
                 const bottom = ev.bottom -| reserve;
                 if (bottom < ev.region_top) break :scroll;
 

@@ -24,6 +24,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 BINARY = REPO / "zig-out-release" / "bin" / "ghostty"
 
+# Precision-scroll sensitivity the run is pinned to. Overridable with --mult=.
+# This needs a default: without one every gesture died with a bare
+# "NameError: name 'MULT' is not defined" from inside gesture().
+MULT = "1"
+
 EMIT = re.compile(
     r"scrollemit yoff=(-?[\d.]+) adj=(-?[\d.]+) poff=(-?[\d.]+) raw=(-?[\d.]+) "
     r"rows=(-?\d+) dir=(-?\d+) pending=(-?[\d.]+) cell=(\d+)"
