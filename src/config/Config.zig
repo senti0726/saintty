@@ -1068,19 +1068,7 @@ palette: Palette = .{},
 /// could not reach. See tools/scroll-harness.
 @"scroll-input-script": ?[]const u8 = null,
 
-@"scroll-pixel-perfect": bool = false,
 
-/// Snap content back onto the character grid when a scroll gesture ends.
-///
-/// With `scroll-pixel-perfect` the display can rest between two rows. A
-/// terminal has no content for a partially visible row -- in the alternate
-/// screen the row entering, or the one that just left, belongs to the
-/// application and not to us -- so resting off the grid leaves a blank sliver
-/// up to half a line tall at one edge.
-///
-/// Snapping trades that sliver for landing on the nearest row. Turn it off to
-/// keep the position your gesture actually ended at, and accept the sliver.
-@"scroll-pixel-perfect-snap": bool = true,
 
 /// Rows at the bottom of the screen that a scroll animation never moves.
 ///

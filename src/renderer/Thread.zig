@@ -438,10 +438,6 @@ fn drainMailbox(self: *Thread) !void {
                 self.flags.has_inspector = v;
             },
 
-            .scroll_pixel => |v| {
-                self.renderer.setScrollPixel(v.pending_px, v.requested_rows);
-            },
-
             .input_activity => {
                 self.renderer.noteInputActivity();
             },

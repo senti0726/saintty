@@ -26,15 +26,6 @@ pub const Message = union(enum) {
     /// restarting the timer.
     reset_cursor_blink,
 
-    /// Sub-row scroll position, for pixel-perfect scrolling.
-    ///
-    /// How far the gesture sits from the row the app has been scrolled to,
-    /// signed so that it always describes the display trailing the app rather
-    /// than leading it. See `Renderer.scrollPixelOffset`.
-    scroll_pixel: struct {
-        pending_px: f32,
-        requested_rows: i64,
-    },
 
     /// A key was pressed that produced input for the program.
     ///

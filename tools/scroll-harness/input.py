@@ -145,7 +145,7 @@ def analyze(lines: list[str], label: str) -> bool:
     events = [m for m in events if m]
 
     print(f"\n=== {label} ===")
-    # The per-sample emit log only exists on the pixel-perfect path. Without it
+    # There is no per-sample emit log any more. Without it
     # the run is still measurable -- scroll events and drawn frames tell us
     # what happened -- so fall back rather than refusing to report.
     if emits:
@@ -159,7 +159,7 @@ def analyze(lines: list[str], label: str) -> bool:
         return False
     else:
         fwd = rev = 0
-        print(f"  scroll events       : {len(events)} (no emit log; not pixel-perfect)")
+        print(f"  scroll events       : {len(events)} (no per-sample emit log)")
 
     regions = {}
     for m in events:
@@ -271,7 +271,7 @@ def main() -> int:
         elif a.startswith("--"):
             extra.append(a)
     if not extra:
-        extra = ["--scroll-pixel-perfect=true", "--scroll-pixel-perfect-snap=false"]
+        extra = ["--scroll-animation=true"]
     if not BINARY.exists():
         print(f"no binary at {BINARY}", file=sys.stderr)
         return 1

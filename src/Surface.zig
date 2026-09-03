@@ -243,15 +243,6 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
-    /// Cumulative rows we have turned into scroll events, signed like
-    /// `ScrollAmount.delta`. The renderer subtracts what the app has actually
-    /// done from this to find the rows still in flight down the pty.
-    scroll_requested_rows: i64 = 0,
-
-    /// Direction of the last row we emitted under pixel-perfect scrolling,
-    /// for the hysteresis in `scrollCallback`. Zero before the first one.
-    scroll_emit_dir: i8 = 0,
-
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -325,7 +316,6 @@ const DerivedConfig = struct {
     mouse_hide_while_typing: bool,
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
-    scroll_pixel_perfect: bool,
     scroll_trace: bool,
     scroll_input_script: ?[]const u8,
     mouse_shift_capture: configpkg.MouseShiftCapture,
@@ -408,7 +398,6 @@ const DerivedConfig = struct {
             .mouse_hide_while_typing = config.@"mouse-hide-while-typing",
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
-            .scroll_pixel_perfect = config.@"scroll-pixel-perfect",
             .scroll_trace = config.@"scroll-trace",
             .scroll_input_script = config.@"scroll-input-script",
             .mouse_shift_capture = config.@"mouse-shift-capture",
@@ -3530,66 +3519,6 @@ pub fn scrollCallback(
         // direction and undo a pending scroll.
         const poff: f64 = self.mouse.pending_scroll_y + yoff_adjusted;
 
-        // Pixel-perfect scrolling rounds to the *nearest* row instead of
-        // waiting for a whole one to accumulate.
-        //
-        // The point is which side of the app the leftover falls on. Truncating
-        // means the display is always asked to run ahead of the app, and in
-        // the alternate screen the row it would need to show has not arrived
-        // yet -- tmux has it, we do not -- so leading by a row leaves a row
-        // shaped hole. Rounding to nearest bounds the leftover to half a row
-        // in *either* direction, so the worst case is a half-row sliver at one
-        // edge rather than a deleted line.
-        if (self.config.scroll_pixel_perfect) {
-            const raw = poff / cell_size;
-            var rows = @round(raw);
-
-            // Reversing direction takes a whole row, not half of one.
-            //
-            // Rounding to nearest leaves the remainder sitting exactly on the
-            // half-row threshold right after a scroll is emitted -- the precise
-            // point where the next rounding tips over. A touchpad always
-            // reports a little jitter of the opposite sign, so a single stray
-            // sample rounded *backwards* and emitted a scroll the other way,
-            // which the next sample immediately undid: one line up and
-            // straight back down, while the finger moved steadily in one
-            // direction. Truncating used to hide this behind a full-row
-            // deadband.
-            //
-            // Half a row of genuine movement against the current direction is
-            // still enough to turn around, because the remainder is already
-            // half a row over.
-            if (rows != 0) {
-                const dir: i8 = if (rows > 0) 1 else -1;
-                if (self.mouse.scroll_emit_dir != 0 and
-                    dir != self.mouse.scroll_emit_dir and
-                    @abs(raw) < 1.0)
-                {
-                    rows = 0;
-                } else {
-                    self.mouse.scroll_emit_dir = dir;
-                }
-            }
-
-            self.mouse.pending_scroll_y = poff - (rows * cell_size);
-            const delta: isize = @intFromFloat(rows);
-            if (self.config.scroll_trace) log.info(
-                "scrollemit yoff={d:.2} adj={d:.2} poff={d:.2} raw={d:.3} rows={d} dir={d} pending={d:.2} cell={d}",
-                .{
-                    yoff,
-                    yoff_adjusted,
-                    poff,
-                    raw,
-                    delta,
-                    self.mouse.scroll_emit_dir,
-                    self.mouse.pending_scroll_y,
-                    cell_size,
-                },
-            );
-            if (delta == 0) break :y .{};
-            break :y .{ .delta = delta };
-        }
-
         // If the new offset is less than a single unit of scroll, we save
         // the new pending value and do not scroll yet.
         if (@abs(poff) < cell_size) {
@@ -3614,23 +3543,19 @@ pub fn scrollCallback(
         break :y .{ .delta = delta };
     };
 
-    // Tell the renderer where the gesture actually is, so it can draw
-    // sub-row positions instead of waiting for a whole row to accumulate.
-    // Sent unconditionally: the renderer decides whether it is enabled, and
-    // the value must keep flowing as the fraction resets across a row.
+    // Tell the renderer the user just scrolled. The repaint detector only
+    // trusts a shift it can attribute to the user, and this is the wheel half
+    // of that; `keyCallback` sends the same message for the keyboard.
     if (yoff != 0) {
-        _ = self.renderer_thread.mailbox.push(global.io(), .{
-            .scroll_pixel = .{
-                .pending_px = @floatCast(self.mouse.pending_scroll_y),
-                .requested_rows = self.mouse.scroll_requested_rows,
-            },
-        }, .{ .instant = {} });
+        _ = self.renderer_thread.mailbox.push(
+            global.io(),
+            .input_activity,
+            .{ .instant = {} },
+        );
 
-        // Wake the renderer. Without this the message sits in the mailbox
-        // until something else happens to wake the thread, so the sub-row
-        // position it carries is read frames late or not at all -- the offset
-        // then stays put while the model steps a row at a time, which is
-        // exactly the whole-row jumping this feature exists to remove.
+        // Wake the renderer, or the message sits in the mailbox until
+        // something else happens to wake the thread and the frame that should
+        // have animated has already gone by.
         self.queueRender() catch |err| {
             log.warn("error queueing render for scroll err={}", .{err});
         };
@@ -3710,15 +3635,6 @@ pub fn scrollCallback(
         // If we're scrolling up or down, then send a mouse event.
         if (self.isMouseReporting()) {
             if (y.delta != 0) {
-                // Count these as in flight only here. A scroll handled by the
-                // application travels down the pty and comes back as a model
-                // change some milliseconds later, and the renderer holds the
-                // picture still across that gap. Viewport scrolling below
-                // happens synchronously, so counting those would hold the
-                // picture still for a gap that never existed -- which looks
-                // like the text jumping and immediately coming back.
-                self.mouse.scroll_requested_rows += @intCast(y.delta);
-
                 const pos = try self.rt_surface.getCursorPos();
                 self.mouseReportRepeat(switch (y.direction()) {
                     .up_right => .four,

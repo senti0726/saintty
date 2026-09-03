@@ -1561,3 +1561,67 @@ Traps banked while chasing this:
 - `input.py`'s `MULT` had no module-level default; every gesture died with a
   bare `NameError` unless `--mult=` was passed.
 - nvim launched with `--clean` ignores wheel events unless `set mouse=a`.
+
+## 2026-09-03 (later) — Keyboard scrolling, easing, and the pixel-perfect removal
+
+### Keyboard-driven scrolls were invisible
+
+Holding `j`/`k` in vim, and paging through `bat`, did not animate. Same cause
+for both: the repaint detector's gate only accepted a *mouse* scroll, and the
+keyboard reaches none of the scroll plumbing. A new `input_activity` renderer
+message marks a keypress that produced pty input, and after the pixel-perfect
+removal the wheel sends the same message, so there is now one activity
+timestamp rather than two.
+
+The window is 150ms. Key repeat runs at roughly 30Hz so it stays continuously
+fresh while a key is held, and it closes promptly on release -- which is what
+keeps the output of a command you just pressed Enter on from sliding past
+instead of appearing.
+
+### Easing is a setting
+
+`scroll-animation-easing`: `ease-out-cubic` (default, unchanged behaviour),
+`ease-out-quint`, `ease-out-quad`, `material`, `linear`. The last three go
+through a real cubic-bezier solver (Newton with a bisection fallback), so
+`material` is genuinely `cubic-bezier(0.4, 0, 0.2, 1)` -- the curve browsers
+use to move something into place, which eases *in* as well as out and reads as
+the content having weight.
+
+Tested: every curve starts at 0, ends at 1, never moves backwards, the
+ease-outs lead a linear ramp at the halfway point, and the solver reproduces
+the identity bezier `cubic-bezier(0.25, 0.25, 0.75, 0.75)`.
+
+### Pixel-perfect is gone
+
+Removed `scroll-pixel-perfect` and `scroll-pixel-perfect-snap` and everything
+they owned: `setScrollPixel`, `advanceScrollFlight`, `settleScrollPixel`,
+`scrollPixelOffset`, the `scroll_pixel` renderer message, the in-flight
+compensation counters, the frozen scrolling region, and the reversal hysteresis
+in `Surface.scrollCallback`. The gtk precision multiplier is back to upstream's
+plain `10.0`.
+
+The coupling worth knowing about, because it would have failed *silently*: the
+repaint detector's gate read `scroll_input_ts`, which only `setScrollPixel`
+set. Deleting that path with the gate untouched would have left mouse-driven
+detection dead with everything still compiling and every test passing. The
+wheel now sends `input_activity` directly.
+
+Kept, because they are independent fixes and still correct:
+
+- the rounded-delta remainder fix in `scrollCallback` (upstream discards the
+  sub-cell remainder on every scroll)
+- `queueRepeatedWrite` / `mouseReportRepeat`, which coalesce a flick's mouse
+  reports into one mailbox message instead of overrunning the 64-slot termio
+  queue and freezing the GTK thread
+
+`narrowed` survives the removal: it is what decides whether
+`scroll-animation-reserve-bottom` applies.
+
+### Still not verified end to end
+
+`tools/scroll-harness/input.py` still cannot drive an application. Its defaults
+no longer pass the deleted flags, but the underlying fault is unfixed: the
+replay reaches `scrollCallback` and rows are emitted (`pending` cycling,
+`inflight` set before the counters were removed) yet the application never
+scrolls. Everything in this section was verified by unit tests, the full suite
+(291 scroll tests, 3837 overall), and the compiler -- not by watching a screen.

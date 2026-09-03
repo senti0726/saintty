@@ -25,7 +25,6 @@ const shadertoy = @import("shadertoy.zig");
 const ScrollAnim = @import("scroll_anim.zig");
 
 /// An inclusive row range that a scroll applies to.
-const ScrollRegion = struct { top: f32, bottom: f32 };
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -174,72 +173,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// offset these reconstruct where content was actually drawn.
         scroll_trace_rows: i64 = 0,
         scroll_trace_base: ?std.Io.Timestamp = null,
-
-        /// Sub-row scroll position, for pixel-perfect scrolling. `pending_px`
-        /// is the fraction of a row the gesture is currently at;
-        /// `requested_rows` counts rows we have asked the app for and
-        /// `applied_rows` counts the ones the model has actually performed.
-        /// See `setScrollPixel` and `scrollPixelOffset`.
-        scroll_pending_px: f32 = 0,
-        scroll_requested_rows: i64 = 0,
-
-        /// Direction of the gesture in progress, or 0 for none.
-        ///
-        /// Only a direction: which way to clamp the outstanding count. It is
-        /// never cleared by a scroll event, because events carry no identity
-        /// and clearing on one belonging to an earlier request is what made
-        /// the picture skip a row at every wrap.
-        ///
-        /// This compensation is bounded by *time*, not by a matching event,
-        /// and that is deliberate. It was first a pair of counters and then a
-        /// flag retired when the application scrolled, and both got stuck on
-        /// the same race: tmux answers a wheel event in about 0.3ms, faster
-        /// than our own cross-thread message announcing that we asked for it,
-        /// so the retire ran before the request and the compensation was never
-        /// cleared. It then pinned the offset at its clamp for the whole
-        /// gesture and only whole-row steps showed -- the exact symptom this
-        /// feature exists to remove.
-        ///
-        /// A deadline cannot get stuck. The gap being bridged is the frame or
-        /// so between asking and seeing it happen; if an application is slower
-        /// than that, the compensation expires and the picture simply lags
-        /// rather than freezing.
-        scroll_outstanding: i8 = 0,
-        scroll_outstanding_ts: ?std.Io.Timestamp = null,
-
-        /// Rows the application has scrolled during this gesture, in the same
-        /// sign convention as `scroll_requested_rows`. The difference between
-        /// the two is what is still in flight, and counting both ways is what
-        /// makes it robust to the ordering: the application answers a wheel
-        /// event faster than our own message announcing it, so either can be
-        /// seen first, and a difference that comes out on the wrong side of
-        /// zero simply clamps away.
-        scroll_model_rows: i64 = 0,
-
-        /// The compensation actually drawn, which follows the counters exactly
-        /// but eases away when a request goes unanswered. See
-        /// `advanceScrollFlight`.
-        scroll_flight: f32 = 0,
-        scroll_flight_last: ?std.Io.Timestamp = null,
-
-        /// The last content scrolling region we saw, so a sub-row
-        /// displacement that arrives before any scroll event still knows what
-        /// to move. Null means we have not seen one and the whole grid is
-        /// used, which is right for a plain shell and only briefly wrong in
-        /// tmux, until its first scroll names the region.
-        scroll_region: ?ScrollRegion = null,
-
-        /// Whether `scroll_region` has been decided for the gesture in
-        /// progress. Decided once, on the first scroll of the gesture, then
-        /// held: re-deciding per event is what let Claude Code's alternating
-        /// margins toggle smoothing between frames, and deciding only between
-        /// gestures meant a gesture that began before any region was known
-        /// smoothed nothing at all.
-        scroll_region_locked: bool = false,
-
-        /// When scroll input last arrived, so the sub-row displacement can be
-        /// settled once the gesture is over.
-        scroll_input_ts: ?std.Io.Timestamp = null,
 
         /// When a key last produced input for the program.
         ///
@@ -673,8 +606,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             scroll_animation_duration_ms: u32,
             scroll_animation_reserve_bottom: u8,
             scroll_animation_easing: ScrollAnim.Easing,
-            scroll_pixel_perfect: bool,
-            scroll_pixel_perfect_snap: bool,
             scroll_trace: bool,
             foreground: terminal.color.RGB,
             selection_background: ?configpkg.Config.TerminalColor,
@@ -764,8 +695,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .@"ease-out-quad" => .ease_out_quad,
                         .material => .material,
                     },
-                    .scroll_pixel_perfect = config.@"scroll-pixel-perfect",
-                    .scroll_pixel_perfect_snap = config.@"scroll-pixel-perfect-snap",
                     .scroll_trace = config.@"scroll-trace",
                     .padding_color = config.@"window-padding-color",
 
@@ -1144,31 +1073,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// i.e. 120fps, and the floor for any animation wake delay.
         pub const draw_interval_ms: u64 = 8;
 
-        /// How long after the last scroll input a sub-row displacement is
-        /// considered finished and eased onto the grid. Long enough not to
-        /// fire between the frames of a gesture, short enough not to be seen
-        /// as a delay once the fingers lift.
-        pub const settle_idle_ms: i64 = 120;
-
-        /// How long a requested-but-unseen scroll keeps its compensation. Long
-        /// enough to cover the round trip to a responsive application, short
-        /// enough that a slow one lags rather than freezing.
-        pub const scroll_outstanding_ms: i64 = 40;
-
-        /// How long an unanswered scroll's compensation takes to fade away.
-        /// Slow enough not to read as a jump, quick enough that the picture is
-        /// not left leaning on a stale request.
-        pub const scroll_flight_ramp_ms: f32 = 140;
-
-        /// How recently the user must have scrolled for a repaint to be read
-        /// as a scroll.
-        ///
-        /// Without this gate every screenful of program output would animate:
-        /// a build log scrolling past would slide rather than appear, which is
-        /// both wrong and unreadable. Deliberate scrolling is the only case
-        /// this is for, and the gesture timestamp is what says so.
-        pub const repaint_scroll_idle_ms: i64 = 250;
-
         /// Rows that must agree before a shift is believed, as a count and as
         /// a fraction of the rows compared.
         ///
@@ -1259,7 +1163,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // overruns the vsync budget and halves the observed frame rate --
             // measured at 33ms/frame with the animation on versus 18ms with
             // it off, which reads as the animation making scrolling *worse*.
-            if (self.scroll_anim.active() or self.scrollPixelOffset() != 0) {
+            if (self.scroll_anim.active()) {
                 const min_interval_ms: u64 = 16;
                 const delay: u64 = delay: {
                     const last = self.last_draw_ts orelse break :delay 1;
@@ -1303,196 +1207,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (!self.scroll_anim.active()) self.scroll_anim_last = null;
         }
 
-        /// Record where a scroll gesture currently is.
-        ///
-        /// Called from the render thread's mailbox.
-        pub fn setScrollPixel(self: *Self, pending_px: f32, requested_rows: i64) void {
-            // A new gesture picks its region afresh; the application on screen
-            // may not be the one that was scrolling last time.
-            if (self.scroll_input_ts == null) self.scroll_region_locked = false;
-            self.scroll_pending_px = pending_px;
-            const asked = requested_rows - self.scroll_requested_rows;
-            if (asked != 0) {
-                self.scroll_outstanding = if (asked > 0) 1 else -1;
-                self.scroll_outstanding_ts = .now(global.io(), .awake);
-            }
-            self.scroll_requested_rows = requested_rows;
-            self.scroll_input_ts = .now(global.io(), .awake);
-        }
-
         /// Record that a key produced input, for the repaint detector's gate.
         ///
         /// Called from the render thread's mailbox.
         pub fn noteInputActivity(self: *Self) void {
             self.input_activity_ts = .now(global.io(), .awake);
-        }
-
-        /// Bring `scroll_flight` to what should be drawn this frame.
-        ///
-        /// Two of the three transitions have to be *instant*, because each is
-        /// an exact cancellation of something happening in the same frame.
-        /// Arming cancels the remainder wrapping by a whole row when a scroll
-        /// is emitted; disarming because the application caught up cancels the
-        /// row of content it just moved. Ramping either of those would put the
-        /// jump back rather than removing it.
-        ///
-        /// The third transition is the one to ease: a request the application
-        /// never answered. Dropping that in a single frame -- and re-arming on
-        /// the next request -- is what swung the picture a whole row back and
-        /// forth several times a second on a slow application. Nothing cancels
-        /// it, so it is free to take its time.
-        fn advanceScrollFlight(self: *Self) void {
-            if (!self.config.scroll_pixel_perfect) {
-                self.scroll_flight = 0;
-                self.scroll_flight_last = null;
-                return;
-            }
-
-            const now: std.Io.Timestamp = .now(global.io(), .awake);
-            const last = self.scroll_flight_last;
-            self.scroll_flight_last = now;
-
-            var expired = false;
-            const target: f32 = target: {
-                if (self.scroll_outstanding == 0) break :target 0;
-                const ts = self.scroll_outstanding_ts orelse break :target 0;
-                const age_ms = @divTrunc(
-                    ts.durationTo(now).nanoseconds,
-                    std.time.ns_per_ms,
-                );
-                if (age_ms > scroll_outstanding_ms) {
-                    expired = true;
-                    break :target 0;
-                }
-
-                // What we asked for less what the application has done,
-                // clamped towards zero from the far side so that seeing the
-                // scroll before the request reads as nothing in flight rather
-                // than as a scroll the other way.
-                const diff: f32 = @floatFromInt(
-                    self.scroll_requested_rows - self.scroll_model_rows,
-                );
-                break :target if (self.scroll_outstanding > 0)
-                    std.math.clamp(diff, 0, 1)
-                else
-                    std.math.clamp(diff, -1, 0);
-            };
-
-            if (!expired) {
-                self.scroll_flight = target;
-                return;
-            }
-
-            const prev = last orelse return;
-            const dt_ms: f32 = @floatFromInt(@divTrunc(
-                prev.durationTo(now).nanoseconds,
-                std.time.ns_per_ms,
-            ));
-            if (!(dt_ms > 0)) return;
-
-            const step = dt_ms / scroll_flight_ramp_ms;
-            if (@abs(self.scroll_flight) <= step) {
-                self.scroll_flight = 0;
-            } else {
-                self.scroll_flight -= std.math.sign(self.scroll_flight) * step;
-            }
-        }
-
-        /// Once the gesture is over, retire the sub-row displacement.
-        ///
-        /// Two reasons this is not optional. A fraction of a row left standing
-        /// holds the text permanently off the character grid. And if the app
-        /// never scrolled at all -- a plain shell, which scrolls its viewport
-        /// without touching the terminal model, or an app already at the top
-        /// of its scrollback -- the outstanding rows never unwind and the
-        /// picture stays displaced for good.
-        ///
-        /// Hand the displacement to the ordinary ramp rather than dropping it,
-        /// so it eases onto the grid instead of snapping.
-        fn settleScrollPixel(self: *Self) void {
-            if (!self.config.scroll_pixel_perfect) return;
-            const ts = self.scroll_input_ts orelse return;
-
-            const now: std.Io.Timestamp = .now(global.io(), .awake);
-            const idle_ms = @divTrunc(ts.durationTo(now).nanoseconds, std.time.ns_per_ms);
-            if (idle_ms < settle_idle_ms) return;
-
-            // The in-flight term is always retired: it describes rows still
-            // travelling down the pty, and once the gesture is over there are
-            // none. Leaving it would let a miscount pin the offset for good.
-            self.scroll_outstanding = 0;
-            self.scroll_outstanding_ts = null;
-            self.scroll_flight = 0;
-            self.scroll_model_rows = self.scroll_requested_rows;
-            self.scroll_input_ts = null;
-            self.scroll_region_locked = false;
-
-            // Without snapping, the leftover fraction *is* the resting
-            // position, so keep it and stop here.
-            if (!self.config.scroll_pixel_perfect_snap) return;
-
-            const offset = self.scrollPixelOffset();
-            self.scroll_pending_px = 0;
-            if (@abs(offset) < ScrollAnim.min_offset_px) return;
-
-            const region: ScrollRegion = self.scroll_region orelse return;
-            const cell_h: f32 = @floatFromInt(self.size.cell.height);
-            self.scroll_anim.push(
-                offset,
-                region.top,
-                region.bottom,
-                cell_h * ScrollAnim.max_lag_rows,
-            );
-            self.scroll_anim_last = null;
-        }
-
-        /// The sub-row displacement to draw, in pixels.
-        ///
-        /// Two terms that only work together.
-        ///
-        /// `scroll_pending_px` is how far the gesture sits from the row the
-        /// app has been rounded to. Drawing it is the whole point: otherwise
-        /// half a row of finger movement shows nothing and a bit more jumps a
-        /// full line.
-        ///
-        /// The second is the rows we have asked the app for and not yet seen
-        /// it perform. Without it the picture stutters at every row boundary:
-        /// the instant the fraction rounds up, a report goes down the pty and
-        /// `pending` flips from +half a cell to -half a cell, but the app is a
-        /// round trip away and has not moved, so the offset would jump a whole
-        /// cell with nothing underneath it. Holding the in-flight rows makes
-        /// the two cancel exactly, and the drawn position does not move at all
-        /// until the app arrives under it.
-        ///
-        /// Because `scrollCallback` rounds to *nearest* under this option, the
-        /// two together stay within half a cell, so the display leads the app
-        /// by at most half a row. That bound matters: in the alternate screen
-        /// the row that would come into view has not arrived -- tmux has it,
-        /// we do not -- so any lead is a hole exactly as tall as the lead.
-        /// Half a row is a sliver; a whole row is a missing line.
-        ///
-        /// The clamp is a hard safety net rather than arithmetic. It assumes
-        /// one wheel report produces one row of app scrolling, and nothing
-        /// enforces that -- an app can scroll by three, or refuse at the top
-        /// of its buffer. When that assumption slips the term drifts, and the
-        /// clamp keeps the drift from ever becoming a deleted line.
-        fn scrollPixelOffset(self: *const Self) f32 {
-            if (!self.config.scroll_pixel_perfect) return 0;
-
-            // Only move rows the application has actually told us it scrolls.
-            //
-            // Without a known scrolling region the only honest choice is the
-            // whole grid, and that shifts things deliberately parked outside
-            // it: tmux's status line, nvim's bars, the prompt box an
-            // application keeps pinned to the bottom while it redraws its own
-            // history above. An application that redraws instead of scrolling
-            // never tells us a region, and gets no smoothing rather than a
-            // wobbling interface.
-            if (self.scroll_region == null) return 0;
-
-            const cell_h: f32 = @floatFromInt(self.size.cell.height);
-            const offset = self.scroll_pending_px + self.scroll_flight * cell_h;
-            return std.math.clamp(offset, -cell_h / 2, cell_h / 2);
         }
 
         /// Recover a scroll that an application performed by repainting.
@@ -1516,13 +1235,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }.f;
 
-            // Either input the user drives. The keyboard window is the
-            // shorter of the two on purpose: a wheel gesture is unambiguous,
-            // but pressing Enter is followed by whatever the command prints,
-            // and a long window would animate the start of that output.
-            if (sinceMs(now, self.scroll_input_ts) > repaint_scroll_idle_ms and
-                sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms)
-            {
+            // Only movement the user drove. Both the wheel and the keyboard
+            // mark the same timestamp; the window is short enough that the
+            // output of a command you just pressed Enter on does not slide,
+            // and key repeat at roughly 30Hz keeps it fresh while a key is
+            // held.
+            if (sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms) {
                 self.scroll_row_hashes.clearRetainingCapacity();
                 return;
             }
@@ -1587,17 +1305,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             const t_us = @divTrunc(base.durationTo(now).nanoseconds, std.time.ns_per_us);
             log.info(
-                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} inflight={d} pending={d:.2} top={d} bot={d} cell_h={d}",
+                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} top={d} bot={d} cell_h={d}",
                 .{
                     t_us,
                     self.scroll_trace_rows,
-                    // The *drawn* offset, both terms. Logging only the
-                    // animation half made the trace blind to pixel-perfect
-                    // scrolling, which is exactly the part that keeps
-                    // breaking.
-                    self.scroll_anim.offset_px + self.scrollPixelOffset(),
-                    self.scroll_outstanding,
-                    self.scroll_pending_px,
+                    self.scroll_anim.offset_px,
                     self.scroll_anim.top,
                     self.scroll_anim.bottom,
                     self.size.cell.height,
@@ -2007,7 +1719,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // the *region* top (not the cursor row `top`), whether it
                     // counted as narrowed, and the offset actually drawn.
                     log.info(
-                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} pixel={} req={d} applied={d} pending={d:.2} pixoff={d:.2} cell_h={d}",
+                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} cell_h={d}",
                         .{
                             ev.rows,
                             ev.top,
@@ -2015,11 +1727,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             ev.bottom,
                             self.size.grid().rows,
                             @tagName(ev.source),
-                            self.config.scroll_pixel_perfect,
-                            self.scroll_requested_rows,
-                            self.scroll_outstanding,
-                            self.scroll_pending_px,
-                            self.scrollPixelOffset(),
                             self.size.cell.height,
                         },
                     );
@@ -2060,39 +1767,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // for the duration of the gesture removes that entirely, and
                 // an application with a stable region -- tmux, nvim -- is
                 // unaffected because there is nothing to re-decide.
+                // `narrowed` says the application named its own interface
+                // rows at one end or the other, which is better information
+                // than a number in a config file. See the reserve below.
                 const grid_rows = self.size.grid().rows;
                 const narrowed = ev.region_top > 0 or ev.bottom + 1 < grid_rows;
-                if (!self.scroll_region_locked) {
-                    self.scroll_region_locked = true;
-                    self.scroll_region = if (narrowed) .{
-                        .top = @floatFromInt(ev.region_top),
-                        .bottom = @floatFromInt(ev.bottom),
-                    } else null;
-                }
-
-                if (self.config.scroll_pixel_perfect) {
-                    // The application moved the way we asked, so nothing is
-                    // outstanding any more. Only matching directions count: a
-                    // program writing output scrolls the model too, and
-                    // retiring on those would drop the compensation for a
-                    // scroll still in flight.
-                    //
-                    // ScrollEvent.rows counts content moving *up* as positive,
-                    // the opposite sense to the scroll delta, hence the negation.
-                    // Count it and nothing else. Clearing a flag here was
-                    // wrong: the event carries no identity, so a scroll
-                    // belonging to an *earlier* request cleared the
-                    // compensation for the one that had just been made, and
-                    // the picture stepped back a whole row at the moment the
-                    // remainder wrapped -- smooth until half way down the
-                    // line, then a skip. The counters already say what is
-                    // outstanding.
-                    self.scroll_model_rows += -@as(i64, @intCast(ev.rows));
-
-                    // The gesture already places the content continuously, so
-                    // easing toward the model would fight it.
-                    break :scroll;
-                }
 
                 if (!self.config.scroll_animation) break :scroll;
                 if (ev.rows == 0) break :scroll;
@@ -2468,19 +2147,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Advance any scroll animation and publish it to the shaders.
             // Done here, immediately before upload, so the value drawn is the
             // value computed for this frame.
-            self.settleScrollPixel();
-            self.advanceScrollFlight();
             self.advanceScrollAnim();
             if (self.config.scroll_trace) self.traceScrollFrame();
-            const pixel_off = self.scrollPixelOffset();
-            const total_off = self.scroll_anim.offset_px + pixel_off;
-            // The region only matters while something is displaced. When only
-            // the sub-row term is live there has been no scroll event to name
-            // a region, so fall back to the whole grid.
+            const total_off = self.scroll_anim.offset_px;
             const top: f32, const bot: f32 = if (self.scroll_anim.active())
                 .{ self.scroll_anim.top, self.scroll_anim.bottom }
-            else if (self.scroll_region) |r|
-                .{ r.top, r.bottom }
             else
                 .{ 0, 0 };
             self.uniforms.scroll_anim = .{
