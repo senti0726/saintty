@@ -1121,6 +1121,27 @@ palette: Palette = .{},
 /// `scroll-animation` is enabled.
 @"scroll-animation-duration": u32 = 120,
 
+/// The shape of the scroll animation's motion.
+///
+/// Which curve reads best depends on how large one step is, so this is worth
+/// tasting rather than taking on trust. All of them travel the same distance
+/// in the same `scroll-animation-duration`; only the pacing differs.
+///
+///   * `ease-out-cubic` - the default. Most of the travel happens early, then
+///     it decelerates into place.
+///   * `ease-out-quint` - the same idea, more pronounced: leaves faster,
+///     settles more gently.
+///   * `ease-out-quad`  - `cubic-bezier(0.25, 0.46, 0.45, 0.94)`, a gentler
+///     ease-out closer to a plain ramp.
+///   * `material`       - `cubic-bezier(0.4, 0.0, 0.2, 1.0)`, what browsers
+///     and Material interfaces use to move something into place. It eases
+///     *in* as well as out, which reads as the content having weight.
+///   * `linear`         - constant speed. Arrives at full speed and stops
+///     dead; included mostly for comparison.
+///
+/// Has no effect unless `scroll-animation` is enabled.
+@"scroll-animation-easing": ScrollAnimationEasing = .@"ease-out-cubic",
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.
@@ -4238,6 +4259,15 @@ test "handle bom in config files" {
 }
 
 pub const OptionalFileAction = enum { loaded, not_found, @"error" };
+
+/// See scroll-animation-easing
+pub const ScrollAnimationEasing = enum {
+    linear,
+    @"ease-out-cubic",
+    @"ease-out-quint",
+    @"ease-out-quad",
+    material,
+};
 
 /// Load optional configuration file from `path`. All errors are ignored.
 ///

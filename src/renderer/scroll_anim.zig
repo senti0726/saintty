@@ -104,16 +104,77 @@ pub fn stop(self: *ScrollAnim) void {
     self.elapsed_ms = 0;
 }
 
-/// Cubic ease-out: quick away from the old position, decelerating into the
-/// new one.
+/// The shape of the motion.
 ///
 /// A linear ramp arrives at full speed and stops dead, which reads as
-/// mechanical next to a browser however short it is. This is the difference a
-/// person actually notices, and it matters most for a mouse wheel, where one
-/// notch is a large discrete jump rather than a finger's worth of pixels.
-fn easeOut(t: f32) f32 {
+/// mechanical next to a browser however short it is. Which *curve* reads best
+/// is a matter of taste and of how big one step is, so it is a setting rather
+/// than a constant.
+pub const Easing = enum {
+    linear,
+    ease_out_cubic,
+    ease_out_quint,
+    /// cubic-bezier(0.4, 0.0, 0.2, 1.0) -- the curve browsers and Material
+    /// interfaces use for moving something into place. Unlike a pure ease-out
+    /// it starts gently as well, which reads as the content having weight.
+    material,
+    /// cubic-bezier(0.25, 0.46, 0.45, 0.94).
+    ease_out_quad,
+};
+
+/// Evaluate a cubic Bezier with P0=(0,0), P3=(1,1) at `x`.
+///
+/// The curve is parameterised by u, not by x, so x must be inverted first.
+/// Newton-Raphson converges in a handful of steps here because the curve is
+/// monotonic in x for the control points we allow; the bisection fallback
+/// keeps a pathological pair from spinning.
+fn bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) f32 {
+    const curve = struct {
+        fn at(a: f32, b: f32, u: f32) f32 {
+            const inv = 1.0 - u;
+            // 3(1-u)^2 u a + 3(1-u) u^2 b + u^3
+            return 3.0 * inv * inv * u * a +
+                3.0 * inv * u * u * b +
+                u * u * u;
+        }
+        fn slope(a: f32, b: f32, u: f32) f32 {
+            const inv = 1.0 - u;
+            return 3.0 * inv * inv * a +
+                6.0 * inv * u * (b - a) +
+                3.0 * u * u * (1.0 - b);
+        }
+    };
+
+    var u = x;
+    for (0..8) |_| {
+        const dx = curve.at(x1, x2, u) - x;
+        if (@abs(dx) < 1e-5) return curve.at(y1, y2, u);
+        const d = curve.slope(x1, x2, u);
+        if (@abs(d) < 1e-6) break;
+        u -= dx / d;
+    }
+
+    var lo: f32 = 0;
+    var hi: f32 = 1;
+    u = x;
+    for (0..24) |_| {
+        const cx = curve.at(x1, x2, u);
+        if (@abs(cx - x) < 1e-5) break;
+        if (cx > x) hi = u else lo = u;
+        u = (lo + hi) / 2.0;
+    }
+    return curve.at(y1, y2, u);
+}
+
+fn easeOut(t: f32, easing: Easing) f32 {
     const inv = 1.0 - t;
-    return 1.0 - inv * inv * inv;
+    return switch (easing) {
+        .linear => t,
+        .ease_out_cubic => 1.0 - inv * inv * inv,
+        .ease_out_quint => 1.0 - inv * inv * inv * inv * inv,
+        .material => bezier(0.4, 0.0, 0.2, 1.0, t),
+        .ease_out_quad => bezier(0.25, 0.46, 0.45, 0.94, t),
+    };
 }
 
 /// Advance the animation by `dt_ms`, retiring the displacement over
@@ -122,7 +183,12 @@ fn easeOut(t: f32) f32 {
 /// Eased rather than linear, and computed from elapsed time rather than
 /// integrated, so a dropped or long frame lands where it should instead of
 /// accumulating error.
-pub fn advance(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
+pub fn advance(
+    self: *ScrollAnim,
+    dt_ms: f32,
+    duration_ms: f32,
+    easing: Easing,
+) void {
     if (!self.active()) return;
 
     // A stalled or hidden surface can hand us a huge dt. Finishing early is
@@ -136,7 +202,8 @@ pub fn advance(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
         return;
     }
 
-    const remaining = self.start_px * (1.0 - easeOut(self.elapsed_ms / duration_ms));
+    const remaining = self.start_px *
+        (1.0 - easeOut(self.elapsed_ms / duration_ms, easing));
     self.offset_px = if (@abs(remaining) < min_offset_px) 0 else remaining;
 }
 
@@ -228,6 +295,47 @@ pub fn detectShift(
     while (bottom > top and cur[bottom] == prev[bottom]) bottom -= 1;
 
     return .{ .rows = best_shift, .top = top, .bottom = bottom };
+}
+
+test "Easing: every curve starts at 0 and ends at 1" {
+    // A curve that does not reach 1 leaves the animation permanently short of
+    // the model, which pins the text off the character grid.
+    for (std.enums.values(Easing)) |e| {
+        try testing.expectApproxEqAbs(@as(f32, 0), easeOut(0, e), 0.002);
+        try testing.expectApproxEqAbs(@as(f32, 1), easeOut(1, e), 0.002);
+    }
+}
+
+test "Easing: every curve advances monotonically" {
+    // Any dip backwards is content visibly moving against the scroll.
+    for (std.enums.values(Easing)) |e| {
+        var prev: f32 = -1;
+        var i: usize = 0;
+        while (i <= 100) : (i += 1) {
+            const v = easeOut(@as(f32, @floatFromInt(i)) / 100.0, e);
+            try testing.expect(v >= prev - 0.001);
+            prev = v;
+        }
+    }
+}
+
+test "Easing: the eased curves lead a linear ramp at the halfway point" {
+    // The property that makes them read as motion rather than a slide: most
+    // of the travel is done early. `material` is deliberately exempt -- it
+    // eases in as well, which is the whole point of offering it.
+    for ([_]Easing{ .ease_out_cubic, .ease_out_quint, .ease_out_quad }) |e| {
+        try testing.expect(easeOut(0.5, e) > 0.5);
+    }
+}
+
+test "Easing: bezier matches its closed form on a known curve" {
+    // cubic-bezier(0.25, 0.25, 0.75, 0.75) is the identity; if the solver is
+    // wrong this is where it shows.
+    var i: usize = 0;
+    while (i <= 10) : (i += 1) {
+        const x = @as(f32, @floatFromInt(i)) / 10.0;
+        try testing.expectApproxEqAbs(x, bezier(0.25, 0.25, 0.75, 0.75, x), 0.002);
+    }
 }
 
 test "detectShift: finds a clean shift and gets its sign right" {
@@ -336,7 +444,7 @@ test "ScrollAnim: settles within the configured duration, not long after" {
     var a: ScrollAnim = .{};
     a.push(-38, 1, 52, 10_000);
     var elapsed: f32 = 0;
-    while (a.active() and elapsed < 1000) : (elapsed += 16) a.advance(16, 80);
+    while (a.active() and elapsed < 1000) : (elapsed += 16) a.advance(16, 80, .ease_out_cubic);
     try testing.expect(!a.active());
     try testing.expect(elapsed <= 96);
 }
@@ -347,10 +455,10 @@ test "ScrollAnim: eases out, so early frames move further than late ones" {
     var a: ScrollAnim = .{};
     a.push(-100, 0, 10, 10_000);
     const start = a.offset_px;
-    a.advance(10, 100);
+    a.advance(10, 100, .ease_out_cubic);
     const first = @abs(a.offset_px - start);
     const before = a.offset_px;
-    a.advance(10, 100);
+    a.advance(10, 100, .ease_out_cubic);
     const second = @abs(a.offset_px - before);
     try testing.expect(first > second);
 }
@@ -362,10 +470,10 @@ test "ScrollAnim: position comes from elapsed time, not accumulated frames" {
     var b: ScrollAnim = .{};
     a.push(-100, 0, 10, 10_000);
     b.push(-100, 0, 10, 10_000);
-    a.advance(30, 100);
-    b.advance(10, 100);
-    b.advance(10, 100);
-    b.advance(10, 100);
+    a.advance(30, 100, .ease_out_cubic);
+    b.advance(10, 100, .ease_out_cubic);
+    b.advance(10, 100, .ease_out_cubic);
+    b.advance(10, 100, .ease_out_cubic);
     try testing.expectApproxEqAbs(a.offset_px, b.offset_px, 0.001);
 }
 
@@ -386,7 +494,7 @@ test "ScrollAnim: advancing a full duration finishes it" {
     var a: ScrollAnim = .{};
     a.push(-20, 0, 10, 10_000);
     try testing.expect(a.active());
-    a.advance(80, 80);
+    a.advance(80, 80, .ease_out_cubic);
     try testing.expect(!a.active());
     try testing.expectEqual(@as(f32, 0), a.offset_px);
 }
@@ -396,7 +504,7 @@ test "ScrollAnim: a longer-than-duration frame does not overshoot past zero" {
     a.push(-20, 0, 10, 10_000);
     // A stalled surface: the offset must land exactly on zero, never cross it
     // and animate back from the other side.
-    a.advance(5000, 80);
+    a.advance(5000, 80, .ease_out_cubic);
     try testing.expectEqual(@as(f32, 0), a.offset_px);
 }
 
@@ -406,7 +514,7 @@ test "ScrollAnim: decays monotonically toward zero without changing sign" {
     var prev = a.offset_px;
     var i: usize = 0;
     while (i < 200 and a.active()) : (i += 1) {
-        a.advance(16, 80);
+        a.advance(16, 80, .ease_out_cubic);
         try testing.expect(a.offset_px <= 0); // never flips sign
         try testing.expect(@abs(a.offset_px) <= @abs(prev)); // never grows
         prev = a.offset_px;
@@ -420,8 +528,8 @@ test "ScrollAnim: positive and negative decay symmetrically" {
     up.push(30, 0, 10, 10_000);
     down.push(-30, 0, 10, 10_000);
     for (0..3) |_| {
-        up.advance(16, 80);
-        down.advance(16, 80);
+        up.advance(16, 80, .ease_out_cubic);
+        down.advance(16, 80, .ease_out_cubic);
     }
     try testing.expectApproxEqAbs(up.offset_px, -down.offset_px, 0.001);
 }
@@ -429,7 +537,7 @@ test "ScrollAnim: positive and negative decay symmetrically" {
 test "ScrollAnim: a scroll over a disjoint region replaces" {
     var a: ScrollAnim = .{};
     a.push(-20, 0, 10, 10_000);
-    a.advance(16, 80);
+    a.advance(16, 80, .ease_out_cubic);
     a.push(40, 20, 30, 10_000);
     try testing.expectEqual(@as(f32, 40), a.offset_px);
     try testing.expectEqual(@as(f32, 20), a.top);
@@ -472,7 +580,7 @@ test "ScrollAnim: a fling cannot wind the offset past a couple of rows" {
     const limit = cell_h * max_lag_rows;
     for (0..200) |_| {
         a.push(-cell_h, 1, 52, limit);
-        a.advance(16, 80);
+        a.advance(16, 80, .ease_out_cubic);
     }
     try testing.expect(@abs(a.offset_px) <= limit);
 }
@@ -487,14 +595,14 @@ test "ScrollAnim: zero or negative dt is ignored rather than reversing" {
     var a: ScrollAnim = .{};
     a.push(-20, 0, 10, 10_000);
     const before = a.offset_px;
-    a.advance(0, 80);
-    a.advance(-5, 80);
+    a.advance(0, 80, .ease_out_cubic);
+    a.advance(-5, 80, .ease_out_cubic);
     try testing.expectEqual(before, a.offset_px);
 }
 
 test "ScrollAnim: a zero duration does not divide by zero" {
     var a: ScrollAnim = .{};
     a.push(-20, 0, 10, 10_000);
-    a.advance(16, 0);
+    a.advance(16, 0, .ease_out_cubic);
     try testing.expect(a.offset_px == -20);
 }

@@ -36,6 +36,15 @@ pub const Message = union(enum) {
         requested_rows: i64,
     },
 
+    /// A key was pressed that produced input for the program.
+    ///
+    /// The repaint-scroll detector only trusts a shift it can attribute to
+    /// the user, and a keyboard is the other way they scroll: `j`/`k` held
+    /// down in vim or in a pager moves the screen exactly as a wheel does,
+    /// but reaches none of the scroll plumbing. Without this the detector is
+    /// blind to every keyboard-driven scroll.
+    input_activity,
+
     /// Change the font grid. This can happen for any number of reasons
     /// including a font size change, family change, etc.
     font_grid: struct {

@@ -241,6 +241,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// settled once the gesture is over.
         scroll_input_ts: ?std.Io.Timestamp = null,
 
+        /// When a key last produced input for the program.
+        ///
+        /// Keyboard scrolling -- `j`/`k` held in vim or a pager -- moves the
+        /// screen exactly as a wheel does but touches none of the scroll
+        /// plumbing, so without this the repaint detector never runs for it.
+        input_activity_ts: ?std.Io.Timestamp = null,
+
         /// Row content hashes from the previous frame.
         ///
         /// Some applications move the picture without ever telling us they
@@ -665,6 +672,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             scroll_animation: bool,
             scroll_animation_duration_ms: u32,
             scroll_animation_reserve_bottom: u8,
+            scroll_animation_easing: ScrollAnim.Easing,
             scroll_pixel_perfect: bool,
             scroll_pixel_perfect_snap: bool,
             scroll_trace: bool,
@@ -749,6 +757,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .scroll_animation = config.@"scroll-animation",
                     .scroll_animation_duration_ms = config.@"scroll-animation-duration",
                     .scroll_animation_reserve_bottom = config.@"scroll-animation-reserve-bottom",
+                    .scroll_animation_easing = switch (config.@"scroll-animation-easing") {
+                        .linear => .linear,
+                        .@"ease-out-cubic" => .ease_out_cubic,
+                        .@"ease-out-quint" => .ease_out_quint,
+                        .@"ease-out-quad" => .ease_out_quad,
+                        .material => .material,
+                    },
                     .scroll_pixel_perfect = config.@"scroll-pixel-perfect",
                     .scroll_pixel_perfect_snap = config.@"scroll-pixel-perfect-snap",
                     .scroll_trace = config.@"scroll-trace",
@@ -1161,6 +1176,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// empty screen can "match" a shift of any size. Animating that
         /// invents motion that never happened, so a shift has to be carried by
         /// a substantial majority of the screen before it is acted on.
+        /// The same gate for the keyboard, kept shorter.
+        ///
+        /// Key repeat when a key is held runs at roughly 30Hz, so a window
+        /// this size stays continuously fresh while `j` is down and closes
+        /// promptly once it is released -- which is what keeps the output of
+        /// a command you just pressed Enter on from sliding.
+        pub const repaint_key_idle_ms: i64 = 150;
+
         pub const repaint_scroll_min_rows: usize = 6;
         pub const repaint_scroll_min_ratio: f32 = 0.6;
 
@@ -1275,6 +1298,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.scroll_anim.advance(
                 dt_ms,
                 @floatFromInt(self.config.scroll_animation_duration_ms),
+                self.config.scroll_animation_easing,
             );
             if (!self.scroll_anim.active()) self.scroll_anim_last = null;
         }
@@ -1294,6 +1318,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             self.scroll_requested_rows = requested_rows;
             self.scroll_input_ts = .now(global.io(), .awake);
+        }
+
+        /// Record that a key produced input, for the repaint detector's gate.
+        ///
+        /// Called from the render thread's mailbox.
+        pub fn noteInputActivity(self: *Self) void {
+            self.input_activity_ts = .now(global.io(), .awake);
         }
 
         /// Bring `scroll_flight` to what should be drawn this frame.
@@ -1474,15 +1505,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Hashes are only kept while a gesture is in progress, so this costs
         /// nothing at rest.
         fn detectRepaintScroll(self: *Self, had_event: bool) void {
-            const idle: i64 = idle: {
-                const ts = self.scroll_input_ts orelse break :idle std.math.maxInt(i64);
-                const now: std.Io.Timestamp = .now(global.io(), .awake);
-                break :idle @intCast(@divTrunc(
-                    ts.durationTo(now).nanoseconds,
-                    std.time.ns_per_ms,
-                ));
-            };
-            if (idle > repaint_scroll_idle_ms) {
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const sinceMs = struct {
+                fn f(now_: std.Io.Timestamp, ts: ?std.Io.Timestamp) i64 {
+                    const t = ts orelse return std.math.maxInt(i64);
+                    return @intCast(@divTrunc(
+                        t.durationTo(now_).nanoseconds,
+                        std.time.ns_per_ms,
+                    ));
+                }
+            }.f;
+
+            // Either input the user drives. The keyboard window is the
+            // shorter of the two on purpose: a wheel gesture is unambiguous,
+            // but pressing Enter is followed by whatever the command prints,
+            // and a long window would animate the start of that output.
+            if (sinceMs(now, self.scroll_input_ts) > repaint_scroll_idle_ms and
+                sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms)
+            {
                 self.scroll_row_hashes.clearRetainingCapacity();
                 return;
             }

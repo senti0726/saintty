@@ -2860,6 +2860,17 @@ pub fn keyCallback(
 
         if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
 
+        // Tell the renderer a key produced input. Holding `j` or `k` in vim
+        // or a pager scrolls the screen exactly as a wheel does, but reaches
+        // none of the scroll plumbing, so the repaint detector would never
+        // run for it. Best effort: a dropped one costs a frame of animation,
+        // never correctness.
+        _ = self.renderer_thread.mailbox.push(
+            global.io(),
+            .input_activity,
+            .{ .instant = {} },
+        );
+
         try self.queueRender();
     }
 
