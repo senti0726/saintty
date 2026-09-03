@@ -33,4 +33,6 @@ vgcore.*
 
 /sprite_face_test*
 .scroll-trace-*.log
+.scroll-input-*.txt
+.scroll-input-*.log
 zig-out-release/
