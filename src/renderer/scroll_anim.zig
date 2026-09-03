@@ -151,12 +151,26 @@ pub fn advance(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
 /// wrapped line, and anything on the primary screen moves the scrollback
 /// viewport instead. Hashing rows and looking for the offset recovers the
 /// movement from what was drawn.
+pub const Shift = struct {
+    /// Rows the content moved up by; negative means down.
+    rows: isize,
+
+    /// Inclusive row range that actually moved.
+    ///
+    /// Rows an application keeps still -- nvim's status and tab lines, a
+    /// prompt box -- hold the same content from frame to frame, so they match
+    /// themselves and *not* the shifted picture. Animating the whole grid drags
+    /// them along and springs them back, so only the matched span moves.
+    top: usize,
+    bottom: usize,
+};
+
 pub fn detectShift(
     cur: []const u64,
     prev: []const u64,
     min_rows: usize,
     min_ratio: f32,
-) ?isize {
+) ?Shift {
     if (cur.len != prev.len or cur.len == 0) return null;
     const n: isize = @intCast(cur.len);
 
@@ -196,7 +210,24 @@ pub fn detectShift(
     }
     if (same >= best_matches) return null;
 
-    return best_shift;
+    // Trim interface rows off both edges.
+    //
+    // A row an application pins -- nvim's tab line and status line, a prompt
+    // box -- holds the same content across the frame. Scan inward from each
+    // edge while that is true and animate what is left. Rows *matching the
+    // shift* is the wrong test here: it also excludes rows newly exposed at
+    // the trailing edge, which have no previous position but must still move
+    // with the block, and leaving them behind tears that edge.
+    //
+    // Only the outermost unchanged rows are trimmed, so an unchanged row in
+    // the middle of the content -- a blank line -- is unaffected.
+    var top: usize = 0;
+    while (top < cur.len and cur[top] == prev[top]) top += 1;
+    if (top == cur.len) return null;
+    var bottom: usize = cur.len - 1;
+    while (bottom > top and cur[bottom] == prev[bottom]) bottom -= 1;
+
+    return .{ .rows = best_shift, .top = top, .bottom = bottom };
 }
 
 test "detectShift: finds a clean shift and gets its sign right" {
@@ -205,7 +236,7 @@ test "detectShift: finds a clean shift and gets its sign right" {
     for (&prev, 0..) |*v, i| v.* = 1000 + i;
     var cur: [20]u64 = undefined;
     for (&cur, 0..) |*v, i| v.* = 1000 + i + 3;
-    try testing.expectEqual(@as(?isize, 3), detectShift(&cur, &prev, 6, 0.6));
+    try testing.expectEqual(@as(isize, 3), detectShift(&cur, &prev, 6, 0.6).?.rows);
 }
 
 test "detectShift: reports the other direction as negative" {
@@ -213,7 +244,31 @@ test "detectShift: reports the other direction as negative" {
     for (&prev, 0..) |*v, i| v.* = 1000 + i;
     var cur: [20]u64 = undefined;
     for (&cur, 0..) |*v, i| v.* = 1000 + i - 2;
-    try testing.expectEqual(@as(?isize, -2), detectShift(&cur, &prev, 6, 0.6));
+    try testing.expectEqual(@as(isize, -2), detectShift(&cur, &prev, 6, 0.6).?.rows);
+}
+
+test "detectShift: interface rows held at top and bottom are excluded" {
+    // The bug this guards, reported by eye: nvim's tab line and status line
+    // rode along with the scroll and sprang back, because the whole grid was
+    // animated. They keep their content across the frame, so they match
+    // themselves and not the shifted picture -- which is exactly the signal
+    // that they are not part of the scroll.
+    var prev: [20]u64 = undefined;
+    var cur: [20]u64 = undefined;
+    for (0..20) |i| {
+        prev[i] = 1000 + i;
+        cur[i] = 1000 + i + 3;
+    }
+    // Row 0 a tab line, rows 18-19 a status line and command line: unchanged.
+    for ([_]usize{ 0, 18, 19 }) |i| {
+        prev[i] = 500 + i;
+        cur[i] = 500 + i;
+    }
+
+    const got = detectShift(&cur, &prev, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, 3), got.rows);
+    try testing.expectEqual(@as(usize, 1), got.top);
+    try testing.expectEqual(@as(usize, 17), got.bottom);
 }
 
 test "detectShift: a still screen is not a scroll" {
@@ -221,14 +276,14 @@ test "detectShift: a still screen is not a scroll" {
     // every frame forever.
     var rows: [20]u64 = undefined;
     for (&rows, 0..) |*v, i| v.* = 1000 + i;
-    try testing.expectEqual(@as(?isize, null), detectShift(&rows, &rows, 6, 0.6));
+    try testing.expect(detectShift(&rows, &rows, 6, 0.6) == null);
 }
 
 test "detectShift: a blank screen matches every shift and must be refused" {
     // Every row equal means every offset scores a perfect match. Believing one
     // would slide an empty screen sideways for no reason.
     const blank: [20]u64 = @splat(0);
-    try testing.expectEqual(@as(?isize, null), detectShift(&blank, &blank, 6, 0.6));
+    try testing.expect(detectShift(&blank, &blank, 6, 0.6) == null);
 }
 
 test "detectShift: repeating content does not invent a scroll" {
@@ -236,7 +291,7 @@ test "detectShift: repeating content does not invent a scroll" {
     // as well, so `same` has to veto it.
     var rows: [20]u64 = undefined;
     for (&rows, 0..) |*v, i| v.* = if (i % 2 == 0) 7 else 9;
-    try testing.expectEqual(@as(?isize, null), detectShift(&rows, &rows, 6, 0.6));
+    try testing.expect(detectShift(&rows, &rows, 6, 0.6) == null);
 }
 
 test "detectShift: an unrelated screen is not a scroll" {
@@ -246,7 +301,7 @@ test "detectShift: an unrelated screen is not a scroll" {
     for (&prev, 0..) |*v, i| v.* = 1000 + i;
     var cur: [20]u64 = undefined;
     for (&cur, 0..) |*v, i| v.* = 50_000 + i * 7;
-    try testing.expectEqual(@as(?isize, null), detectShift(&cur, &prev, 6, 0.6));
+    try testing.expect(detectShift(&cur, &prev, 6, 0.6) == null);
 }
 
 test "detectShift: too few matching rows is refused" {
@@ -255,7 +310,7 @@ test "detectShift: too few matching rows is refused" {
     for (&prev, 0..) |*v, i| v.* = 1000 + i;
     var cur: [20]u64 = undefined;
     for (&cur, 0..) |*v, i| v.* = if (i < 3) 1000 + i + 3 else 90_000 + i;
-    try testing.expectEqual(@as(?isize, null), detectShift(&cur, &prev, 6, 0.6));
+    try testing.expect(detectShift(&cur, &prev, 6, 0.6) == null);
 }
 
 test "detectShift: a shift larger than we animate is not reported" {
@@ -264,13 +319,13 @@ test "detectShift: a shift larger than we animate is not reported" {
     var cur: [40]u64 = undefined;
     // Past max_animated_rows: a page jump, which snaps rather than slides.
     for (&cur, 0..) |*v, i| v.* = 1000 + i + max_animated_rows + 5;
-    try testing.expectEqual(@as(?isize, null), detectShift(&cur, &prev, 6, 0.6));
+    try testing.expect(detectShift(&cur, &prev, 6, 0.6) == null);
 }
 
 test "detectShift: mismatched lengths are refused rather than compared" {
     const a: [10]u64 = @splat(1);
     const b: [12]u64 = @splat(1);
-    try testing.expectEqual(@as(?isize, null), detectShift(&a, &b, 6, 0.6));
+    try testing.expect(detectShift(&a, &b, 6, 0.6) == null);
 }
 
 test "ScrollAnim: settles within the configured duration, not long after" {

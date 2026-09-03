@@ -1519,16 +1519,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             const was_idle = !self.scroll_anim.active();
             self.scroll_anim.push(
-                @as(f32, @floatFromInt(shift)) * cell_h,
-                0,
-                @floatFromInt(n - 1),
+                @as(f32, @floatFromInt(shift.rows)) * cell_h,
+                @floatFromInt(shift.top),
+                @floatFromInt(shift.bottom),
                 cell_h * ScrollAnim.max_lag_rows,
             );
             if (was_idle) self.scroll_anim_last = null;
 
             if (self.config.scroll_trace) log.info(
-                "repaintscroll shift={d} rows={d}",
-                .{ shift, n },
+                "repaintscroll shift={d} span={d}..{d} of {d}",
+                .{ shift.rows, shift.top, shift.bottom, n },
             );
         }
 
