@@ -140,6 +140,139 @@ pub fn advance(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
     self.offset_px = if (@abs(remaining) < min_offset_px) 0 else remaining;
 }
 
+/// Find the whole-row shift that best maps `cur` onto `prev`, or null.
+///
+/// `cur[i] == prev[i + shift]` means row i now holds what row i+shift held,
+/// which is content moving *up* by `shift` -- the same sense as
+/// `ScrollEvent.rows`, so a caller needs no negation.
+///
+/// This exists because some applications move the picture without ever saying
+/// they scrolled: nvim repaints rather than scrolls when moving within a
+/// wrapped line, and anything on the primary screen moves the scrollback
+/// viewport instead. Hashing rows and looking for the offset recovers the
+/// movement from what was drawn.
+pub fn detectShift(
+    cur: []const u64,
+    prev: []const u64,
+    min_rows: usize,
+    min_ratio: f32,
+) ?isize {
+    if (cur.len != prev.len or cur.len == 0) return null;
+    const n: isize = @intCast(cur.len);
+
+    var best_shift: isize = 0;
+    var best_matches: usize = 0;
+    var best_compared: usize = 0;
+    var s: isize = -max_animated_rows;
+    while (s <= max_animated_rows) : (s += 1) {
+        if (s == 0) continue;
+        var matches: usize = 0;
+        var compared: usize = 0;
+        for (0..cur.len) |i| {
+            const j = @as(isize, @intCast(i)) + s;
+            if (j < 0 or j >= n) continue;
+            compared += 1;
+            if (cur[i] == prev[@intCast(j)]) matches += 1;
+        }
+        if (matches > best_matches) {
+            best_matches = matches;
+            best_compared = compared;
+            best_shift = s;
+        }
+    }
+
+    if (best_shift == 0 or best_compared == 0) return null;
+    if (best_matches < min_rows) return null;
+    const ratio = @as(f32, @floatFromInt(best_matches)) /
+        @as(f32, @floatFromInt(best_compared));
+    if (ratio < min_ratio) return null;
+
+    // A screen that did not move matches *itself* best. Without this a static
+    // screen of blank or repeating rows finds a spurious shift and animates
+    // every frame, inventing motion that never happened.
+    var same: usize = 0;
+    for (cur, prev) |a, b| {
+        if (a == b) same += 1;
+    }
+    if (same >= best_matches) return null;
+
+    return best_shift;
+}
+
+test "detectShift: finds a clean shift and gets its sign right" {
+    // prev rows 0..19; cur is prev scrolled up by 3, so cur[i] == prev[i+3].
+    var prev: [20]u64 = undefined;
+    for (&prev, 0..) |*v, i| v.* = 1000 + i;
+    var cur: [20]u64 = undefined;
+    for (&cur, 0..) |*v, i| v.* = 1000 + i + 3;
+    try testing.expectEqual(@as(?isize, 3), detectShift(&cur, &prev, 6, 0.6));
+}
+
+test "detectShift: reports the other direction as negative" {
+    var prev: [20]u64 = undefined;
+    for (&prev, 0..) |*v, i| v.* = 1000 + i;
+    var cur: [20]u64 = undefined;
+    for (&cur, 0..) |*v, i| v.* = 1000 + i - 2;
+    try testing.expectEqual(@as(?isize, -2), detectShift(&cur, &prev, 6, 0.6));
+}
+
+test "detectShift: a still screen is not a scroll" {
+    // The failure this guards: a static screen finding a shift and animating
+    // every frame forever.
+    var rows: [20]u64 = undefined;
+    for (&rows, 0..) |*v, i| v.* = 1000 + i;
+    try testing.expectEqual(@as(?isize, null), detectShift(&rows, &rows, 6, 0.6));
+}
+
+test "detectShift: a blank screen matches every shift and must be refused" {
+    // Every row equal means every offset scores a perfect match. Believing one
+    // would slide an empty screen sideways for no reason.
+    const blank: [20]u64 = @splat(0);
+    try testing.expectEqual(@as(?isize, null), detectShift(&blank, &blank, 6, 0.6));
+}
+
+test "detectShift: repeating content does not invent a scroll" {
+    // Alternating rows match at every even offset, and match themselves just
+    // as well, so `same` has to veto it.
+    var rows: [20]u64 = undefined;
+    for (&rows, 0..) |*v, i| v.* = if (i % 2 == 0) 7 else 9;
+    try testing.expectEqual(@as(?isize, null), detectShift(&rows, &rows, 6, 0.6));
+}
+
+test "detectShift: an unrelated screen is not a scroll" {
+    // A full repaint with different content -- switching buffers, say -- has
+    // nothing in common and must not be animated.
+    var prev: [20]u64 = undefined;
+    for (&prev, 0..) |*v, i| v.* = 1000 + i;
+    var cur: [20]u64 = undefined;
+    for (&cur, 0..) |*v, i| v.* = 50_000 + i * 7;
+    try testing.expectEqual(@as(?isize, null), detectShift(&cur, &prev, 6, 0.6));
+}
+
+test "detectShift: too few matching rows is refused" {
+    // Only three rows line up: below the confidence floor, so no animation.
+    var prev: [20]u64 = undefined;
+    for (&prev, 0..) |*v, i| v.* = 1000 + i;
+    var cur: [20]u64 = undefined;
+    for (&cur, 0..) |*v, i| v.* = if (i < 3) 1000 + i + 3 else 90_000 + i;
+    try testing.expectEqual(@as(?isize, null), detectShift(&cur, &prev, 6, 0.6));
+}
+
+test "detectShift: a shift larger than we animate is not reported" {
+    var prev: [40]u64 = undefined;
+    for (&prev, 0..) |*v, i| v.* = 1000 + i;
+    var cur: [40]u64 = undefined;
+    // Past max_animated_rows: a page jump, which snaps rather than slides.
+    for (&cur, 0..) |*v, i| v.* = 1000 + i + max_animated_rows + 5;
+    try testing.expectEqual(@as(?isize, null), detectShift(&cur, &prev, 6, 0.6));
+}
+
+test "detectShift: mismatched lengths are refused rather than compared" {
+    const a: [10]u64 = @splat(1);
+    const b: [12]u64 = @splat(1);
+    try testing.expectEqual(@as(?isize, null), detectShift(&a, &b, 6, 0.6));
+}
+
 test "ScrollAnim: settles within the configured duration, not long after" {
     // The whole point of a *duration*: a one-row scroll at 60fps must be done
     // in the time asked for. Decaying a fraction of the remaining offset

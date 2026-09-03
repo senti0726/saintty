@@ -241,6 +241,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// settled once the gesture is over.
         scroll_input_ts: ?std.Io.Timestamp = null,
 
+        /// Row content hashes from the previous frame.
+        ///
+        /// Some applications move the picture without ever telling us they
+        /// scrolled. nvim with `smoothscroll` repaints every row rather than
+        /// scrolling the grid when it moves within a wrapped line -- measured
+        /// at 9008 bytes of repaint against 1873 for the same movement with
+        /// `nosmoothscroll`, which does scroll and emits `CSI M`. Anything on
+        /// the primary screen -- a plain shell, Claude Code -- moves our own
+        /// scrollback viewport instead, which never reaches `noteScroll`
+        /// either. In both cases the content demonstrably moved by whole rows
+        /// and there is no event to hook, so we recover the movement by
+        /// noticing that this frame's rows are last frame's rows, shifted.
+        scroll_row_hashes: std.ArrayList(u64) = .empty,
+
         /// When the last frame was actually drawn, so the scroll animation
         /// can pace itself against every draw rather than adding its own on
         /// top of them.
@@ -907,6 +921,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
+            self.scroll_row_hashes.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
@@ -1129,6 +1144,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Slow enough not to read as a jump, quick enough that the picture is
         /// not left leaning on a stale request.
         pub const scroll_flight_ramp_ms: f32 = 140;
+
+        /// How recently the user must have scrolled for a repaint to be read
+        /// as a scroll.
+        ///
+        /// Without this gate every screenful of program output would animate:
+        /// a build log scrolling past would slide rather than appear, which is
+        /// both wrong and unreadable. Deliberate scrolling is the only case
+        /// this is for, and the gesture timestamp is what says so.
+        pub const repaint_scroll_idle_ms: i64 = 250;
+
+        /// Rows that must agree before a shift is believed, as a count and as
+        /// a fraction of the rows compared.
+        ///
+        /// Blank and repeating rows match at many offsets at once, so a mostly
+        /// empty screen can "match" a shift of any size. Animating that
+        /// invents motion that never happened, so a shift has to be carried by
+        /// a substantial majority of the screen before it is acted on.
+        pub const repaint_scroll_min_rows: usize = 6;
+        pub const repaint_scroll_min_ratio: f32 = 0.6;
 
         /// A point in the future when the renderer needs to be driven
         /// again to keep animating, and what kind of drive it needs.
@@ -1428,6 +1462,74 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             const offset = self.scroll_pending_px + self.scroll_flight * cell_h;
             return std.math.clamp(offset, -cell_h / 2, cell_h / 2);
+        }
+
+        /// Recover a scroll that an application performed by repainting.
+        ///
+        /// `had_event` is true when a real scroll event already described this
+        /// frame. The hashes are still refreshed in that case -- the next
+        /// frame has to compare against the truth -- but the movement has been
+        /// animated already and counting it twice would double the offset.
+        ///
+        /// Hashes are only kept while a gesture is in progress, so this costs
+        /// nothing at rest.
+        fn detectRepaintScroll(self: *Self, had_event: bool) void {
+            const idle: i64 = idle: {
+                const ts = self.scroll_input_ts orelse break :idle std.math.maxInt(i64);
+                const now: std.Io.Timestamp = .now(global.io(), .awake);
+                break :idle @intCast(@divTrunc(
+                    ts.durationTo(now).nanoseconds,
+                    std.time.ns_per_ms,
+                ));
+            };
+            if (idle > repaint_scroll_idle_ms) {
+                self.scroll_row_hashes.clearRetainingCapacity();
+                return;
+            }
+
+            const cells_list = self.terminal_state.row_data.items(.cells);
+            const n = cells_list.len;
+            if (n == 0) return;
+
+            const cur = self.alloc.alloc(u64, n) catch return;
+            defer self.alloc.free(cur);
+            for (cells_list, 0..) |*cells, i| {
+                cur[i] = std.hash.Wyhash.hash(
+                    0,
+                    std.mem.sliceAsBytes(cells.items(.raw)),
+                );
+            }
+
+            const prev = self.scroll_row_hashes.items;
+            defer {
+                self.scroll_row_hashes.clearRetainingCapacity();
+                self.scroll_row_hashes.appendSlice(self.alloc, cur) catch {};
+            }
+
+            if (had_event) return;
+            if (prev.len != n) return;
+
+            const shift = ScrollAnim.detectShift(
+                cur,
+                prev,
+                repaint_scroll_min_rows,
+                repaint_scroll_min_ratio,
+            ) orelse return;
+
+            const cell_h: f32 = @floatFromInt(self.size.cell.height);
+            const was_idle = !self.scroll_anim.active();
+            self.scroll_anim.push(
+                @as(f32, @floatFromInt(shift)) * cell_h,
+                0,
+                @floatFromInt(n - 1),
+                cell_h * ScrollAnim.max_lag_rows,
+            );
+            if (was_idle) self.scroll_anim_last = null;
+
+            if (self.config.scroll_trace) log.info(
+                "repaintscroll shift={d} rows={d}",
+                .{ shift, n },
+            );
         }
 
         /// Emit one `scroll-trace` line for this frame.
@@ -2021,6 +2123,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // within it. This must be done before anything reads the
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
+
+            // Now the render state is readable, look for movement no event
+            // described. Must come after endUpdate: row_data is not valid
+            // until the update it began is completed.
+            if (self.config.scroll_animation) {
+                self.detectRepaintScroll(critical.scroll_event != null);
+            }
 
             // Outside the critical area we can update our links to contain
             // our regex results.

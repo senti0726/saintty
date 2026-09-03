@@ -1488,3 +1488,76 @@ cd ~/dev/ghostty && git fetch origin main && git rebase origin/main \
   && zig build && zig build test -Dtest-filter=scroll \
   && python3 tools/scroll-harness/input.py
 ```
+
+## 2026-09-03 — Why nvim and Claude Code never animated
+
+Both had the same cause, and it is not one `noteScroll` can ever see: **the
+content moved but no scroll operation was sent.**
+
+### Measured, not guessed
+
+nvim under a pty, same file, same movement (3x Ctrl-E), counting what nvim
+actually writes to the terminal:
+
+| nvim setting | scroll ops | bytes |
+|---|---|---|
+| `smoothscroll` | **0** | 9008 |
+| `nosmoothscroll` | 3x `CSI M` + `DECSTBM` | 1873 |
+
+With `smoothscroll` on, nvim does not scroll the grid when moving within a
+wrapped line -- it repaints every row, five times the traffic. There is no
+scroll operation to hook. With it off nvim scrolls properly and the animation
+works, but a wrapped line then moves in one jump, which is the complaint
+`smoothscroll` was turned on to fix. The two were mutually exclusive.
+
+Claude Code is the same shape for a different reason: it runs on the *primary*
+screen, so scrolling it moves our own scrollback viewport via `scrollViewport`,
+which has no hook at all. `noteScroll` is called from exactly four places --
+`scroll_up`, `scroll_down`, `insert_lines`, `delete_lines` -- all
+alternate-screen operations. The gap was already described in a comment on
+`settleScrollPixel` ("a plain shell, which scrolls its viewport without
+touching the terminal model") and treated only as a hazard, never as something
+to animate.
+
+### The fix: stop asking the application
+
+`ScrollAnim.detectShift` hashes each row and finds the whole-row offset that
+maps this frame onto the last one. If row *i* now holds what row *i+3* held,
+the screen scrolled by 3 -- however the application drew it.
+
+An earlier note in this file said comparing frames was too expensive. That was
+wrong, and the reason is worth recording: it was reasoning about comparing
+*cells*. At 60 rows, testing shifts of +/-8 is ~960 comparisons of one u64 each,
+against the ~9KB of text nvim just made us parse anyway. Hashes are kept only
+while a gesture is in flight, so it costs nothing at rest.
+
+Guards, each with a test:
+
+- **Gate on recent input** (`repaint_scroll_idle_ms`). Without it every
+  screenful of program output would slide instead of appear.
+- **`same >= best_matches` veto.** Blank and repeating rows match at every
+  offset at once, so a still screen would otherwise find a shift and animate
+  forever.
+- **Confidence floor** (rows *and* ratio) so a full repaint with unrelated
+  content is not read as a scroll.
+- **`had_event`**, so a real scroll event is not counted twice.
+
+### Verification status -- read this before trusting it
+
+`detectShift` is unit tested (9 tests, negative-control checked: the suite does
+fail when the expected value is wrong). **The integration is not verified end
+to end.** `tools/scroll-harness/input.py` cannot currently drive an
+application: the replay runs and reaches `setScrollPixel` (`pending=36.00`,
+`inflight=1` in the trace) but the terminal never scrolls (`model_rows=0`), so
+every end-to-end number it printed today was measuring startup output, not the
+gesture. Fixing that is the next job, and nothing here should be called working
+until it passes.
+
+Traps banked while chasing this:
+
+- `scrollemit` only logs on the pixel-perfect path, so `scrollemit: 0` on the
+  animation path is expected and is *not* evidence the replay failed.
+- `@n` in a replay script waits n *frames* of 8ms, not n milliseconds.
+- `input.py`'s `MULT` had no module-level default; every gesture died with a
+  bare `NameError` unless `--mult=` was passed.
+- nvim launched with `--clean` ignores wheel events unless `set mouse=a`.
