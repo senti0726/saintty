@@ -205,7 +205,17 @@ pub fn advance(
     // A stalled or hidden surface can hand us a huge dt. Finishing early is
     // the right failure: the model is already correct, so snapping to it
     // shows the truth rather than a stale intermediate position.
-    if (!(dt_ms > 0) or !(duration_ms > 0)) return;
+    if (!(dt_ms > 0)) return;
+
+    // A duration of zero means "do not animate", so land on the model at
+    // once. Returning early here instead -- which is what a guard against
+    // dividing by zero looks like if you write it without thinking about it
+    // -- leaves the displacement standing for good, holding the text off the
+    // character grid until some later scroll happens to clear it.
+    if (!(duration_ms > 0)) {
+        self.offset_px = 0;
+        return;
+    }
 
     self.elapsed_ms += dt_ms;
     if (self.elapsed_ms >= duration_ms) {
@@ -715,9 +725,13 @@ test "ScrollAnim: zero or negative dt is ignored rather than reversing" {
     try testing.expectEqual(before, a.offset_px);
 }
 
-test "ScrollAnim: a zero duration does not divide by zero" {
+test "ScrollAnim: a zero duration snaps rather than freezing" {
+    // Reachable the moment the duration is a setting someone can type into.
+    // The obvious divide-by-zero guard returns early, which pins the text a
+    // row off the grid indefinitely -- a worse failure than not animating.
     var a: ScrollAnim = .{};
     a.push(-20, 0, 10, 0, 0, 10_000);
     a.advance(16, 0, .ease_out_cubic);
-    try testing.expect(a.offset_px == -20);
+    try testing.expectEqual(@as(f32, 0), a.offset_px);
+    try testing.expect(!a.active());
 }
