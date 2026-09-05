@@ -43,5 +43,46 @@ void main() {
     vec2 image_pos = (cell_size * grid_pos) + cell_offset;
     image_pos += dest_size * corner;
 
+    // Carry the scroll animation, exactly as cell_text.v.glsl does for glyphs.
+    //
+    // WHY THIS IS NEEDED: an image is positioned by GRID CELL — the Kitty
+    // protocol anchors a placement to a row/column, and image.nvim's
+    // unicode-placeholder method makes that anchoring the terminal's job. So
+    // when a region of the screen is displaced by a fraction of a row, the
+    // figures in that region have to move with it or they stay pinned to the
+    // model position while the paragraph they belong to slides away underneath.
+    //
+    // Without this, scrolling a figure-heavy markdown buffer (a CSAPP chapter,
+    // which is what this was found on) leaves the picture standing still for
+    // the length of the animation while the text moves, then snaps. Because
+    // the image is composited by the terminal ABOVE the cell grid, the result
+    // reads as a ghost trail smeared off the figure, text landing inside it,
+    // and — where the placement is re-transmitted mid-animation — the same
+    // figure stamped twice at two different heights.
+    //
+    // The region test is deliberately the same shape as the one in
+    // cell_text.v.glsl so the two cannot disagree about what is moving:
+    // scroll_anim is (offset_px, top_row, bottom_row, unused) and
+    // scroll_anim_cols is (left_col, right_col, unused, unused). Rows outside
+    // the region must not move — tmux's status line is kept outside the
+    // scrolling margins precisely so it stays put.
+    //
+    // grid_pos is the placement's top-left cell, so an image is treated as
+    // moving or not as a whole. That is the right call for a figure inside a
+    // scrolling viewport, which is every case this fires on; an image
+    // straddling the top edge of the region is displaced with the region
+    // rather than torn in half.
+    //
+    // NOTE: this is the OpenGL path, which is the only one this machine uses.
+    // shaders.metal carries the same uniform for the cell shaders and would
+    // need the equivalent edit for the macOS renderer.
+    if (scroll_anim.x != 0.0 &&
+        grid_pos.y >= scroll_anim.y &&
+        grid_pos.y <= scroll_anim.z &&
+        grid_pos.x >= scroll_anim_cols.x &&
+        grid_pos.x <= scroll_anim_cols.y) {
+        image_pos.y += scroll_anim.x;
+    }
+
     gl_Position = projection_matrix * vec4(image_pos.xy, 1.0, 1.0);
 }
