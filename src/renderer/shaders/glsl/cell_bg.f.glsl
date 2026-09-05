@@ -21,7 +21,9 @@ vec4 cell_bg() {
     // scroll and draw as nothing.
     if (scroll_anim.x != 0.0 &&
         float(grid_pos.y) >= scroll_anim.y &&
-        float(grid_pos.y) <= scroll_anim.z) {
+        float(grid_pos.y) <= scroll_anim.z &&
+        float(grid_pos.x) >= scroll_anim_cols.x &&
+        float(grid_pos.x) <= scroll_anim_cols.y) {
         float shifted = (gl_FragCoord.y - grid_padding.x - scroll_anim.x) / cell_size.y;
         int gy = int(floor(shifted));
         // Rows displaced past the edge of the region are the gap the scroll

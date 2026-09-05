@@ -253,6 +253,8 @@ pub const Uniforms = extern struct {
     /// currently OpenGL-only. The field exists so the shared renderer code
     /// that publishes it still compiles for Metal.
     scroll_anim: [4]f32 align(16),
+    /// Mirrors the OpenGL uniform; see src/renderer/opengl/shaders.zig.
+    scroll_anim_cols: [4]f32 align(16),
 
     const PaddingExtend = packed struct(u8) {
         left: bool = false,

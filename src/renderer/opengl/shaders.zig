@@ -201,6 +201,14 @@ pub const Uniforms = extern struct {
     /// whole numbers.
     scroll_anim: [4]f32 align(16),
 
+    /// Inclusive column range the scroll animation applies to, as
+    /// {left, right, unused, unused}.
+    ///
+    /// Separate from `scroll_anim` only because that vec4 is full. A scroll
+    /// is not always full width -- a preview pane, a tmux vertical split --
+    /// and moving the columns either side of it drags stationary content.
+    scroll_anim_cols: [4]f32 align(16),
+
     comptime {
         // std140 puts this vec4 at byte 144 (bools ends at 136, vec4 aligns
         // to 16). If Zig disagrees the shader reads the wrong bytes and the
@@ -209,6 +217,13 @@ pub const Uniforms = extern struct {
             std.fmt.comptimePrint(
                 "scroll_anim at {d}, std140 expects 144",
                 .{@offsetOf(Uniforms, "scroll_anim")},
+            ),
+        );
+        // The next vec4 follows immediately at 160.
+        if (@offsetOf(Uniforms, "scroll_anim_cols") != 160) @compileError(
+            std.fmt.comptimePrint(
+                "scroll_anim_cols at {d}, std140 expects 160",
+                .{@offsetOf(Uniforms, "scroll_anim_cols")},
             ),
         );
     }

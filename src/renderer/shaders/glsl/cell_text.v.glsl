@@ -62,7 +62,9 @@ void main() {
     out_data.scroll_clip = 0.0;
     if (scroll_anim.x != 0.0 &&
         float(grid_pos.y) >= scroll_anim.y &&
-        float(grid_pos.y) <= scroll_anim.z) {
+        float(grid_pos.y) <= scroll_anim.z &&
+        float(grid_pos.x) >= scroll_anim_cols.x &&
+        float(grid_pos.x) <= scroll_anim_cols.y) {
         cell_pos.y += scroll_anim.x;
         out_data.scroll_clip = 1.0;
 

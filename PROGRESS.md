@@ -1625,3 +1625,69 @@ replay reaches `scrollCallback` and rows are emitted (`pending` cycling,
 `inflight` set before the counters were removed) yet the application never
 scrolls. Everything in this section was verified by unit tests, the full suite
 (291 scroll tests, 3837 overall), and the compiler -- not by watching a screen.
+
+## 2026-09-05 — a scroll is not always full width
+
+Reported in yazi: with a scrollable nvim buffer in the preview pane, scrolling
+it slid the file lists in the left and middle panes too, which then snapped
+back. A regression from the repaint detector.
+
+### Reproduced before changing anything
+
+The detector hashed one value per **row**, so it had no way to express a scroll
+confined to some columns. Modelling yazi offline -- three panes, only the right
+one moving, chrome on the first and last row:
+
+```
+FIRES: shift=3 span=1..56 (of 58 rows)
+```
+
+It found the preview's shift correctly and then animated those rows across the
+whole width, dragging the stationary panes and springing them back when the
+animation ended.
+
+Two things were wrong at once, and the first hid the second:
+
+1. The span came from *changed* rows, so it stretched over every row the
+   preview touched.
+2. Blank and static cells match at every offset, so the left pane's empty
+   region helped confirm a shift it had no part in.
+
+### The fix
+
+One hash per **cell** instead of per row, and `detectShift` now returns a column
+range as well as a row range. A column qualifies only if the cells that
+**changed** in it are the ones the shift explains -- so a stationary pane, whose
+cells did not change, contributes to neither the numerator nor the denominator
+and simply drops out. The longest contiguous run of qualifying columns is the
+moved region.
+
+Counting only changed cells is the part worth remembering: the previous ratio
+counted every compared row, and an unchanged row matches at *any* shift, so a
+mostly-still screen could confirm an arbitrary one.
+
+On the GPU, `scroll_anim_cols` carries the range and `cell_text.v.glsl` /
+`cell_bg.f.glsl` gate on `grid_pos.x` as well as `.y`. The std140 offset guard
+now covers both vec4s (144 and 160).
+
+This also fixes tmux vertical splits, which have exactly the same shape and
+would have been just as wrong.
+
+Cost: ~12k cell hashes per frame (FNV-1a, cheaper than Wyhash at this size) and
+~200k u64 comparisons for the shift search, and only while a gesture is in
+flight.
+
+### Verification
+
+`detectShift` has 11 tests including the yazi case (asserting the region stops
+at the pane boundary) and a full-width scroll (asserting it is *not* narrowed).
+Negative-controlled: asserting the wrong column reports `expected 0, found 40`.
+Full suite 3839 tests.
+
+GLSL is compiled at runtime, so `zig build` says nothing about it. Checked with
+`glslc` after inlining `common.glsl` by hand, against the pristine file as a
+control: `cell_bg.f.glsl` compiles clean, and `cell_text.v.glsl` fails
+*identically to the control* at line 189/190 -- an interface block that SPIR-V
+wants a location qualifier on, pre-existing and not reachable through Ghostty's
+own runtime path. Compiling a shader here without that control would have
+looked like a real failure.

@@ -24,6 +24,7 @@ layout(binding = 1, std140) uniform Globals {
     uniform uint bg_color_packed_4u8;
     uniform uint bools;
     uniform vec4 scroll_anim;
+    uniform vec4 scroll_anim_cols;
 };
 
 // Bools

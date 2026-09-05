@@ -787,6 +787,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .grid_size = undefined,
                     .grid_padding = undefined,
                     .scroll_anim = .{ 0, 0, 0, 0 },
+                    .scroll_anim_cols = .{ 0, 0, 0, 0 },
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
@@ -1247,15 +1248,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const cells_list = self.terminal_state.row_data.items(.cells);
             const n = cells_list.len;
-            if (n == 0) return;
+            const cols: usize = self.terminal_state.cols;
+            if (n == 0 or cols == 0) return;
 
-            const cur = self.alloc.alloc(u64, n) catch return;
+            // One hash per *cell*, not per row. A row hash cannot tell a
+            // full-width scroll from one confined to a pane, and animating a
+            // pane's rows across the whole width drags its neighbours along
+            // and springs them back.
+            const cur = self.alloc.alloc(u64, n * cols) catch return;
             defer self.alloc.free(cur);
             for (cells_list, 0..) |*cells, i| {
-                cur[i] = std.hash.Wyhash.hash(
-                    0,
-                    std.mem.sliceAsBytes(cells.items(.raw)),
-                );
+                const raw = cells.items(.raw);
+                const base = i * cols;
+                for (0..cols) |c| {
+                    // FNV-1a over the cell's bytes. Cheaper than Wyhash per
+                    // cell, which is called ~12k times a frame here and is
+                    // built for longer inputs.
+                    cur[base + c] = if (c < raw.len) hash: {
+                        var h: u64 = 0xcbf29ce484222325;
+                        for (std.mem.asBytes(&raw[c])) |b| {
+                            h = (h ^ b) *% 0x100000001b3;
+                        }
+                        break :hash h;
+                    } else 0;
+                }
             }
 
             const prev = self.scroll_row_hashes.items;
@@ -1265,11 +1281,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             if (had_event) return;
-            if (prev.len != n) return;
+            if (prev.len != cur.len) return;
 
             const shift = ScrollAnim.detectShift(
                 cur,
                 prev,
+                n,
+                cols,
                 repaint_scroll_min_rows,
                 repaint_scroll_min_ratio,
             ) orelse return;
@@ -1280,13 +1298,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @as(f32, @floatFromInt(shift.rows)) * cell_h,
                 @floatFromInt(shift.top),
                 @floatFromInt(shift.bottom),
+                @floatFromInt(shift.left),
+                @floatFromInt(shift.right),
                 cell_h * ScrollAnim.max_lag_rows,
             );
             if (was_idle) self.scroll_anim_last = null;
 
             if (self.config.scroll_trace) log.info(
-                "repaintscroll shift={d} span={d}..{d} of {d}",
-                .{ shift.rows, shift.top, shift.bottom, n },
+                "repaintscroll shift={d} rows={d}..{d} cols={d}..{d} of {d}x{d}",
+                .{ shift.rows, shift.top, shift.bottom, shift.left, shift.right, n, cols },
             );
         }
 
@@ -1833,6 +1853,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     offset,
                     @floatFromInt(ev.region_top),
                     @floatFromInt(bottom),
+                    // An application that says it scrolled a region means the
+                    // whole width of it; only repaint detection can see a
+                    // scroll narrower than the screen.
+                    0,
+                    @floatFromInt(self.size.grid().columns -| 1),
                     limit,
                 );
                 if (was_idle) self.scroll_anim_last = null;
@@ -2160,6 +2185,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 bot,
                 0,
             };
+            // Full width unless a repaint-detected scroll narrowed it.
+            const cols_f: f32 = @floatFromInt(self.size.grid().columns -| 1);
+            self.uniforms.scroll_anim_cols = if (self.scroll_anim.active())
+                .{ self.scroll_anim.left, self.scroll_anim.right, 0, 0 }
+            else
+                .{ 0, cols_f, 0, 0 };
 
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);

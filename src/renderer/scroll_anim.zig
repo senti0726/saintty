@@ -24,6 +24,13 @@ offset_px: f32 = 0,
 top: f32 = 0,
 bottom: f32 = 0,
 
+/// Inclusive column range the offset applies to. Not every scroll is full
+/// width: yazi previews a scrollable buffer in one pane while the file lists
+/// beside it stay put, and a tmux vertical split is the same shape. Moving
+/// those columns too slides the stationary pane and springs it back.
+left: f32 = 0,
+right: f32 = 0,
+
 /// The displacement at the most recent push, signed, and how long ago that
 /// was. The drawn offset is this curved down to zero over `duration_ms`
 /// rather than integrated frame by frame, so the shape of the motion is a
@@ -81,6 +88,8 @@ pub fn push(
     offset_px: f32,
     top: f32,
     bottom: f32,
+    left: f32,
+    right: f32,
     limit: f32,
 ) void {
     const overlaps = self.active() and self.top <= bottom and top <= self.bottom;
@@ -96,6 +105,8 @@ pub fn push(
     self.elapsed_ms = 0;
     self.top = top;
     self.bottom = bottom;
+    self.left = left;
+    self.right = right;
 }
 
 pub fn stop(self: *ScrollAnim) void {
@@ -222,79 +233,129 @@ pub const Shift = struct {
     /// Rows the content moved up by; negative means down.
     rows: isize,
 
-    /// Inclusive row range that actually moved.
-    ///
-    /// Rows an application keeps still -- nvim's status and tab lines, a
-    /// prompt box -- hold the same content from frame to frame, so they match
-    /// themselves and *not* the shifted picture. Animating the whole grid drags
-    /// them along and springs them back, so only the matched span moves.
+    /// Inclusive row range that moved.
     top: usize,
     bottom: usize,
+
+    /// Inclusive *column* range that moved.
+    ///
+    /// Not every scroll is full width. yazi previews an nvim buffer in its
+    /// right-hand pane while the file lists either side stay put, and a tmux
+    /// vertical split is the same shape. Animating the whole row width there
+    /// slides the stationary panes and springs them back, which is worse than
+    /// not animating at all.
+    left: usize,
+    right: usize,
 };
 
+/// Find the whole-row shift that best maps `cur` onto `prev`, or null.
+///
+/// `cur` and `prev` are `rows * cols` hashes in row-major order -- one per
+/// cell, so a scroll confined to some columns can be told apart from one that
+/// moves the whole screen.
+///
+/// `cur[i][c] == prev[i + shift][c]` means the cell at row i now holds what row
+/// i+shift held, which is content moving *up* by `shift` -- the same sense as
+/// `ScrollEvent.rows`, so a caller needs no negation.
+///
+/// Only cells that actually **changed** are counted, in the numerator and the
+/// denominator both. A blank or static cell matches at every offset at once,
+/// so counting those lets a mostly-still screen "confirm" any shift at all.
 pub fn detectShift(
     cur: []const u64,
     prev: []const u64,
+    rows: usize,
+    cols: usize,
     min_rows: usize,
     min_ratio: f32,
 ) ?Shift {
-    if (cur.len != prev.len or cur.len == 0) return null;
-    const n: isize = @intCast(cur.len);
+    if (rows == 0 or cols == 0) return null;
+    if (cur.len != rows * cols or prev.len != cur.len) return null;
+    const n: isize = @intCast(rows);
 
+    // The shift explaining the most changed cells.
     var best_shift: isize = 0;
-    var best_matches: usize = 0;
-    var best_compared: usize = 0;
+    var best_score: usize = 0;
     var s: isize = -max_animated_rows;
     while (s <= max_animated_rows) : (s += 1) {
         if (s == 0) continue;
-        var matches: usize = 0;
-        var compared: usize = 0;
-        for (0..cur.len) |i| {
+        var score: usize = 0;
+        for (0..rows) |i| {
             const j = @as(isize, @intCast(i)) + s;
             if (j < 0 or j >= n) continue;
-            compared += 1;
-            if (cur[i] == prev[@intCast(j)]) matches += 1;
+            const row = i * cols;
+            const src = @as(usize, @intCast(j)) * cols;
+            for (0..cols) |c| {
+                if (cur[row + c] == prev[row + c]) continue;
+                if (cur[row + c] == prev[src + c]) score += 1;
+            }
         }
-        if (matches > best_matches) {
-            best_matches = matches;
-            best_compared = compared;
+        if (score > best_score) {
+            best_score = score;
             best_shift = s;
         }
     }
+    if (best_shift == 0 or best_score == 0) return null;
 
-    if (best_shift == 0 or best_compared == 0) return null;
-    if (best_matches < min_rows) return null;
-    const ratio = @as(f32, @floatFromInt(best_matches)) /
-        @as(f32, @floatFromInt(best_compared));
-    if (ratio < min_ratio) return null;
-
-    // A screen that did not move matches *itself* best. Without this a static
-    // screen of blank or repeating rows finds a spurious shift and animates
-    // every frame, inventing motion that never happened.
-    var same: usize = 0;
-    for (cur, prev) |a, b| {
-        if (a == b) same += 1;
+    // Which columns that shift actually explains. A column of a stationary
+    // pane changes little and matches the shift not at all, so it drops out
+    // here rather than being dragged along.
+    var left: ?usize = null;
+    var right: usize = 0;
+    var run_start: ?usize = null;
+    var best_len: usize = 0;
+    for (0..cols) |c| {
+        var changed: usize = 0;
+        var moved: usize = 0;
+        for (0..rows) |i| {
+            const row = i * cols;
+            if (cur[row + c] == prev[row + c]) continue;
+            changed += 1;
+            const j = @as(isize, @intCast(i)) + best_shift;
+            if (j < 0 or j >= n) continue;
+            if (cur[row + c] == prev[@as(usize, @intCast(j)) * cols + c]) moved += 1;
+        }
+        const ok = moved >= min_rows and
+            @as(f32, @floatFromInt(moved)) >=
+                min_ratio * @as(f32, @floatFromInt(changed));
+        if (ok) {
+            if (run_start == null) run_start = c;
+            const len = c - run_start.? + 1;
+            // Keep the longest contiguous run, so a stray column elsewhere
+            // cannot stretch the region across a stationary pane.
+            if (len > best_len) {
+                best_len = len;
+                left = run_start;
+                right = c;
+            }
+        } else {
+            run_start = null;
+        }
     }
-    if (same >= best_matches) return null;
+    const l = left orelse return null;
 
-    // Trim interface rows off both edges.
-    //
-    // A row an application pins -- nvim's tab line and status line, a prompt
-    // box -- holds the same content across the frame. Scan inward from each
-    // edge while that is true and animate what is left. Rows *matching the
-    // shift* is the wrong test here: it also excludes rows newly exposed at
-    // the trailing edge, which have no previous position but must still move
-    // with the block, and leaving them behind tears that edge.
-    //
-    // Only the outermost unchanged rows are trimmed, so an unchanged row in
-    // the middle of the content -- a blank line -- is unaffected.
-    var top: usize = 0;
-    while (top < cur.len and cur[top] == prev[top]) top += 1;
-    if (top == cur.len) return null;
-    var bottom: usize = cur.len - 1;
-    while (bottom > top and cur[bottom] == prev[bottom]) bottom -= 1;
+    // The rows that moved, within those columns only. Trailing-edge rows are
+    // newly exposed and match nothing, but they still travel with the block,
+    // so this asks which rows *changed* rather than which ones matched.
+    var top: ?usize = null;
+    var bottom: usize = 0;
+    for (0..rows) |i| {
+        const row = i * cols;
+        var any = false;
+        for (l..right + 1) |c| {
+            if (cur[row + c] != prev[row + c]) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) continue;
+        if (top == null) top = i;
+        bottom = i;
+    }
+    const t = top orelse return null;
+    if (bottom - t + 1 < min_rows) return null;
 
-    return .{ .rows = best_shift, .top = top, .bottom = bottom };
+    return .{ .rows = best_shift, .top = t, .bottom = bottom, .left = l, .right = right };
 }
 
 test "Easing: every curve starts at 0 and ends at 1" {
@@ -344,7 +405,7 @@ test "detectShift: finds a clean shift and gets its sign right" {
     for (&prev, 0..) |*v, i| v.* = 1000 + i;
     var cur: [20]u64 = undefined;
     for (&cur, 0..) |*v, i| v.* = 1000 + i + 3;
-    try testing.expectEqual(@as(isize, 3), detectShift(&cur, &prev, 6, 0.6).?.rows);
+    try testing.expectEqual(@as(isize, 3), detectShift(&cur, &prev, cur.len, 1, 6, 0.6).?.rows);
 }
 
 test "detectShift: reports the other direction as negative" {
@@ -352,7 +413,7 @@ test "detectShift: reports the other direction as negative" {
     for (&prev, 0..) |*v, i| v.* = 1000 + i;
     var cur: [20]u64 = undefined;
     for (&cur, 0..) |*v, i| v.* = 1000 + i - 2;
-    try testing.expectEqual(@as(isize, -2), detectShift(&cur, &prev, 6, 0.6).?.rows);
+    try testing.expectEqual(@as(isize, -2), detectShift(&cur, &prev, cur.len, 1, 6, 0.6).?.rows);
 }
 
 test "detectShift: interface rows held at top and bottom are excluded" {
@@ -373,10 +434,64 @@ test "detectShift: interface rows held at top and bottom are excluded" {
         cur[i] = 500 + i;
     }
 
-    const got = detectShift(&cur, &prev, 6, 0.6).?;
+    const got = detectShift(&cur, &prev, cur.len, 1, 6, 0.6).?;
     try testing.expectEqual(@as(isize, 3), got.rows);
     try testing.expectEqual(@as(usize, 1), got.top);
     try testing.expectEqual(@as(usize, 17), got.bottom);
+}
+
+test "detectShift: a pane scrolling does not drag the panes beside it" {
+    // Reported by eye in yazi: the right pane previews a scrollable nvim
+    // buffer, and scrolling it slid the file lists in the left and middle
+    // panes too, which then snapped back. The row-only detector found the
+    // shift and animated those rows across the *full width*.
+    //
+    // Columns 0..39 are the two file lists, 40..79 the preview. Rows 0 and 23
+    // are chrome. Only the preview scrolls.
+    const rows = 24;
+    const cols = 80;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows) |i| {
+        for (0..cols) |c| {
+            const k = i * cols + c;
+            if (i == 0 or i == rows - 1) { // chrome: identical both frames
+                prev[k] = 7_000_000 + k;
+                cur[k] = 7_000_000 + k;
+            } else if (c < 40) { // file lists: unchanged, and unique per row
+                prev[k] = 1_000_000 + k;
+                cur[k] = 1_000_000 + k;
+            } else { // preview: scrolled up by 3
+                prev[k] = 2_000_000 + (i * cols) + c;
+                cur[k] = 2_000_000 + ((i + 3) * cols) + c;
+            }
+        }
+    }
+
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, 3), got.rows);
+    // The preview only. Anything reaching column 39 would move a file list.
+    try testing.expectEqual(@as(usize, 40), got.left);
+    try testing.expectEqual(@as(usize, cols - 1), got.right);
+}
+
+test "detectShift: a full-width scroll still reports the whole width" {
+    // The other half of the pane case: an ordinary scroll must not be narrowed.
+    const rows = 24;
+    const cols = 80;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows) |i| {
+        for (0..cols) |c| {
+            const k = i * cols + c;
+            prev[k] = 3_000_000 + (i * cols) + c;
+            cur[k] = 3_000_000 + ((i + 2) * cols) + c;
+        }
+    }
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, 2), got.rows);
+    try testing.expectEqual(@as(usize, 0), got.left);
+    try testing.expectEqual(@as(usize, cols - 1), got.right);
 }
 
 test "detectShift: a still screen is not a scroll" {
@@ -384,14 +499,14 @@ test "detectShift: a still screen is not a scroll" {
     // every frame forever.
     var rows: [20]u64 = undefined;
     for (&rows, 0..) |*v, i| v.* = 1000 + i;
-    try testing.expect(detectShift(&rows, &rows, 6, 0.6) == null);
+    try testing.expect(detectShift(&rows, &rows, rows.len, 1, 6, 0.6) == null);
 }
 
 test "detectShift: a blank screen matches every shift and must be refused" {
     // Every row equal means every offset scores a perfect match. Believing one
     // would slide an empty screen sideways for no reason.
     const blank: [20]u64 = @splat(0);
-    try testing.expect(detectShift(&blank, &blank, 6, 0.6) == null);
+    try testing.expect(detectShift(&blank, &blank, blank.len, 1, 6, 0.6) == null);
 }
 
 test "detectShift: repeating content does not invent a scroll" {
@@ -399,7 +514,7 @@ test "detectShift: repeating content does not invent a scroll" {
     // as well, so `same` has to veto it.
     var rows: [20]u64 = undefined;
     for (&rows, 0..) |*v, i| v.* = if (i % 2 == 0) 7 else 9;
-    try testing.expect(detectShift(&rows, &rows, 6, 0.6) == null);
+    try testing.expect(detectShift(&rows, &rows, rows.len, 1, 6, 0.6) == null);
 }
 
 test "detectShift: an unrelated screen is not a scroll" {
@@ -409,7 +524,7 @@ test "detectShift: an unrelated screen is not a scroll" {
     for (&prev, 0..) |*v, i| v.* = 1000 + i;
     var cur: [20]u64 = undefined;
     for (&cur, 0..) |*v, i| v.* = 50_000 + i * 7;
-    try testing.expect(detectShift(&cur, &prev, 6, 0.6) == null);
+    try testing.expect(detectShift(&cur, &prev, cur.len, 1, 6, 0.6) == null);
 }
 
 test "detectShift: too few matching rows is refused" {
@@ -418,7 +533,7 @@ test "detectShift: too few matching rows is refused" {
     for (&prev, 0..) |*v, i| v.* = 1000 + i;
     var cur: [20]u64 = undefined;
     for (&cur, 0..) |*v, i| v.* = if (i < 3) 1000 + i + 3 else 90_000 + i;
-    try testing.expect(detectShift(&cur, &prev, 6, 0.6) == null);
+    try testing.expect(detectShift(&cur, &prev, cur.len, 1, 6, 0.6) == null);
 }
 
 test "detectShift: a shift larger than we animate is not reported" {
@@ -427,13 +542,13 @@ test "detectShift: a shift larger than we animate is not reported" {
     var cur: [40]u64 = undefined;
     // Past max_animated_rows: a page jump, which snaps rather than slides.
     for (&cur, 0..) |*v, i| v.* = 1000 + i + max_animated_rows + 5;
-    try testing.expect(detectShift(&cur, &prev, 6, 0.6) == null);
+    try testing.expect(detectShift(&cur, &prev, cur.len, 1, 6, 0.6) == null);
 }
 
 test "detectShift: mismatched lengths are refused rather than compared" {
     const a: [10]u64 = @splat(1);
     const b: [12]u64 = @splat(1);
-    try testing.expect(detectShift(&a, &b, 6, 0.6) == null);
+    try testing.expect(detectShift(&a, &b, a.len, 1, 6, 0.6) == null);
 }
 
 test "ScrollAnim: settles within the configured duration, not long after" {
@@ -442,7 +557,7 @@ test "ScrollAnim: settles within the configured duration, not long after" {
     // instead stretches an 80ms setting into hundreds of milliseconds of
     // sub-pixel creep, which reads as smear rather than motion.
     var a: ScrollAnim = .{};
-    a.push(-38, 1, 52, 10_000);
+    a.push(-38, 1, 52, 0, 0, 10_000);
     var elapsed: f32 = 0;
     while (a.active() and elapsed < 1000) : (elapsed += 16) a.advance(16, 80, .ease_out_cubic);
     try testing.expect(!a.active());
@@ -453,7 +568,7 @@ test "ScrollAnim: eases out, so early frames move further than late ones" {
     // The property a person notices: leave the old position quickly, arrive at
     // the new one gently. A linear ramp arrives at full speed and stops dead.
     var a: ScrollAnim = .{};
-    a.push(-100, 0, 10, 10_000);
+    a.push(-100, 0, 10, 0, 0, 10_000);
     const start = a.offset_px;
     a.advance(10, 100, .ease_out_cubic);
     const first = @abs(a.offset_px - start);
@@ -468,8 +583,8 @@ test "ScrollAnim: position comes from elapsed time, not accumulated frames" {
     // frame does not leave the animation behind.
     var a: ScrollAnim = .{};
     var b: ScrollAnim = .{};
-    a.push(-100, 0, 10, 10_000);
-    b.push(-100, 0, 10, 10_000);
+    a.push(-100, 0, 10, 0, 0, 10_000);
+    b.push(-100, 0, 10, 0, 0, 10_000);
     a.advance(30, 100, .ease_out_cubic);
     b.advance(10, 100, .ease_out_cubic);
     b.advance(10, 100, .ease_out_cubic);
@@ -486,13 +601,13 @@ test "ScrollAnim: starts inactive" {
 
 test "ScrollAnim: start below the visible threshold is a no-op" {
     var a: ScrollAnim = .{};
-    a.push(0.1, 0, 10, 10_000);
+    a.push(0.1, 0, 10, 0, 0, 10_000);
     try testing.expect(!a.active());
 }
 
 test "ScrollAnim: advancing a full duration finishes it" {
     var a: ScrollAnim = .{};
-    a.push(-20, 0, 10, 10_000);
+    a.push(-20, 0, 10, 0, 0, 10_000);
     try testing.expect(a.active());
     a.advance(80, 80, .ease_out_cubic);
     try testing.expect(!a.active());
@@ -501,7 +616,7 @@ test "ScrollAnim: advancing a full duration finishes it" {
 
 test "ScrollAnim: a longer-than-duration frame does not overshoot past zero" {
     var a: ScrollAnim = .{};
-    a.push(-20, 0, 10, 10_000);
+    a.push(-20, 0, 10, 0, 0, 10_000);
     // A stalled surface: the offset must land exactly on zero, never cross it
     // and animate back from the other side.
     a.advance(5000, 80, .ease_out_cubic);
@@ -510,7 +625,7 @@ test "ScrollAnim: a longer-than-duration frame does not overshoot past zero" {
 
 test "ScrollAnim: decays monotonically toward zero without changing sign" {
     var a: ScrollAnim = .{};
-    a.push(-20, 0, 10, 10_000);
+    a.push(-20, 0, 10, 0, 0, 10_000);
     var prev = a.offset_px;
     var i: usize = 0;
     while (i < 200 and a.active()) : (i += 1) {
@@ -525,8 +640,8 @@ test "ScrollAnim: decays monotonically toward zero without changing sign" {
 test "ScrollAnim: positive and negative decay symmetrically" {
     var up: ScrollAnim = .{};
     var down: ScrollAnim = .{};
-    up.push(30, 0, 10, 10_000);
-    down.push(-30, 0, 10, 10_000);
+    up.push(30, 0, 10, 0, 0, 10_000);
+    down.push(-30, 0, 10, 0, 0, 10_000);
     for (0..3) |_| {
         up.advance(16, 80, .ease_out_cubic);
         down.advance(16, 80, .ease_out_cubic);
@@ -536,9 +651,9 @@ test "ScrollAnim: positive and negative decay symmetrically" {
 
 test "ScrollAnim: a scroll over a disjoint region replaces" {
     var a: ScrollAnim = .{};
-    a.push(-20, 0, 10, 10_000);
+    a.push(-20, 0, 10, 0, 0, 10_000);
     a.advance(16, 80, .ease_out_cubic);
-    a.push(40, 20, 30, 10_000);
+    a.push(40, 20, 30, 0, 0, 10_000);
     try testing.expectEqual(@as(f32, 40), a.offset_px);
     try testing.expectEqual(@as(f32, 20), a.top);
     try testing.expectEqual(@as(f32, 30), a.bottom);
@@ -549,25 +664,25 @@ test "ScrollAnim: a one-row region jitter keeps the pending displacement" {
     // as a different region discarded the offset mid-slide, and the content
     // snapped to the model instead of arriving there.
     var a: ScrollAnim = .{};
-    a.push(-20, 1, 52, 10_000);
-    a.push(-20, 2, 52, 10_000);
+    a.push(-20, 1, 52, 0, 0, 10_000);
+    a.push(-20, 2, 52, 0, 0, 10_000);
     try testing.expectEqual(@as(f32, -40), a.offset_px);
     try testing.expectEqual(@as(f32, 2), a.top);
 }
 
 test "ScrollAnim: successive scrolls over the same region accumulate" {
     var a: ScrollAnim = .{};
-    a.push(-20, 0, 10, 10_000);
+    a.push(-20, 0, 10, 0, 0, 10_000);
     // Still behind by 20px when the model scrolls another 20: the display is
     // now behind by 40, not by 20.
-    a.push(-20, 0, 10, 10_000);
+    a.push(-20, 0, 10, 0, 0, 10_000);
     try testing.expectEqual(@as(f32, -40), a.offset_px);
 }
 
 test "ScrollAnim: opposing scrolls net out rather than compounding" {
     var a: ScrollAnim = .{};
-    a.push(-20, 0, 10, 10_000);
-    a.push(20, 0, 10, 10_000);
+    a.push(-20, 0, 10, 0, 0, 10_000);
+    a.push(20, 0, 10, 0, 0, 10_000);
     try testing.expect(!a.active());
 }
 
@@ -579,7 +694,7 @@ test "ScrollAnim: a fling cannot wind the offset past a couple of rows" {
     var a: ScrollAnim = .{};
     const limit = cell_h * max_lag_rows;
     for (0..200) |_| {
-        a.push(-cell_h, 1, 52, limit);
+        a.push(-cell_h, 1, 52, 0, 0, limit);
         a.advance(16, 80, .ease_out_cubic);
     }
     try testing.expect(@abs(a.offset_px) <= limit);
@@ -587,13 +702,13 @@ test "ScrollAnim: a fling cannot wind the offset past a couple of rows" {
 
 test "ScrollAnim: accumulation is capped by the limit" {
     var a: ScrollAnim = .{};
-    for (0..100) |_| a.push(-20, 0, 10, 50);
+    for (0..100) |_| a.push(-20, 0, 10, 0, 0, 50);
     try testing.expectEqual(@as(f32, -50), a.offset_px);
 }
 
 test "ScrollAnim: zero or negative dt is ignored rather than reversing" {
     var a: ScrollAnim = .{};
-    a.push(-20, 0, 10, 10_000);
+    a.push(-20, 0, 10, 0, 0, 10_000);
     const before = a.offset_px;
     a.advance(0, 80, .ease_out_cubic);
     a.advance(-5, 80, .ease_out_cubic);
@@ -602,7 +717,7 @@ test "ScrollAnim: zero or negative dt is ignored rather than reversing" {
 
 test "ScrollAnim: a zero duration does not divide by zero" {
     var a: ScrollAnim = .{};
-    a.push(-20, 0, 10, 10_000);
+    a.push(-20, 0, 10, 0, 0, 10_000);
     a.advance(16, 0, .ease_out_cubic);
     try testing.expect(a.offset_px == -20);
 }
