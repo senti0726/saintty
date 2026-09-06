@@ -310,10 +310,34 @@ pub fn detectShift(
     // Which columns that shift actually explains. A column of a stationary
     // pane changes little and matches the shift not at all, so it drops out
     // here rather than being dragged along.
+    //
+    // The classification is THREE-WAY, and that is the whole subtlety. A
+    // column can confirm the shift, it can positively disagree with it, or it
+    // can carry too little evidence to say anything — and the third case is
+    // not the second.
+    //
+    // Treating "cannot confirm" as "disagrees" is what caused the tearing.
+    // Prose is full of columns that barely change between two frames: the
+    // gutter between a paragraph's ragged right edge and the next block, a run
+    // of aligned spaces, the blank rows around a heading. Such a column has
+    // only a handful of changed cells, fails `moved >= min_rows` for lack of
+    // evidence rather than for disagreeing, and used to END the run. The
+    // region then covered one side of the screen only, the other side did not
+    // move, and the boundary between them read as a vertical tear — which is
+    // exactly what it was, drawn by us rather than by the display.
+    //
+    // So a column only breaks the run when it has enough changed cells to
+    // *judge* and still does not match: that is a genuinely independent
+    // region, a tmux split or yazi's file list beside a scrolling preview.
+    // A sparse column bridges instead, and because the run's bounds are only
+    // ever set by CONFIRMING columns, bridging cannot stretch the region into
+    // a stationary pane — an unchanged pane sits outside the outermost
+    // confirming column, not between two of them.
     var left: ?usize = null;
     var right: usize = 0;
     var run_start: ?usize = null;
-    var best_len: usize = 0;
+    var confirms: usize = 0;
+    var best_confirms: usize = 0;
     for (0..cols) |c| {
         var changed: usize = 0;
         var moved: usize = 0;
@@ -325,21 +349,23 @@ pub fn detectShift(
             if (j < 0 or j >= n) continue;
             if (cur[row + c] == prev[@as(usize, @intCast(j)) * cols + c]) moved += 1;
         }
-        const ok = moved >= min_rows and
+        const confirmed = moved >= min_rows and
             @as(f32, @floatFromInt(moved)) >=
                 min_ratio * @as(f32, @floatFromInt(changed));
-        if (ok) {
+        if (confirmed) {
             if (run_start == null) run_start = c;
-            const len = c - run_start.? + 1;
-            // Keep the longest contiguous run, so a stray column elsewhere
-            // cannot stretch the region across a stationary pane.
-            if (len > best_len) {
-                best_len = len;
+            confirms += 1;
+            // Score a run by how many columns actually confirm it, so a long
+            // bridge of sparse columns cannot outrank a shorter run that is
+            // solidly attested.
+            if (confirms > best_confirms) {
+                best_confirms = confirms;
                 left = run_start;
                 right = c;
             }
-        } else {
+        } else if (changed >= min_rows) {
             run_start = null;
+            confirms = 0;
         }
     }
     const l = left orelse return null;
@@ -496,6 +522,37 @@ test "detectShift: a full-width scroll still reports the whole width" {
             const k = i * cols + c;
             prev[k] = 3_000_000 + (i * cols) + c;
             cur[k] = 3_000_000 + ((i + 2) * cols) + c;
+        }
+    }
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, 2), got.rows);
+    try testing.expectEqual(@as(usize, 0), got.left);
+    try testing.expectEqual(@as(usize, cols - 1), got.right);
+}
+
+test "detectShift: a sparse column does not split the region in two" {
+    // The screen tearing this guards, seen scrolling a CSAPP chapter in nvim.
+    //
+    // Columns 38..41 are a gutter that only changes on every eighth row --
+    // three changed cells over the whole height, which is under `min_rows` and
+    // so cannot confirm the shift. When "cannot confirm" ended the run, the
+    // region stopped at column 37: the left of the screen animated, the right
+    // stood still, and the seam between them looked like display tearing.
+    // Nothing about this frame is a split; it is one scroll all the way across.
+    const rows = 24;
+    const cols = 80;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows) |i| {
+        for (0..cols) |c| {
+            const k = i * cols + c;
+            if (c >= 38 and c <= 41 and i % 8 != 0) {
+                prev[k] = 5_000_000 + c;
+                cur[k] = 5_000_000 + c;
+            } else {
+                prev[k] = 4_000_000 + (i * cols) + c;
+                cur[k] = 4_000_000 + ((i + 2) * cols) + c;
+            }
         }
     }
     const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
