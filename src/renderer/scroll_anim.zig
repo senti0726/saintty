@@ -38,6 +38,10 @@ right: f32 = 0,
 start_px: f32 = 0,
 elapsed_ms: f32 = 0,
 
+/// A shorter ease for this burst, when rows are arriving faster than the
+/// configured duration can retire them; 0 when there is none. See `push`.
+pace_ms: f32 = 0,
+
 /// Below this many pixels there is nothing left to see. Holding a sub-pixel
 /// offset would keep requesting frames forever for no visible benefit.
 pub const min_offset_px: f32 = 0.5;
@@ -60,6 +64,9 @@ pub const max_animated_rows: isize = 8;
 /// rest of the region empty. Being briefly a row or two behind reads as
 /// motion; being half a screen behind reads as lag, because it *is* lag.
 pub const max_lag_rows: f32 = 2;
+
+/// How many input intervals a burst of pushes is given to settle. See `push`.
+pub const pace_intervals: f32 = 4;
 
 pub fn active(self: ScrollAnim) bool {
     return self.offset_px != 0;
@@ -130,6 +137,23 @@ pub fn push(
     // Restart the curve from wherever we now are. A scroll arriving mid-flight
     // should accelerate away from the current position, not resume a curve
     // aimed at a total that is no longer true.
+    // Keep pace with input. Every push restarts the ease from zero, so a
+    // held key -- a row every ~33ms of repeat -- keeps restarting a 300ms ramp
+    // that has barely begun, the standing offset pins itself at `limit`, and
+    // every row beyond it is clipped: drawn as a snap. A longer duration
+    // clips more. So while pushes land on a live animation, the time since
+    // the last one is the input's interval, and this burst eases over at
+    // most `pace_intervals` of them: at 30Hz that is ~130ms, which in steady
+    // state stands at ~36px of a 42px cap. A push slower than
+    // `duration / pace_intervals` is left at the configured duration, and a
+    // push onto an idle animation clears the pace, so an isolated scroll
+    // always takes exactly what was configured.
+    if (!overlaps) {
+        self.pace_ms = 0;
+    } else if (self.elapsed_ms > 0) {
+        self.pace_ms = self.elapsed_ms * pace_intervals;
+    }
+
     self.start_px = self.offset_px;
     self.elapsed_ms = 0;
     if (overlaps) {
@@ -237,10 +261,11 @@ fn easeOut(t: f32, easing: Easing) f32 {
 pub fn advance(
     self: *ScrollAnim,
     dt_ms: f32,
-    duration_ms: f32,
+    duration_cfg_ms: f32,
     easing: Easing,
 ) void {
     if (!self.active()) return;
+    const duration_ms = if (self.pace_ms > 0) @min(duration_cfg_ms, self.pace_ms) else duration_cfg_ms;
 
     // A stalled or hidden surface can hand us a huge dt. Finishing early is
     // the right failure: the model is already correct, so snapping to it
@@ -321,8 +346,8 @@ pub const Shift = struct {
 };
 
 /// How many neutral columns a thinly-attested column may sit from the
-/// cluster it widens. A word gap is one; see `detectShift`.
-const weak_bridge_cols: usize = 2;
+/// cluster it widens: none, it has to touch it. See `detectShift`.
+const weak_bridge_cols: usize = 0;
 
 /// Whether a cell can be evidence about a scroll: its text changed, to some
 /// text. See `detectShift`.
@@ -430,15 +455,17 @@ pub fn detectShift(
     // edge can widen a region but never invent one.
     //
     // And a thin edge can only widen a region it TOUCHES. Weak columns gather
-    // into clusters with the columns beside them, across at most
-    // `weak_bridge_cols` of neutral gap, and only a cluster holding at least
-    // one strong column may set a bound. Measured on real prose, a weak
-    // column is never more than one neutral column from the text it continues
-    // -- a word gap. The weak columns that sat further out were all
-    // coincidences, 22 to 34 columns away across a pane border: one hex digit
-    // of a BuildID in yazi's preview agreeing with the digit below it, and
-    // the preview's left half then sliding with the file list beside it.
-    // Strong columns still bridge any gap, so a gutter between two blocks of
+    // into clusters with the columns directly beside them
+    // (`weak_bridge_cols`), and only a cluster holding at least one strong
+    // column may set a bound. The weak columns that sat further out were
+    // coincidences -- one hex digit of a BuildID in yazi's preview, 26
+    // columns away across a pane border, slid the preview's left half with
+    // the file list -- or the selection's own glyphs: yazi's rounded cap and
+    // open-folder icon follow the cursor one blank column from the relative
+    // numbers, and slid the left end of the selection bar with them. On the
+    // captured prose, nvim and yazi scrolls, allowing no gap at all changed
+    // no region: the gaps inside real text are between STRONG columns, and
+    // strong columns still bridge any gap, so a gutter between two blocks of
     // scrolling text does not split them.
     const Verdict = enum { strong, weak, contradict, neutral };
     var left: ?usize = null;
@@ -517,25 +544,54 @@ pub fn detectShift(
     }
     const l = left orelse return null;
 
-    // The rows that moved, within those columns only. Trailing-edge rows are
-    // newly exposed and match nothing, but they still travel with the block,
-    // so this asks which rows *changed* rather than which ones matched.
+    // The rows that MOVED, within those columns only -- not every row that
+    // changed there. yazi's status bar changes on every key (it names the
+    // hovered file), and taking every changed row stretched the region down
+    // to it, swallowing the pane's bottom border on the way: the border's
+    // `─` slid with the relative numbers above it.
+    //
+    // The rows entering on the side the content arrives from are the one
+    // exception. They are newly exposed and match nothing, but they travel
+    // with the block, and leaving them out would snap the newest line into
+    // place while everything above it slides. So the moved span is extended
+    // by up to `|shift|` rows on that side, as long as those rows changed.
+    const moved_row = struct {
+        fn f(cu: []const u64, pr: []const u64, i: usize, s_: isize, n_: isize, cols_: usize, l_: usize, r_: usize) bool {
+            const j = @as(isize, @intCast(i)) + s_;
+            if (j < 0 or j >= n_) return false;
+            const row = i * cols_;
+            const src = @as(usize, @intCast(j)) * cols_;
+            for (l_..r_ + 1) |c| {
+                if (testifies(cu[row + c], pr[row + c]) and cu[row + c] == pr[src + c]) return true;
+            }
+            return false;
+        }
+    }.f;
+    const changed_row = struct {
+        fn f(cu: []const u64, pr: []const u64, i: usize, cols_: usize, l_: usize, r_: usize) bool {
+            const row = i * cols_;
+            for (l_..r_ + 1) |c| if (cu[row + c] != pr[row + c]) return true;
+            return false;
+        }
+    }.f;
     var top: ?usize = null;
     var bottom: usize = 0;
     for (0..rows) |i| {
-        const row = i * cols;
-        var any = false;
-        for (l..right + 1) |c| {
-            if (cur[row + c] != prev[row + c]) {
-                any = true;
-                break;
-            }
-        }
-        if (!any) continue;
+        if (!moved_row(cur, prev, i, best_shift, n, cols, l, right)) continue;
         if (top == null) top = i;
         bottom = i;
     }
-    const t = top orelse return null;
+    var t = top orelse return null;
+    var k: usize = 0;
+    while (k < @abs(best_shift)) : (k += 1) {
+        if (best_shift > 0) {
+            if (bottom + 1 >= rows or !changed_row(cur, prev, bottom + 1, cols, l, right)) break;
+            bottom += 1;
+        } else {
+            if (t == 0 or !changed_row(cur, prev, t - 1, cols, l, right)) break;
+            t -= 1;
+        }
+    }
     if (bottom - t + 1 < min_rows) return null;
 
     return .{ .rows = best_shift, .top = t, .bottom = bottom, .left = l, .right = right };
@@ -884,6 +940,68 @@ test "detectShift: a selection bar moving is not the list scrolling" {
     try testing.expectEqual(@as(usize, 1), got.right);
 }
 
+test "detectShift: a status line below the region does not stretch it" {
+    // yazi's relative-number gutter sliding a row, with the pane's bottom
+    // border and then the status bar beneath it. The status bar shows the
+    // hovered file's name, so it changes on every key -- and the row range
+    // used to be every row that CHANGED within the region's columns, which
+    // reached down to the status bar and swallowed the border in between.
+    // The border's `─` then slid with the numbers: the stray line the report
+    // describes above and below the gutter.
+    //
+    // The rows are the ones that MOVED, plus the rows entering on the side
+    // the content arrives from, which are new and cannot match anything.
+    const rows = 24;
+    const cols = 20;
+    var prev: [rows * cols]u64 = @splat(cellKey(blank_glyph, 0));
+    var cur: [rows * cols]u64 = @splat(cellKey(blank_glyph, 0));
+    for (0..cols) |c| {
+        prev[0 * cols + c] = cellKey('-', 1); // top border
+        cur[0 * cols + c] = cellKey('-', 1);
+        prev[21 * cols + c] = cellKey('-', 1); // bottom border
+        cur[21 * cols + c] = cellKey('-', 1);
+        prev[23 * cols + c] = cellKey(@intCast(700 + c), 2); // status: old name
+        cur[23 * cols + c] = cellKey(@intCast(900 + c), 2); // status: new name
+    }
+    for (1..21) |i| {
+        // Distinct per row, moving down one: the gutter.
+        prev[i * cols + 0] = cellKey(@intCast(100 + i), 0);
+        cur[i * cols + 0] = cellKey(@intCast(100 + i - 1), 0);
+    }
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, -1), got.rows);
+    try testing.expectEqual(@as(usize, 1), got.top);
+    try testing.expectEqual(@as(usize, 20), got.bottom);
+}
+
+test "detectShift: the selection's own glyphs beside a gutter do not slide with it" {
+    // yazi draws the selected row with a rounded cap and an open-folder
+    // icon, both of which move with the cursor -- genuinely one row, the same
+    // shift as the relative numbers beside them, but a column of blank away.
+    // Allowed to bridge that blank, they slid the left end of the selection
+    // bar with the numbers ("9  " moving as one). A thinly-attested column
+    // must touch the evidence it widens; strong columns still bridge gaps.
+    const rows = 24;
+    const cols = 12;
+    var prev: [rows * cols]u64 = @splat(cellKey(blank_glyph, 0));
+    var cur: [rows * cols]u64 = @splat(cellKey(blank_glyph, 0));
+    for (0..rows) |i| {
+        prev[i * cols + 0] = cellKey(@intCast(100 + i), 0); // gutter digit
+        cur[i * cols + 0] = cellKey(@intCast(100 + i - 1 + 0), 0);
+        prev[i * cols + 3] = cellKey('d', 0); // closed-folder icon on every row
+        cur[i * cols + 3] = cellKey('d', 0);
+    }
+    // Selection moves from row 9 to row 10: cap in column 2, open icon in 3.
+    prev[9 * cols + 2] = cellKey('(', 5);
+    cur[10 * cols + 2] = cellKey('(', 5);
+    prev[9 * cols + 3] = cellKey('D', 5);
+    cur[10 * cols + 3] = cellKey('D', 5);
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, -1), got.rows);
+    try testing.expectEqual(@as(usize, 0), got.left);
+    try testing.expectEqual(@as(usize, 0), got.right);
+}
+
 test "detectShift: a still screen is not a scroll" {
     // The failure this guards: a static screen finding a shift and animating
     // every frame forever.
@@ -1115,6 +1233,46 @@ test "ScrollAnim: the union is discarded once the offset reaches zero" {
     try testing.expect(!a.active());
     a.push(20, 0, 52, 0, 209, 10_000);
     try testing.expectEqual(@as(f32, 52), a.bottom);
+}
+
+test "ScrollAnim: a held key keeps up instead of snapping against the cap" {
+    // Holding `j` at the bottom of an nvim window: one row every ~33ms of key
+    // repeat, with the configured 300ms ease restarting from zero on every
+    // row. Measured live, the standing offset pinned itself at the
+    // `max_lag_rows` cap and each new row was CLIPPED -- the part over the cap
+    // drawn as a snap -- so held scrolling alternated sliding and jumping. A
+    // longer duration retires rows more slowly and so clips more, which is
+    // why 1000ms "felt the same" as 300: most of every row was a jump.
+    //
+    // No row may be clipped once the animation is keeping pace with input.
+    const cell_h: f32 = 21;
+    const limit = cell_h * max_lag_rows;
+    var a: ScrollAnim = .{};
+    var clipped: f32 = 0;
+    var t: usize = 0;
+    while (t < 60) : (t += 1) {
+        // 60Hz frames, a row every other frame: ~30Hz key repeat.
+        if (t % 2 == 0) {
+            const before = a.offset_px;
+            a.push(cell_h, 0, 52, 0, 209, limit);
+            if (t >= 8) clipped += (before + cell_h) - a.offset_px;
+        }
+        a.advance(16.7, 300, .ease_out_cubic);
+    }
+    try testing.expectApproxEqAbs(@as(f32, 0), clipped, 0.01);
+}
+
+test "ScrollAnim: a scroll after a pause still takes the configured duration" {
+    // Pacing to input must not leak into an isolated scroll: two rows 250ms
+    // apart are two separate gestures as far as the eye is concerned.
+    var a: ScrollAnim = .{};
+    a.push(21, 0, 52, 0, 209, 42);
+    a.advance(250, 300, .ease_out_cubic);
+    a.push(21, 0, 52, 0, 209, 42);
+    a.advance(200, 300, .ease_out_cubic);
+    try testing.expect(a.active());
+    a.advance(120, 300, .ease_out_cubic);
+    try testing.expect(!a.active());
 }
 
 test "ScrollAnim: successive scrolls over the same region accumulate" {
