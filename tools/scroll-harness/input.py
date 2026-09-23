@@ -35,7 +35,12 @@ EMIT = re.compile(
 )
 TRACE = re.compile(
     r"scrolltrace t_us=(-?\d+) model_rows=(-?\d+) off_px=(-?[\d.]+) "
-    r"inflight=(-?\d+) pending=(-?[\d.]+) top=(-?[\d.]+) bot=(-?[\d.]+) cell_h=(\d+)"
+    # `inflight`/`pending` were dropped from the trace when the pixel-perfect
+    # path went (ed2ac7fdc). Kept as optional groups so the numbering below --
+    # group 7 is `bot`, group 8 is `cell_h` -- survives, and an older log
+    # still parses.
+    r"(?:inflight=(-?\d+) pending=(-?[\d.]+) )?"
+    r"top=(-?[\d.]+) bot=(-?[\d.]+) cell_h=(\d+)"
 )
 EVENT = re.compile(r"scroll event: .*region=(-?\d+)\.\.(-?\d+) rows_total=(\d+)")
 

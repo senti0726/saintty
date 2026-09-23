@@ -24,7 +24,10 @@ EMIT = Path(__file__).resolve().parent / "emit.py"
 
 TRACE = re.compile(
     r"scrolltrace t_us=(-?\d+) model_rows=(-?\d+) off_px=(-?[\d.]+) "
-    r"inflight=-?\d+ pending=-?[\d.]+ "
+    # `inflight`/`pending` were dropped from the trace when the pixel-perfect
+    # path went (ed2ac7fdc). Optional rather than deleted, so this reads an
+    # older log too -- and non-capturing, so the group numbers below hold.
+    r"(?:inflight=-?\d+ pending=-?[\d.]+ )?"
     r"top=(-?[\d.]+) bot=(-?[\d.]+) cell_h=(\d+)"
 )
 EVENT = re.compile(
