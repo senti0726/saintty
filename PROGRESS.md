@@ -1877,3 +1877,12 @@ Reported against `26e099f78`, all measured before changing anything:
 
 Commit `e94751925`. 96/96 detectShift, 99/99 ScrollAnim; installed build
 `cmp`-identical to the one measured.
+
+## 2026-09-23 (evening) — a deliberate multi-row scroll slides whole
+
+yazi gained `J`/`K` (5 rows). `max_lag_rows` capped every push at 2 rows, so
+each `J` snapped 3 rows and slid 2 — the cap was written for bursts, not for
+one deliberate move. `push` now caps at `max(limit, |this push|)`. Measured
+live (yazi in tmux, 80 entries, 28 keys): first-frame displacement 40px ->
+100px on every key. `ScrollAnim` 100/100, `detectShift` 96/96. The same change
+lets tmux's 3-5 row batches of nvim scrolling slide instead of snapping.
