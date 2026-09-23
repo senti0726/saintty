@@ -131,7 +131,12 @@ pub fn push(
         self.left <= right and left <= self.right;
     const base: f32 = if (overlaps) self.offset_px else 0;
 
-    const combined = std.math.clamp(base + offset_px, -@abs(limit), @abs(limit));
+    // `limit` stops a burst of pushes winding up, not one deliberate move: a
+    // single push is displaced by its whole distance (callers already refuse
+    // anything over `max_animated_rows`), so yazi's five-row `J` or a tmux
+    // batch of rows slides whole instead of snapping all but two rows.
+    const cap = @max(@abs(limit), @abs(offset_px));
+    const combined = std.math.clamp(base + offset_px, -cap, cap);
     self.offset_px = if (@abs(combined) < min_offset_px) 0 else combined;
 
     // Restart the curve from wherever we now are. A scroll arriving mid-flight
@@ -1233,6 +1238,23 @@ test "ScrollAnim: the union is discarded once the offset reaches zero" {
     try testing.expect(!a.active());
     a.push(20, 0, 52, 0, 209, 10_000);
     try testing.expectEqual(@as(f32, 52), a.bottom);
+}
+
+test "ScrollAnim: one deliberate multi-row scroll is animated whole" {
+    // yazi's `J` moves the list five rows in one go, and tmux hands nvim's
+    // scrolling over in batches of three to five rows. `max_lag_rows` exists
+    // to stop a BURST of pushes winding the offset up -- but it also cut a
+    // single five-row push down to two rows, snapping the other three before
+    // the slide began. A single push is displaced by its whole distance, up
+    // to `max_animated_rows`; only accumulation beyond it is capped.
+    const cell_h: f32 = 21;
+    var a: ScrollAnim = .{};
+    a.push(5 * cell_h, 0, 52, 0, 209, cell_h * max_lag_rows);
+    try testing.expectEqual(@as(f32, 5 * cell_h), a.offset_px);
+
+    // Landing on a standing offset still cannot exceed the larger of the two.
+    a.push(5 * cell_h, 0, 52, 0, 209, cell_h * max_lag_rows);
+    try testing.expectEqual(@as(f32, 5 * cell_h), a.offset_px);
 }
 
 test "ScrollAnim: a held key keeps up instead of snapping against the cap" {
