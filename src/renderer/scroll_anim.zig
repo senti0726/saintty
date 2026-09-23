@@ -83,6 +83,29 @@ pub fn active(self: ScrollAnim) bool {
 ///
 /// `limit` caps the accumulated displacement, so a burst cannot wind the
 /// offset up to something that flashes unrelated content when it unwinds.
+///
+/// An accumulating push **unions** the region rather than adopting the new
+/// one. The invariant is that the region covers everything that contributed
+/// to the offset now standing, and it is the invariant whose absence drew the
+/// screen tearing.
+///
+/// Two producers describe the same physical scroll: the application's own
+/// scroll events and the repaint detector. They do not agree on its extent,
+/// and they alternate frame to frame through a single gesture. Measured on a
+/// 55x210 grid with nvim scrolling a wrapped markdown buffer, one C-e burst
+/// produced, interleaved:
+///
+///     scroll event:  rows 0..52, columns 0..209   (nvim's own margins)
+///     repaintscroll: rows 0..54, columns 2..207   (what visibly changed)
+///     repaintscroll: rows 0..54, columns 5..204
+///
+/// Adopting the newer region while keeping the accumulated offset meant every
+/// row and column dropped from it snapped the whole standing displacement --
+/// 15 to 48px, up to a row and a quarter -- to zero in one frame and back on
+/// the next. That is a seam along the region's edge, flickering at frame rate:
+/// the status line jittering at the bottom, and a ragged strip at each side
+/// where the gap the scroll left behind stops being drawn. It reads exactly
+/// like a torn frame, which is why it was reported as one.
 pub fn push(
     self: *ScrollAnim,
     offset_px: f32,
@@ -92,7 +115,13 @@ pub fn push(
     right: f32,
     limit: f32,
 ) void {
-    const overlaps = self.active() and self.top <= bottom and top <= self.bottom;
+    // Disjoint in *either* axis is a different region. Columns matter as much
+    // as rows: yazi scrolls a preview pane beside a file list that holds
+    // still, and carrying a pending offset from one to the other would
+    // displace a pane by a distance its own content never travelled.
+    const overlaps = self.active() and
+        self.top <= bottom and top <= self.bottom and
+        self.left <= right and left <= self.right;
     const base: f32 = if (overlaps) self.offset_px else 0;
 
     const combined = std.math.clamp(base + offset_px, -@abs(limit), @abs(limit));
@@ -103,10 +132,21 @@ pub fn push(
     // aimed at a total that is no longer true.
     self.start_px = self.offset_px;
     self.elapsed_ms = 0;
-    self.top = top;
-    self.bottom = bottom;
-    self.left = left;
-    self.right = right;
+    if (overlaps) {
+        // Union, per the note above. This only ever grows over regions that
+        // were actually pushed -- rows and columns something told us really
+        // moved -- and it is discarded the moment the offset reaches zero,
+        // so it cannot creep outwards across a gesture boundary.
+        self.top = @min(self.top, top);
+        self.bottom = @max(self.bottom, bottom);
+        self.left = @min(self.left, left);
+        self.right = @max(self.right, right);
+    } else {
+        self.top = top;
+        self.bottom = bottom;
+        self.left = left;
+        self.right = right;
+    }
 }
 
 pub fn stop(self: *ScrollAnim) void {
@@ -311,33 +351,41 @@ pub fn detectShift(
     // pane changes little and matches the shift not at all, so it drops out
     // here rather than being dragged along.
     //
-    // The classification is THREE-WAY, and that is the whole subtlety. A
-    // column can confirm the shift, it can positively disagree with it, or it
-    // can carry too little evidence to say anything — and the third case is
-    // not the second.
+    // The classification is FOUR-WAY, and every one of the distinctions was
+    // paid for by a seam on screen. A column can confirm the shift *well*, it
+    // can confirm it on the little evidence it has, it can positively
+    // disagree, or it can carry no evidence whatsoever -- and those last two
+    // are not the same thing, nor are the first two.
     //
-    // Treating "cannot confirm" as "disagrees" is what caused the tearing.
-    // Prose is full of columns that barely change between two frames: the
-    // gutter between a paragraph's ragged right edge and the next block, a run
-    // of aligned spaces, the blank rows around a heading. Such a column has
-    // only a handful of changed cells, fails `moved >= min_rows` for lack of
-    // evidence rather than for disagreeing, and used to END the run. The
-    // region then covered one side of the screen only, the other side did not
-    // move, and the boundary between them read as a vertical tear — which is
-    // exactly what it was, drawn by us rather than by the display.
+    // What separates "no evidence" from "a little evidence" is whether the
+    // column CHANGED AT ALL, and that is the whole trick:
     //
-    // So a column only breaks the run when it has enough changed cells to
-    // *judge* and still does not match: that is a genuinely independent
-    // region, a tmux split or yazi's file list beside a scrolling preview.
-    // A sparse column bridges instead, and because the run's bounds are only
-    // ever set by CONFIRMING columns, bridging cannot stretch the region into
-    // a stationary pane — an unchanged pane sits outside the outermost
-    // confirming column, not between two of them.
+    //   - A column with nothing changed says nothing about this frame, and
+    //     must not extend the region. This is yazi's file list beside a
+    //     scrolling preview, or a tmux pane holding still: displacing it
+    //     would slide a pane whose content never moved and spring it back.
+    //
+    //   - A column where everything that changed moved with the shift belongs
+    //     to the scroll, however few cells that was. This is the ragged right
+    //     end of wrapped prose, and the first columns of a list whose rows are
+    //     mostly indented past them. Requiring `min_rows` changed cells before
+    //     a column could confirm excluded exactly these, so a line's head was
+    //     displaced while its tail was not: the Claude Code session list drew
+    //     "Laptop crash recovery and disp" on one row and "lay resolution" on
+    //     the row above it. Reported as tearing, and it was, drawn by us.
+    //
+    // So `min_rows` still gates DISAGREEMENT -- breaking a run is a strong
+    // claim and needs evidence -- but it no longer gates agreement. A run's
+    // score is still its count of well-attested columns, so a thinly-attested
+    // edge can widen a region but never invent one.
+    const Verdict = enum { strong, weak, contradict, neutral };
     var left: ?usize = null;
     var right: usize = 0;
-    var run_start: ?usize = null;
-    var confirms: usize = 0;
-    var best_confirms: usize = 0;
+    var best_strong: usize = 0;
+    var best_is_current = false;
+    var seg_strong: usize = 0;
+    var seg_first: ?usize = null;
+    var seg_last: usize = 0;
     for (0..cols) |c| {
         var changed: usize = 0;
         var moved: usize = 0;
@@ -349,23 +397,40 @@ pub fn detectShift(
             if (j < 0 or j >= n) continue;
             if (cur[row + c] == prev[@as(usize, @intCast(j)) * cols + c]) moved += 1;
         }
-        const confirmed = moved >= min_rows and
-            @as(f32, @floatFromInt(moved)) >=
+        const verdict: Verdict = verdict: {
+            if (changed == 0) break :verdict .neutral;
+            const agrees = @as(f32, @floatFromInt(moved)) >=
                 min_ratio * @as(f32, @floatFromInt(changed));
-        if (confirmed) {
-            if (run_start == null) run_start = c;
-            confirms += 1;
-            // Score a run by how many columns actually confirm it, so a long
-            // bridge of sparse columns cannot outrank a shorter run that is
-            // solidly attested.
-            if (confirms > best_confirms) {
-                best_confirms = confirms;
-                left = run_start;
-                right = c;
+            if (agrees and moved > 0) {
+                break :verdict if (moved >= min_rows) .strong else .weak;
             }
-        } else if (changed >= min_rows) {
-            run_start = null;
-            confirms = 0;
+            break :verdict if (changed >= min_rows) .contradict else .neutral;
+        };
+        switch (verdict) {
+            // A genuinely independent region: a tmux split, or yazi's file
+            // list when its selection moves against the preview's scroll.
+            // Everything after this belongs to a different run.
+            .contradict => {
+                seg_strong = 0;
+                seg_first = null;
+                best_is_current = false;
+            },
+            // Bridges, so a gutter or a run of aligned spaces cannot split
+            // one scroll into two regions, but never sets a bound.
+            .neutral => {},
+            .strong, .weak => {
+                if (seg_first == null) seg_first = c;
+                seg_last = c;
+                if (verdict == .strong) seg_strong += 1;
+                if (seg_strong > best_strong) {
+                    best_strong = seg_strong;
+                    best_is_current = true;
+                }
+                if (best_is_current) {
+                    left = seg_first;
+                    right = seg_last;
+                }
+            },
         }
     }
     const l = left orelse return null;
@@ -561,6 +626,54 @@ test "detectShift: a sparse column does not split the region in two" {
     try testing.expectEqual(@as(usize, cols - 1), got.right);
 }
 
+test "detectShift: a thinly-attested edge column still belongs to the scroll" {
+    // The seam this guards, photographed in Claude Code's session list: a
+    // line's head displaced by the animation while its tail was not, so the
+    // screen read "Laptop crash recovery and disp" with "lay resolution"
+    // sitting on the row above it. The same at the left margin, where
+    // "Resume session" broke into "Re" and "sume session" a row apart.
+    //
+    // Columns 0..1 are the left margin and 60..79 the ragged right ends of
+    // wrapped lines: content on two rows out of 24, both moving with the
+    // shift. Four changed cells is under `min_rows`, so requiring `min_rows`
+    // agreements before a column could confirm left them outside the region
+    // even though they are plainly part of the scroll.
+    //
+    // Contrast the yazi test above, where the stationary pane's columns are
+    // *unchanged*. That is the distinction: nothing changed says nothing,
+    // while a little that all agrees is still agreement.
+    const rows = 24;
+    const cols = 80;
+    // Non-blank only on these source rows, so a sparse column has four
+    // changed cells across the frame: two arriving, two leaving.
+    const sparse_content = struct {
+        fn at(k: usize) bool {
+            return k == 4 or k == 20;
+        }
+    };
+    const blank: u64 = 999;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows) |i| {
+        for (0..cols) |c| {
+            const k = i * cols + c;
+            const sparse = c < 2 or c >= 60;
+            if (!sparse) { // body text: every row changes and moves
+                prev[k] = 6_000_000 + (i * cols) + c;
+                cur[k] = 6_000_000 + ((i + 2) * cols) + c;
+                continue;
+            }
+            prev[k] = if (sparse_content.at(i)) 6_000_000 + (i * cols) + c else blank;
+            cur[k] = if (sparse_content.at(i + 2)) 6_000_000 + ((i + 2) * cols) + c else blank;
+        }
+    }
+
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, 2), got.rows);
+    try testing.expectEqual(@as(usize, 0), got.left);
+    try testing.expectEqual(@as(usize, cols - 1), got.right);
+}
+
 test "detectShift: a still screen is not a scroll" {
     // The failure this guards: a static screen finding a shift and animating
     // every frame forever.
@@ -734,7 +847,64 @@ test "ScrollAnim: a one-row region jitter keeps the pending displacement" {
     a.push(-20, 1, 52, 0, 0, 10_000);
     a.push(-20, 2, 52, 0, 0, 10_000);
     try testing.expectEqual(@as(f32, -40), a.offset_px);
-    try testing.expectEqual(@as(f32, 2), a.top);
+    // Row 1 keeps the region: it earned 20px of the 40px now standing, and
+    // dropping it would snap that row back on this frame and forward on the
+    // next. This assertion used to read `2`; see the union in `push`.
+    try testing.expectEqual(@as(f32, 1), a.top);
+}
+
+test "ScrollAnim: the two scroll producers disagreeing must not tear the region" {
+    // The measured case, from a real C-e scroll of a wrapped markdown buffer
+    // on a 55x210 grid: nvim's own scroll events report rows 0..52 full
+    // width, the repaint detector reports rows 0..54 of columns 2..207, and
+    // they interleave through one gesture.
+    //
+    // The offset is shared, so the region must cover both. Adopting only the
+    // newest left columns 0..1 and 208..209 snapping between displaced and
+    // stationary at frame rate, which is the seam reported as tearing.
+    const cell_h: f32 = 38;
+    var a: ScrollAnim = .{};
+    a.push(cell_h, 0, 52, 0, 209, cell_h * max_lag_rows);
+    a.push(cell_h, 0, 54, 2, 207, cell_h * max_lag_rows);
+    try testing.expectEqual(@as(f32, 0), a.left);
+    try testing.expectEqual(@as(f32, 209), a.right);
+    try testing.expectEqual(@as(f32, 0), a.top);
+    try testing.expectEqual(@as(f32, 54), a.bottom);
+
+    // And the detector's narrower opinion arriving first is the same fact.
+    var b: ScrollAnim = .{};
+    b.push(cell_h, 0, 54, 5, 204, cell_h * max_lag_rows);
+    b.push(cell_h, 0, 52, 0, 209, cell_h * max_lag_rows);
+    try testing.expectEqual(@as(f32, 0), b.left);
+    try testing.expectEqual(@as(f32, 209), b.right);
+}
+
+test "ScrollAnim: a scroll in disjoint columns replaces rather than merging" {
+    // yazi scrolls its preview pane while the file list beside it holds
+    // still. If the user then scrolls the list within the same animation, the
+    // pending offset belongs to the preview and must not be handed to the
+    // list -- and the union must not swallow the gap between them, which
+    // would slide both panes together.
+    var a: ScrollAnim = .{};
+    a.push(-20, 0, 40, 60, 200, 10_000);
+    a.advance(16, 80, .ease_out_cubic);
+    a.push(40, 0, 40, 0, 40, 10_000);
+    try testing.expectEqual(@as(f32, 40), a.offset_px);
+    try testing.expectEqual(@as(f32, 0), a.left);
+    try testing.expectEqual(@as(f32, 40), a.right);
+}
+
+test "ScrollAnim: the union is discarded once the offset reaches zero" {
+    // Growth is bounded by one gesture. Without this the region would creep
+    // outwards across unrelated scrolls until it covered the whole screen.
+    var a: ScrollAnim = .{};
+    a.push(20, 0, 52, 0, 209, 10_000);
+    a.push(20, 0, 54, 2, 207, 10_000);
+    try testing.expectEqual(@as(f32, 54), a.bottom);
+    a.advance(1000, 80, .ease_out_cubic);
+    try testing.expect(!a.active());
+    a.push(20, 0, 52, 0, 209, 10_000);
+    try testing.expectEqual(@as(f32, 52), a.bottom);
 }
 
 test "ScrollAnim: successive scrolls over the same region accumulate" {

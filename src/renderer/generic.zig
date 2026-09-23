@@ -195,6 +195,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// noticing that this frame's rows are last frame's rows, shifted.
         scroll_row_hashes: std.ArrayList(u64) = .empty,
 
+        /// The scrolling region the application last declared for itself,
+        /// while a gesture is in progress.
+        ///
+        /// The repaint detector has to infer its row range from which rows
+        /// *changed*, and nvim's status line changes on every scroll -- it
+        /// carries the position percentage and the cursor's line:col. So the
+        /// detector sweeps in the very rows the application excluded from its
+        /// own scrolling margins, and reported rows 0..54 where nvim's own
+        /// events said 0..52. The status line then animated on detector
+        /// frames and held still on event frames.
+        ///
+        /// An application that narrows its region is naming its interface
+        /// rows, and that is better information than anything the detector
+        /// can recover from pixels. `grid_rows` is kept so a resize
+        /// invalidates the region rather than clamping against a stale one.
+        scroll_anim_app_region: ?struct {
+            top: usize,
+            bottom: usize,
+            grid_rows: usize,
+        } = null,
+
         /// When the last frame was actually drawn, so the scroll animation
         /// can pace itself against every draw rather than adding its own on
         /// top of them.
@@ -1243,6 +1264,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // held.
             if (sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms) {
                 self.scroll_row_hashes.clearRetainingCapacity();
+                // The gesture is over, so the region an application declared
+                // during it stops being what the next one will use.
+                self.scroll_anim_app_region = null;
                 return;
             }
 
@@ -1292,12 +1316,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 repaint_scroll_min_ratio,
             ) orelse return;
 
+            // Hold the detected rows inside the application's own scrolling
+            // region. See `scroll_anim_app_region`: what *changed* is not the
+            // same question as what *scrolled*, and a status line carrying a
+            // position percentage changes on every frame of a scroll without
+            // ever moving.
+            var top = shift.top;
+            var bottom = shift.bottom;
+            if (self.scroll_anim_app_region) |r| {
+                if (r.grid_rows == n) {
+                    top = @max(top, r.top);
+                    bottom = @min(bottom, r.bottom);
+                    if (bottom < top) return;
+                }
+            } else if (bottom + 1 == n) {
+                // Nothing has declared a region this gesture, so fall back to
+                // the same manual reservation the event path applies when an
+                // application names none -- otherwise the two producers
+                // disagree about the last rows exactly as they did about the
+                // status line. Only when the detected range actually reaches
+                // the last row: a scroll that ends mid-screen has no
+                // interface at its bottom edge to reserve.
+                bottom = bottom -| self.config.scroll_animation_reserve_bottom;
+                if (bottom < top) return;
+            }
+
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             const was_idle = !self.scroll_anim.active();
             self.scroll_anim.push(
                 @as(f32, @floatFromInt(shift.rows)) * cell_h,
-                @floatFromInt(shift.top),
-                @floatFromInt(shift.bottom),
+                @floatFromInt(top),
+                @floatFromInt(bottom),
                 @floatFromInt(shift.left),
                 @floatFromInt(shift.right),
                 cell_h * ScrollAnim.max_lag_rows,
@@ -1305,8 +1354,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (was_idle) self.scroll_anim_last = null;
 
             if (self.config.scroll_trace) log.info(
-                "repaintscroll shift={d} rows={d}..{d} cols={d}..{d} of {d}x{d}",
-                .{ shift.rows, shift.top, shift.bottom, shift.left, shift.right, n, cols },
+                "repaintscroll shift={d} rows={d}..{d} clamped={d}..{d} cols={d}..{d} of {d}x{d}",
+                .{ shift.rows, shift.top, shift.bottom, top, bottom, shift.left, shift.right, n, cols },
             );
         }
 
@@ -1847,6 +1896,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.config.scroll_animation_reserve_bottom;
                 const bottom = ev.bottom -| reserve;
                 if (bottom < ev.region_top) break :scroll;
+
+                // Remember it for the repaint detector, which cannot see a
+                // scrolling margin and would otherwise animate the rows this
+                // one deliberately leaves out. See `scroll_anim_app_region`.
+                self.scroll_anim_app_region = .{
+                    .top = ev.region_top,
+                    .bottom = bottom,
+                    .grid_rows = grid_rows,
+                };
 
                 const was_idle = !self.scroll_anim.active();
                 self.scroll_anim.push(
