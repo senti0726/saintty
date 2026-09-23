@@ -1691,3 +1691,150 @@ control: `cell_bg.f.glsl` compiles clean, and `cell_text.v.glsl` fails
 wants a location qualifier on, pre-existing and not reachable through Ghostty's
 own runtime path. Compiling a shader here without that control would have
 looked like a real failure.
+
+## 2026-09-23 — two "shakes", two causes: nvim really reflows, and yazi's preview never scrolled
+
+### First: the binary was not HEAD
+
+`~/tools/ghostty` was built 2026-09-08 03:13 from ~286 uncommitted lines (the
+region union of 09-07 and the four-way column verdict of 09-08), not from
+`978f79386` as its version string says. Committed unchanged as `07440d5ac` and
+`5f8669dd1` before anything else, so history matches the binary that was
+reported on. Both filtered test runs passed first (91/91, 97/97).
+
+### Symptom A — nvim jerks when the cursor crosses a rendered line
+
+Driven live (`ydotool`, 400ms apart, fixture `$$` block at lines 7-9, a 33-line
+file on a 59-row screen so nothing can scroll the viewport):
+
+    j 6->7   scroll event: rows=6 region=6..56 src=delete_lines
+    j 7->8   repaintscroll shift=-1 rows=6..58 ... ; shift=-6 rows=6..57 cols=0..102
+    j 8->9   repaintscroll shift=-1 rows=13..58; shift=1 rows=13..57
+    j 9->10  repaintscroll shift=1 rows=13..37 cols=0..102
+    (k back: shift=7, then scroll event rows=-6 insert_lines)
+
+and nvim's own answer to "which screen row is buffer line 11 on":
+
+    cursor 6 -> row 15,  7 -> 9,  8 -> 16,  9 -> 16,  10 -> 15
+
+**Net −6 / +7 / −1 rows, exactly what the log reported.** The detector is not
+misreading a height change as a scroll: the text below the block really moves,
+and the first move is not the detector at all — it is nvim's own `DL`/`IL`,
+which the scroll-event path animates with no input gate. The 150ms keyboard
+window is not what lets it in.
+
+Cause, in `markdown.lua`: a display block conceals its source rows with one
+`conceal_lines` mark PER ROW, each anti-concealing independently. On the
+opening `$$` the rendering (virt_lines anchored to that row) is hidden but
+the other source rows stay concealed: 6 rows shorter. One row in, the
+rendering is back and a source row is revealed: 1 taller. The table wrapper
+already moved to one mark with `end_row` for this reason (SETUP-LOG
+2026-09-14); display maths did not. Not fixed here — see "Open".
+
+Mitigation, measured (two alternating pairs, `--config-default-files=false`):
+
+| duration | visibly moving | more than a row off |
+|---|---|---|
+| 300 | 250–262 ms | 67–95 ms |
+| 120 | 100–101 ms | 34 ms |
+
+Peak is clamped at `max_lag_rows` either way, so the jump's size is unchanged.
+
+**Trap:** `--scroll-animation-duration=120` on the command line did NOTHING
+the first time — both runs came out identical. `config` includes
+`scroll-state.conf` via `config-file`, and an include is loaded after CLI
+flags, so it wins. Measure with `--config-default-files=false`.
+
+### Symptom B — yazi's preview tears along a column boundary
+
+`yazi ~/playground`, j/k down the middle column. **Nothing ever scrolls
+there** — every entry fits on screen; each key only moves the selection and
+replaces the preview. Yet, on the installed binary, 25 detections in 40 keys:
+
+    repaintscroll shift=8 rows=2..58 cols=85..101 of 59x103   (pane is 52..101)
+    repaintscroll shift=5 rows=2..58 cols=67..101
+    repaintscroll shift=1 rows=2..58 cols=14..101             (list AND preview)
+
+The hypothesis that the run stops partway through the pane is right about the
+shape and wrong about the cause: these are not scrolls at all. Reproduced
+offline on `tmux capture-pane -e` frames of the same size (effective SGR
+state, not SGR history — the first parse got that wrong and invented
+disagreements) with a Python port of `detectShift`, which reproduces the live
+verdicts. Three kinds of cell were voting without carrying evidence:
+
+1. **Blanks.** Ten entries -> five: the padding yazi paints to the pane edge
+   in each entry's colour lines up with padding five rows away (`S11/8`) while
+   the name columns contradict outright (`X12/5`). The region is exactly the
+   empty tail of every line.
+2. **Restyled cells.** The relative-number gutter (yazi's relative-motions,
+   like nvim's) genuinely shifts a row per key and anchored a run. The
+   selection bar then restyled `csapp-md-backup2` in place, whose shared
+   prefix equals the row above in the bar's colour: weak `2/2` columns out to
+   col 34, the head of each name sliding and its tail not.
+3. **A lone coincidence, far away.** Real list scroll in `/usr/bin`: one hex
+   digit of the preview's BuildID agreed with the digit below it, and the
+   09-08 weak-column rule let that one cell widen the region from 49 to 76
+   across 26 neutral columns and the pane border.
+
+Tried and rejected: letting a cell that STAYED PUT vote against the shift.
+Right in principle, but on a real scroll the low-information columns (an icon
+identical on every row) have only edge artifacts left to vote with — pane
+border rows, the fixed selection bar, the row entering at the bottom compared
+against the border — and it narrowed `/usr/bin` from 20..49 to 24..42. A
+narrowed real scroll is the 09-08 tear.
+
+### The fix (`26e099f78`)
+
+- Cells are keyed `cellKey(glyph, rest)`: glyph in the low 32 bits (a space
+  counts as blank), FNV of the whole cell folded into the high 32. Synthetic
+  test hashes below 2^32 mean what they did before.
+- A cell **testifies** only if its glyph changed, to a non-blank glyph — in
+  the shift score and the column verdict both. A testifying cell still has to
+  match in full.
+- Weak columns gather into clusters across at most `weak_bridge_cols = 2`
+  neutral columns, and only a cluster with a strong column sets a bound.
+  Measured: the widest legitimate bridge on real prose was 1 (a word gap);
+  every false one was 22-34. Strong columns still bridge any gap (HEAD's rule).
+
+### Verification
+
+- `zig build test -Dtest-filter=detectShift`: 94/94. Three new tests fail on
+  the old code with the modelled values (a shift where there is none;
+  `expected 29, found 56`; `expected 1, found 19`) and pass after. Each rule
+  was broken on its own and its test, and only its test (plus the one that
+  shares it), failed. All 11 old tests pass, the four negative controls
+  included.
+- Offline, captured frames: nvim C-e/C-y keep `cols 0..101`; the genuinely
+  scrolling `/usr/bin` list goes from `20..76`/`20..72` on two frames to
+  `20..49` on all ten; the yazi selection moves stay within `14..18`.
+- **Live**, same 29x103 window, same 40 keys, `tools/scroll-harness/drive-yazi.sh`:
+
+  | build | detections | touching the preview | shift > 1 |
+  |---|---|---|---|
+  | before | 25 | 17 | 8 |
+  | after | 40 | **0** | **0** |
+
+  The four keys where the list really scrolled at 29 rows came out
+  `±1 cols=18..49`, the whole list body. nvim C-e/C-y live: all 8 through
+  nvim's own full-width scroll events, detector correctly idle.
+- No shader changed, so no `glslc` check was needed this round.
+- Installed build is `cmp`-identical to the one verified.
+
+### The harness
+
+`drive-yazi.sh` added: real keys, a probe confirmed by `ya sub hover` before
+any burst, per-key log slices, PID-only cleanup. It closes the gap for yazi
+only; `input.py` still cannot drive an application and that is still undiagnosed.
+
+### Open
+
+- **Symptom A's actual fix is in `markdown.lua`**, and it is a trade-off:
+  one mark spanning the block (so it anti-conceals as a unit — one move in,
+  one out, instead of −6/+7/−1), or `conceal = false` (never reflows, but the
+  LaTeX source is never visible, even in insert mode given `render_modes`).
+- **The relative-number gutter rolls a row on every j/k** in nvim and yazi
+  (cols 0..3 / 14..18). A real shift of real glyphs; left alone.
+- **`scroll_anim_app_region` outlives its gesture.** It is only cleared when
+  `detectRepaintScroll` runs while idle, and that needs an `updateFrame`, so
+  after one `scroll event` it kept clamping gutter detections to rows 6..36
+  for eleven keypresses 400ms apart. Minor; not either symptom.
