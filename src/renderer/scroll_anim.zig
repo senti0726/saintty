@@ -268,6 +268,28 @@ pub fn advance(
     self.offset_px = if (@abs(remaining) < min_offset_px) 0 else remaining;
 }
 
+/// The detector's key for one cell: the glyph in the low half, a hash of
+/// everything else drawn -- style, colour, width -- in the high half.
+///
+/// Two cells with equal keys look identical. The low half alone answers a
+/// different question, "did the *text* here change?", which is the one that
+/// decides whether a cell can testify to a scroll at all: a blank looks like
+/// every other blank, and a highlight moving over text that stays put is not
+/// that text moving. See `detectShift`. Packing both into one word keeps the
+/// detector's input a single array, and keeps any hash below 2^32 -- every
+/// synthetic frame in the tests -- meaning exactly what it did before.
+pub fn cellKey(glyph: u32, rest: u32) u64 {
+    return (@as(u64, rest) << 32) | glyph;
+}
+
+/// The glyph half of a `cellKey`.
+pub fn glyphOf(key: u64) u32 {
+    return @truncate(key);
+}
+
+/// The glyph of a cell that draws no text, whatever colour it is painted.
+pub const blank_glyph: u32 = 0;
+
 /// Find the whole-row shift that best maps `cur` onto `prev`, or null.
 ///
 /// `cur[i] == prev[i + shift]` means row i now holds what row i+shift held,
@@ -298,6 +320,17 @@ pub const Shift = struct {
     right: usize,
 };
 
+/// How many neutral columns a thinly-attested column may sit from the
+/// cluster it widens. A word gap is one; see `detectShift`.
+const weak_bridge_cols: usize = 2;
+
+/// Whether a cell can be evidence about a scroll: its text changed, to some
+/// text. See `detectShift`.
+fn testifies(cur: u64, prev: u64) bool {
+    const g = glyphOf(cur);
+    return g != blank_glyph and g != glyphOf(prev);
+}
+
 /// Find the whole-row shift that best maps `cur` onto `prev`, or null.
 ///
 /// `cur` and `prev` are `rows * cols` hashes in row-major order -- one per
@@ -311,6 +344,23 @@ pub const Shift = struct {
 /// Only cells that actually **changed** are counted, in the numerator and the
 /// denominator both. A blank or static cell matches at every offset at once,
 /// so counting those lets a mostly-still screen "confirm" any shift at all.
+///
+/// And "changed" means the **glyph** changed, to something that is not blank
+/// (see `cellKey`). Two kinds of change carry no information about where
+/// anything went, and both were measured producing scrolls that never
+/// happened:
+///
+///   - A cell that became blank, or a blank that changed colour. A blank
+///     equals every other blank in its colour, so it "confirms" whichever
+///     shift lines the blanks up. yazi replacing a ten-entry preview listing
+///     with a five-entry one read as `shift=5` across the padding at the end
+///     of every line, while the names themselves disagreed.
+///   - A cell restyled in place. A selection bar or cursor line moving over
+///     text that stays put restyles two rows, and where neighbouring rows
+///     share text -- `csapp-md-backup2` under `csapp-md-backup` -- the
+///     restyled row equals the row above it in its new colour.
+///
+/// A cell that *does* testify still has to match in full, glyph and style.
 pub fn detectShift(
     cur: []const u64,
     prev: []const u64,
@@ -336,7 +386,7 @@ pub fn detectShift(
             const row = i * cols;
             const src = @as(usize, @intCast(j)) * cols;
             for (0..cols) |c| {
-                if (cur[row + c] == prev[row + c]) continue;
+                if (!testifies(cur[row + c], prev[row + c])) continue;
                 if (cur[row + c] == prev[src + c]) score += 1;
             }
         }
@@ -378,20 +428,38 @@ pub fn detectShift(
     // claim and needs evidence -- but it no longer gates agreement. A run's
     // score is still its count of well-attested columns, so a thinly-attested
     // edge can widen a region but never invent one.
+    //
+    // And a thin edge can only widen a region it TOUCHES. Weak columns gather
+    // into clusters with the columns beside them, across at most
+    // `weak_bridge_cols` of neutral gap, and only a cluster holding at least
+    // one strong column may set a bound. Measured on real prose, a weak
+    // column is never more than one neutral column from the text it continues
+    // -- a word gap. The weak columns that sat further out were all
+    // coincidences, 22 to 34 columns away across a pane border: one hex digit
+    // of a BuildID in yazi's preview agreeing with the digit below it, and
+    // the preview's left half then sliding with the file list beside it.
+    // Strong columns still bridge any gap, so a gutter between two blocks of
+    // scrolling text does not split them.
     const Verdict = enum { strong, weak, contradict, neutral };
     var left: ?usize = null;
     var right: usize = 0;
     var best_strong: usize = 0;
     var best_is_current = false;
+    // The segment since the last contradiction: its strong-column count, and
+    // the extent of its clusters that hold strong evidence.
     var seg_strong: usize = 0;
     var seg_first: ?usize = null;
     var seg_last: usize = 0;
+    // The cluster being built.
+    var cl_first: ?usize = null;
+    var cl_last: usize = 0;
+    var cl_strong: usize = 0;
     for (0..cols) |c| {
         var changed: usize = 0;
         var moved: usize = 0;
         for (0..rows) |i| {
             const row = i * cols;
-            if (cur[row + c] == prev[row + c]) continue;
+            if (!testifies(cur[row + c], prev[row + c])) continue;
             changed += 1;
             const j = @as(isize, @intCast(i)) + best_shift;
             if (j < 0 or j >= n) continue;
@@ -413,22 +481,36 @@ pub fn detectShift(
             .contradict => {
                 seg_strong = 0;
                 seg_first = null;
+                cl_first = null;
                 best_is_current = false;
             },
             // Bridges, so a gutter or a run of aligned spaces cannot split
             // one scroll into two regions, but never sets a bound.
             .neutral => {},
             .strong, .weak => {
-                if (seg_first == null) seg_first = c;
-                seg_last = c;
-                if (verdict == .strong) seg_strong += 1;
+                const joins = if (cl_first != null) c - cl_last - 1 <= weak_bridge_cols else false;
+                if (!joins) {
+                    cl_first = c;
+                    cl_strong = 0;
+                }
+                cl_last = c;
+                if (verdict == .strong) {
+                    cl_strong += 1;
+                    seg_strong += 1;
+                }
+                if (cl_strong > 0) {
+                    if (seg_first == null) seg_first = cl_first;
+                    seg_last = cl_last;
+                }
                 if (seg_strong > best_strong) {
                     best_strong = seg_strong;
                     best_is_current = true;
                 }
                 if (best_is_current) {
-                    left = seg_first;
-                    right = seg_last;
+                    if (seg_first) |f| {
+                        left = f;
+                        right = seg_last;
+                    }
                 }
             },
         }
@@ -672,6 +754,134 @@ test "detectShift: a thinly-attested edge column still belongs to the scroll" {
     try testing.expectEqual(@as(isize, 2), got.rows);
     try testing.expectEqual(@as(usize, 0), got.left);
     try testing.expectEqual(@as(usize, cols - 1), got.right);
+}
+
+test "detectShift: blank padding cannot testify to a shift" {
+    // yazi's preview pane, measured: moving the selection from a directory
+    // with ten entries to one with five replaced the listing, and the detector
+    // reported `shift=5 cols=65..101` -- the right half of a 51-column pane.
+    // That is the torn line: each preview row's tail displaced by five rows
+    // and easing back, its head standing still.
+    //
+    // Every cell that "agreed" was a blank. yazi pads each entry to the pane
+    // edge in the entry's colour, so a directory's padding five rows down
+    // equals a directory's padding here, and a plain blank equals every other
+    // plain blank. The text itself -- the only part that could say where
+    // anything went -- disagreed with the shift outright.
+    //
+    // A blank cannot say where it came from. It must not vote.
+    const rows = 24;
+    const cols = 40;
+    const plain = cellKey(blank_glyph, 0);
+    const file_pad = cellKey(blank_glyph, 11); // padding in a file's colour
+    const dir_pad = cellKey(blank_glyph, 22); // and in a directory's
+    var prev: [rows * cols]u64 = @splat(plain);
+    var cur: [rows * cols]u64 = @splat(plain);
+    for (2..12) |i| {
+        for (0..cols) |c| {
+            prev[i * cols + c] = if (c < 10)
+                cellKey(@intCast(1000 + i * cols + c), 7) // this listing's names
+            else if (i < 7) file_pad else dir_pad;
+        }
+    }
+    for (2..7) |i| {
+        for (0..cols) |c| {
+            cur[i * cols + c] = if (c < 10)
+                cellKey(@intCast(90_000 + i * cols + c), 7) // a different listing
+            else
+                dir_pad;
+        }
+    }
+    try testing.expect(detectShift(&cur, &prev, rows, cols, 6, 0.6) == null);
+}
+
+test "detectShift: a lone coincidence across a pane border cannot widen the region" {
+    // yazi's file list genuinely scrolling one row, with the preview beside it
+    // showing `file(1)` output for each binary. Consecutive binaries describe
+    // themselves almost identically, so the preview barely changes -- except a
+    // BuildID hash, one of whose hex digits happened to equal the digit a row
+    // below it. Measured: `cols=20..76` where the list is 20..49.
+    //
+    // One agreeing cell made that column "weak", and the rule that lets a
+    // weak column widen a run (a ragged line end, a left margin) let it do so
+    // across 26 columns of border and unchanged preview. The preview's left
+    // half then slid with the list and its right half did not.
+    //
+    // Measured on real prose, a weak column is never more than one neutral
+    // column from the text it continues -- a word gap. Across a pane border it
+    // is always a coincidence.
+    const rows = 24;
+    const cols = 60;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows) |i| {
+        for (0..cols) |c| {
+            const k = i * cols + c;
+            if (c < 30) { // the list: every row moves up one
+                prev[k] = 7_000_000 + i * cols + c;
+                cur[k] = 7_000_000 + (i + 1) * cols + c;
+            } else if (c == 31) { // the border
+                prev[k] = 5;
+                cur[k] = 5;
+            } else if (c < 33) { // padding
+                prev[k] = cellKey(blank_glyph, 0);
+                cur[k] = cellKey(blank_glyph, 0);
+            } else { // the preview: identical from one binary to the next
+                prev[k] = 8_000_000 + i * cols + c;
+                cur[k] = prev[k];
+            }
+        }
+    }
+    // ...but for one digit of a hash, which equals the one below it.
+    cur[6 * cols + 56] = prev[7 * cols + 56];
+
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, 1), got.rows);
+    try testing.expectEqual(@as(usize, 0), got.left);
+    try testing.expectEqual(@as(usize, 29), got.right);
+}
+
+test "detectShift: a selection bar moving is not the list scrolling" {
+    // yazi's middle column, `j` with nothing scrolling: the relative line
+    // numbers in the gutter really do shift a row, and that anchored a run.
+    // The bar then moved from `csapp-md-backup2` to `csapp-md-backup3` -- the
+    // same text restyled in place, whose shared prefix equals the row above
+    // in the bar's new colour. Measured `cols=15..34`: the gutter and the
+    // first twenty columns of every name slid a row, the rest of each name
+    // did not.
+    //
+    // A cell whose glyph is unchanged has not moved, whatever colour it is
+    // now. Restyling is an overlay moving over text that stayed put.
+    const rows = 24;
+    const cols = 40;
+    const bar: u32 = 99;
+    const sel_old = 9;
+    const sel_new = 10;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows) |i| {
+        for (0..cols) |c| {
+            const k = i * cols + c;
+            if (c < 2) {
+                // Relative numbers: |i - cursor|, which shifts with the cursor.
+                const d_old: u32 = @intCast(if (i > sel_old) i - sel_old else sel_old - i);
+                const d_new: u32 = @intCast(if (i > sel_new) i - sel_new else sel_new - i);
+                prev[k] = cellKey(500 + d_old * 2 + @as(u32, @intCast(c)), 0);
+                cur[k] = cellKey(500 + d_new * 2 + @as(u32, @intCast(c)), 0);
+                continue;
+            }
+            // Names that share a long prefix with their neighbours: the glyph
+            // depends on the column, not the row, until the last few columns.
+            const glyph: u32 = if (c < 20) @intCast(3000 + c) else @intCast(4000 + i * cols + c);
+            prev[k] = cellKey(glyph, if (i == sel_old) bar else 0);
+            cur[k] = cellKey(glyph, if (i == sel_new) bar else 0);
+        }
+    }
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, -1), got.rows);
+    // The gutter, and nothing of the names beside it.
+    try testing.expectEqual(@as(usize, 0), got.left);
+    try testing.expectEqual(@as(usize, 1), got.right);
 }
 
 test "detectShift: a still screen is not a scroll" {

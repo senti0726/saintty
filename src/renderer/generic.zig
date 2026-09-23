@@ -1288,13 +1288,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // FNV-1a over the cell's bytes. Cheaper than Wyhash per
                     // cell, which is called ~12k times a frame here and is
                     // built for longer inputs.
-                    cur[base + c] = if (c < raw.len) hash: {
+                    //
+                    // Packed with the glyph alone, so the detector can tell a
+                    // cell whose text changed from one that was only
+                    // repainted -- see `ScrollAnim.cellKey`. A space is as
+                    // blank as an empty cell: TUIs pad with styled spaces,
+                    // and those match each other at any offset.
+                    cur[base + c] = if (c < raw.len) key: {
+                        const cell = raw[c];
                         var h: u64 = 0xcbf29ce484222325;
-                        for (std.mem.asBytes(&raw[c])) |b| {
+                        for (std.mem.asBytes(&cell)) |b| {
                             h = (h ^ b) *% 0x100000001b3;
                         }
-                        break :hash h;
-                    } else 0;
+                        const cp = cell.codepoint();
+                        const glyph: u32 = if (!cell.hasText() or cp == ' ')
+                            ScrollAnim.blank_glyph
+                        else
+                            cp;
+                        break :key ScrollAnim.cellKey(glyph, @truncate(h ^ (h >> 32)));
+                    } else ScrollAnim.cellKey(ScrollAnim.blank_glyph, 0);
                 }
             }
 
