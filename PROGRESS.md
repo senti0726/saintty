@@ -1838,3 +1838,42 @@ only; `input.py` still cannot drive an application and that is still undiagnosed
   `detectRepaintScroll` runs while idle, and that needs an `updateFrame`, so
   after one `scroll event` it kept clamping gutter detections to rows 6..36
   for eleven keypresses 400ms apart. Minor; not either symptom.
+
+## 2026-09-23 (later) — held keys, and the gutter's neighbours
+
+Reported against `26e099f78`, all measured before changing anything:
+
+- **"1000ms feels the same as 300."** The setting works (single `C-e`: 84ms
+  at 120, 733ms after a live reload to 1000, 726ms fresh). What made it feel
+  the same: with a key HELD, every push restarts the ease from zero, the
+  offset pins at the `max_lag_rows` cap and each row beyond it is clipped to a
+  snap. Longer durations clip more — at 1000ms the old build moved 1.8px a
+  frame and jumped a whole row 13 times in 2s. Fix: while pushes land on a
+  live animation the burst eases over at most `pace_intervals` (4) input
+  intervals; slower input or a fresh gesture keeps the configured duration.
+  Test: 220px clipped -> 0. Live, nvim in tmux: median 6.2px/frame at both 300
+  and 1000.
+  Also: an edit of `scroll-animation-duration` in `config` is overridden by
+  the `scroll-state.conf` include; `ghostty-scroll-speed` is the way to set it.
+- **nvim, `j` held at the bottom, "just jumps".** Not the fork (the previous
+  binary is identical). The remaining whole-row steps are rows arriving
+  several at a time — tmux coalescing (+3, +5 rows, over the 2-row cap) and
+  nvim falling behind on a heavy markdown chapter and catching up in one
+  +28-row redraw (over `max_animated_rows`, so a jump by design).
+- **yazi's relative numbers dragged their surroundings.** Rows: the range was
+  every row that *changed* in the region's columns, reaching the status bar
+  (it names the hovered file) and swallowing the bottom border in between —
+  the border's `─` slid with the numbers. Now the rows that *moved*, plus
+  `|shift|` arriving rows. Columns: the selection's rounded cap and
+  open-folder icon genuinely move with the cursor one blank column from the
+  numbers; `weak_bridge_cols` 2 -> 0 (strong columns still bridge anything).
+  On captured prose and real list scrolls, no region changed except that a
+  real yazi list scroll no longer includes border + status bar.
+- **yazi, `j` held through the wrap, "whole screen shaking".** Not reproduced
+  as such. Held through two wraps in `~/playground` and through an 80-entry
+  list in tmux: no large detections either build. The one screen-wide
+  difference found is the old build drawing rows 2..58 (border and status
+  bar) on every key, now 2..28. Left for the user to re-test.
+
+Commit `e94751925`. 96/96 detectShift, 99/99 ScrollAnim; installed build
+`cmp`-identical to the one measured.
