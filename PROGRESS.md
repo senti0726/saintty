@@ -1886,3 +1886,95 @@ one deliberate move. `push` now caps at `max(limit, |this push|)`. Measured
 live (yazi in tmux, 80 entries, 28 keys): first-frame displacement 40px ->
 100px on every key. `ScrollAnim` 100/100, `detectShift` 96/96. The same change
 lets tmux's 3-5 row batches of nvim scrolling slide instead of snapping.
+
+## 2026-09-24 — smooth at speed: a real-device harness, ghost rows, a spring
+
+User: slow input feels fine, fast doesn't (held j, fast touchpad, an MX
+Anywhere 3S wheel in free-spin) -- wants Obsidian/VS Code smoothness.
+
+### The harness (`tools/scroll-harness/fast/`, commit `ec0bfd584`)
+
+Real input the whole way: **uinput devices** (`devices.py`: a hi-res wheel
+sending 1/8 notches, a clickpad shaped like the ASCP1209) go through
+libinput -> KWin -> GTK -> Ghostty exactly like hardware; ydotool for keys.
+`/dev/uinput` is ACL-writable by the user, no root. `run.py` runs a fullscreen
+fork window -> the user's tmux (TPM stripped) -> the user's nvim on CSAPP
+ch. 2; `analyse.py` scores the drawn position per display refresh; `visual.py`
+screenshots a 4 s animation mid-flight. Results default to
+`~/playground/fast-scroll/`; the 2026-09-24 baseline and final runs are kept
+there.
+
+Traps, each cost a run:
+- **The display must be on.** DPMS off = no frame callbacks = Ghostty never
+  realises its surface and never spawns `-e`. Looks like a hang.
+  `kscreen-doctor --dpms on`.
+- **A window under a pointer that never moved gets no wheel at all** (Ghostty
+  reports at the last known position). `park_pointer` moves it and proves the
+  position with nvim's `getmousepos()`.
+- `$TMUX` inherited from the agent's own tmux makes the inner tmux refuse to
+  nest; a unix socket path over 108 bytes makes nvim silently not listen.
+- tmux-continuum on a second server would restore/overwrite the user's
+  sessions -- TPM is stripped from the harness's tmux.conf.
+- Sampling: resample per DRAWN FRAME, not on a fixed 60 Hz grid -- frames sit
+  within ±1 ms of the grid and the jitter manufactured stall+double pairs.
+- Scoring position: count repaint-detected scrolls (held j produced zero
+  scroll events, all repaints) and ignore offsets on narrow animated columns.
+- **Trace clock**: `.awake` IS CLOCK_MONOTONIC -- device send to Ghostty
+  receipt measured 0.3 ms apart, so all three logs share one clock.
+
+### What was wrong, and the fixes (`d279e888d`)
+
+1. **The number column cancelled the scroll.** nvim scrolls with DL/IL (full
+   width, gutter included), then repaints the screen-fixed relative numbers;
+   when that repaint lands in the next frame the detector reads a narrow
+   shift (-N, and once +8) and `push` adds it to the ONE shared offset: the
+   page snapped (30-40% of fast-wheel frames had no slide) or lurched back
+   160 px. `ScrollAnim.isRepair`: under half the event's width, within 250 ms
+   of an app scroll -> the app's repaint, ignored. Either sign.
+2. **The lag cap made batches snap.** nvim delivers 3-6 rows every 17-67 ms at
+   ~3600 px/s on a fast spin, and 24-36 at once when it falls behind a flick;
+   a 2-row cap can't smooth that, and >8 rows snapped. Lagging further needs
+   the rows that already left the grid -> **ghost rows**: before the frame's
+   cells are rebuilt, `keepScrollGhosts` copies the departing rows' glyphs
+   (`captureGhosts`, columns clipped to the push), keeps them relative to the
+   model (`shiftGhosts`), and the shader draws them (SCROLL_GHOST flag, u16 y
+   read as signed, no bg/cursor lookup, clipped to the region, gone when the
+   animation ends). Cap 24 rows; app scrolls up to 40 rows slide (Ctrl-D now
+   slides; a full page still snaps). Band bg is the global bg.
+3. **Ease-out restarted per push surges and sags.** Measured 5-13 px/refresh
+   holding j. New `spring` easing (now the DEFAULT): critically damped,
+   integrated exactly, velocity kept across pushes, exponential kick from
+   rest, stiffens only past the cap (stiffening from half the cap retired a
+   24-row batch in one frame = a snap).
+
+smooth% (no stall/jump/jerk/reversal), baseline -> final (two runs):
+
+| scenario | before | after |
+|---|---|---|
+| wheel slow / fast / flick | 84 / 53 / 56 | 100 / 100 / 96 |
+| touchpad slow / fast / flick / repeated | 96 / 57 / 74 / 48 | 99.6 / 94-100 / 93-96 / 90 |
+| held j / tapped j | (baseline run invalid) | 100 / 100 |
+
+Tests: `isRepair` 4 (one flipped when the rule widened to both signs),
+`spring` 4 incl. an ease-out control that must stay unsteady, `ghosts` 3;
+each negative-controlled by breaking it. ScrollAnim 100/100, detectShift
+96/96. `cell_text.v.glsl` via glslc: same single SPIR-V diagnostic as the
+pristine file; a deliberately broken copy adds its error. Visual: mid-flight
+screenshots both directions show continuous text through the band.
+
+### Ruled out
+
+- **Forcing nvim to redraw at least every 10 ms while scrolling**
+  (WinScrolled -> `:redraw`). It did even out deliveries (47 -> 92 on repeated
+  touchpad) but made everything worse, slow wheel 100 -> 78-89, held j 100
+  -> 77: each step drawn in two pieces stalls the picture. Reverted.
+
+### Open
+
+- Flicks still batch in nvim (it postpones redraw while input is queued): the
+  last ~5-10% on flick scenarios is that, not the terminal.
+- A ghost row carries whatever the old frame had, e.g. nvim's `@@@`
+  last-line marker, for the length of a slide.
+- Metal shaders were never given the scroll animation; ghosts are Linux-only
+  like the rest (`@hasField` guards the flag).
+- Measured on the 60 Hz laptop panel only; the AW2725Q was not connected.
