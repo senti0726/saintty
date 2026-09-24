@@ -28,6 +28,12 @@ const uint ATLAS_COLOR = 1u;
 // Masks for the `glyph_bools` attribute
 const uint NO_MIN_CONTRAST = 1u;
 const uint IS_CURSOR_GLYPH = 2u;
+// A row the scroll animation carried out of its region, kept to fill the band
+// its lag uncovers (generic.zig `scroll_ghost`). Its grid y is relative to the
+// current model and lies OUTSIDE the region -- above it as a wrapped u16 --
+// so it is displaced unconditionally, clipped to the region like any
+// displaced row, and never drawn once the animation is over.
+const uint SCROLL_GHOST = 4u;
 
 out CellTextVertexOut {
     flat uint atlas;
@@ -51,8 +57,12 @@ void main() {
     bool cursor_wide = (bools & CURSOR_WIDE) != 0;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
+    bool ghost = (glyph_bools & SCROLL_GHOST) != 0u;
+    float gy = float(grid_pos.y);
+    if (ghost && gy >= 32768.0) gy -= 65536.0;
+
     // Convert the grid x, y into world space x, y by accounting for cell size
-    vec2 cell_pos = cell_size * vec2(grid_pos);
+    vec2 cell_pos = cell_size * vec2(float(grid_pos.x), gy);
 
     // Scroll animation: rows inside the animated region are drawn offset from
     // where they now live in the model, so a scroll can be shown part-way
@@ -61,8 +71,7 @@ void main() {
     bool scroll_clipped = false;
     out_data.scroll_clip = 0.0;
     if (scroll_anim.x != 0.0 &&
-        float(grid_pos.y) >= scroll_anim.y &&
-        float(grid_pos.y) <= scroll_anim.z &&
+        (ghost || (gy >= scroll_anim.y && gy <= scroll_anim.z)) &&
         float(grid_pos.x) >= scroll_anim_cols.x &&
         float(grid_pos.x) <= scroll_anim_cols.y) {
         cell_pos.y += scroll_anim.x;
@@ -72,10 +81,13 @@ void main() {
         // would land on rows that are deliberately stationary, painting
         // glyphs over tmux's status line. The background pass leaves a blank
         // line there instead.
-        float displaced = float(grid_pos.y) + scroll_anim.x / cell_size.y;
+        float displaced = gy + scroll_anim.x / cell_size.y;
         if (displaced < scroll_anim.y - 0.999 || displaced > scroll_anim.z + 0.999) {
             scroll_clipped = true;
         }
+    } else if (ghost) {
+        // No animation, or outside its columns: a ghost has no place to be.
+        scroll_clipped = true;
     }
 
     int vid = gl_VertexID;
@@ -148,8 +160,10 @@ void main() {
     // Get our color. We always fetch a linearized version to
     // make it easier to handle minimum contrast calculations.
     out_data.color = load_color(color, true);
-    // Get the BG color
-    out_data.bg_color = load_color(
+    // Get the BG color. A ghost row is not on the grid, so it has no cell
+    // background to read (its index would be out of bounds): use none, and
+    // take the global background below.
+    out_data.bg_color = ghost ? vec4(0.0) : load_color(
             unpack4u8(bg_colors[grid_pos.y * grid_size.x + grid_pos.x]),
             true
         );
@@ -173,7 +187,7 @@ void main() {
 
     // If this cell is the cursor cell, but we're not processing
     // the cursor glyph itself, then we need to change the color.
-    if ((glyph_bools & IS_CURSOR_GLYPH) == 0 && is_cursor_pos) {
+    if ((glyph_bools & IS_CURSOR_GLYPH) == 0 && is_cursor_pos && !ghost) {
         out_data.color = load_color(unpack4u8(cursor_color_packed_4u8), use_linear_blending);
     }
 }

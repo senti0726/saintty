@@ -2669,6 +2669,12 @@ pub fn keyCallback(
 ) !InputEffect {
     // log.warn("text keyCallback event={}", .{event_orig});
 
+    if (self.config.scroll_trace and event_orig.action != .release) log.info("keyinput mono_us={d} key={s} action={s}", .{
+        @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
+        @tagName(event_orig.key),
+        @tagName(event_orig.action),
+    });
+
     // Apply key remappings to transform modifiers before any processing.
     // This allows users to remap modifier keys at the app level.
     var event = event_orig;
@@ -3473,6 +3479,15 @@ pub fn scrollCallback(
     scroll_mods: input.ScrollMods,
 ) !void {
     // log.info("SCROLL: xoff={} yoff={} mods={}", .{ xoff, yoff, scroll_mods });
+    // Input side of the scroll trace: when each wheel/touchpad event reached
+    // us, on the same clock as the renderer's `scrolltrace` lines, so a
+    // harness can time input -> application -> frame end to end.
+    if (self.config.scroll_trace) log.info("scrollinput mono_us={d} yoff={d:.3} precision={} momentum={s}", .{
+        @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
+        yoff,
+        scroll_mods.precision,
+        @tagName(scroll_mods.momentum),
+    });
 
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();

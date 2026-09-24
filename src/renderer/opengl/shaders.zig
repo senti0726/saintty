@@ -272,7 +272,10 @@ pub const CellText = extern struct {
     bools: packed struct(u8) {
         no_min_contrast: bool = false,
         is_cursor_glyph: bool = false,
-        _padding: u6 = 0,
+        /// A row the scroll animation carried out of its region, drawn in
+        /// the band its lag uncovers. See generic.zig `scroll_ghost`.
+        scroll_ghost: bool = false,
+        _padding: u5 = 0,
     } align(1) = .{},
 
     pub const Atlas = enum(u8) {

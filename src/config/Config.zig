@@ -1115,7 +1115,7 @@ palette: Palette = .{},
 /// tasting rather than taking on trust. All of them travel the same distance
 /// in the same `scroll-animation-duration`; only the pacing differs.
 ///
-///   * `ease-out-cubic` - the default. Most of the travel happens early, then
+///   * `ease-out-cubic` - most of the travel happens early, then
 ///     it decelerates into place.
 ///   * `ease-out-quint` - the same idea, more pronounced: leaves faster,
 ///     settles more gently.
@@ -1126,9 +1126,14 @@ palette: Palette = .{},
 ///     *in* as well as out, which reads as the content having weight.
 ///   * `linear`         - constant speed. Arrives at full speed and stops
 ///     dead; included mostly for comparison.
+///   * `spring`         - the default. Not a curve but a critically damped spring pulling
+///     the text onto its new position. Every curve above restarts on each
+///     scroll, so a held key or a spinning wheel speeds up at every row and
+///     sags between them; a spring keeps its speed across them, so steady
+///     scrolling looks steady. A single scroll behaves like an ease-out.
 ///
 /// Has no effect unless `scroll-animation` is enabled.
-@"scroll-animation-easing": ScrollAnimationEasing = .@"ease-out-cubic",
+@"scroll-animation-easing": ScrollAnimationEasing = .spring,
 
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
@@ -4255,6 +4260,7 @@ pub const ScrollAnimationEasing = enum {
     @"ease-out-quint",
     @"ease-out-quad",
     material,
+    spring,
 };
 
 /// Load optional configuration file from `path`. All errors are ignored.

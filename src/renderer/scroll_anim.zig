@@ -42,6 +42,18 @@ elapsed_ms: f32 = 0,
 /// configured duration can retire them; 0 when there is none. See `push`.
 pace_ms: f32 = 0,
 
+/// Rate of change of `offset_px`, px per ms. Only the `spring` easing keeps
+/// it: it is what makes that motion velocity-continuous. See `advanceSpring`.
+vel_px_ms: f32 = 0,
+
+/// The last push found the animation idle, so a spring should set off at
+/// once rather than accelerate from standstill. See `advanceSpring`.
+from_rest: bool = false,
+
+/// The lag cap the most recent push was given, which a spring stiffens
+/// against as the offset approaches it.
+limit_px: f32 = 0,
+
 /// Below this many pixels there is nothing left to see. Holding a sub-pixel
 /// offset would keep requesting frames forever for no visible benefit.
 pub const min_offset_px: f32 = 0.5;
@@ -67,6 +79,34 @@ pub const max_lag_rows: f32 = 2;
 
 /// How many input intervals a burst of pushes is given to settle. See `push`.
 pub const pace_intervals: f32 = 4;
+
+/// How many rows that scrolled OUT of the region the renderer keeps, so it
+/// can go on drawing them in the band a lagging offset uncovers. See
+/// `shiftGhosts`. This is what makes a lag of more than a row or two
+/// possible at all: without them the band is empty -- the rows left the grid
+/// the moment the application scrolled -- and a deep lag reads as a hole.
+pub const max_ghost_rows: usize = 40;
+
+/// With ghost rows to fill the band, how far behind the model the drawn
+/// position may fall. A fast wheel spin in nvim arrives as 3-6 row batches
+/// 17-67 ms apart at ~3600 px/s, and a spring following that settles about
+/// sqrt(2 V cap / omega) behind: ~415 px, inside 24 rows. At 12 rows the
+/// spring had to stiffen against the cap and big batches collapsed in a frame.
+pub const ghost_lag_rows: f32 = 24;
+
+/// The largest single application scroll that slides rather than snaps,
+/// with ghost rows available. A touchpad flick in nvim delivers up to ~30
+/// rows in one redraw once nvim falls behind the input (up to 36 measured);
+/// sliding them reads as fast scrolling, snapping them reads as a jump. A
+/// half-page jump (`Ctrl-D`, ~29 rows) now slides too, as an Electron editor's
+/// Page Down does; a full page still snaps.
+pub const max_ghost_animated_rows: isize = 40;
+
+/// The stiffness of the `spring` easing, as a multiple of 1/duration. At 6 a
+/// single one-row push from rest is inside half a pixel in ~0.6 x duration,
+/// and steady scrolling at V px/s trails the model by 2V/omega = V x
+/// duration / 3 -- 100 ms at the default-ish 300 ms.
+pub const spring_k: f32 = 6;
 
 pub fn active(self: ScrollAnim) bool {
     return self.offset_px != 0;
@@ -161,6 +201,11 @@ pub fn push(
 
     self.start_px = self.offset_px;
     self.elapsed_ms = 0;
+    self.limit_px = @abs(limit);
+    if (!overlaps) {
+        self.vel_px_ms = 0;
+        self.from_rest = true;
+    }
     if (overlaps) {
         // Union, per the note above. This only ever grows over regions that
         // were actually pushed -- rows and columns something told us really
@@ -182,6 +227,16 @@ pub fn stop(self: *ScrollAnim) void {
     self.offset_px = 0;
     self.start_px = 0;
     self.elapsed_ms = 0;
+    self.vel_px_ms = 0;
+}
+
+/// Would a push over this region add to the running offset (true) or replace
+/// it (false)? The renderer needs to know before it pushes: the rows it keeps
+/// for drawing the band belong to the running animation's region.
+pub fn accumulates(self: ScrollAnim, top: f32, bottom: f32, left: f32, right: f32) bool {
+    return self.active() and
+        self.top <= bottom and top <= self.bottom and
+        self.left <= right and left <= self.right;
 }
 
 /// The shape of the motion.
@@ -200,6 +255,14 @@ pub const Easing = enum {
     material,
     /// cubic-bezier(0.25, 0.46, 0.45, 0.94).
     ease_out_quad,
+    /// Not a curve: a critically damped spring pulling the drawn position
+    /// onto the model. See `advanceSpring`. Every other easing restarts its
+    /// curve on every push, and an ease-out is fastest at its start, so
+    /// steady input -- a held key, a wheel spinning -- kicks the speed up at
+    /// every row and lets it sag until the next: measured 5 to 13 px per
+    /// refresh holding j. A spring keeps its velocity across a push, so
+    /// steady input settles into steady motion.
+    spring,
 };
 
 /// Evaluate a cubic Bezier with P0=(0,0), P3=(1,1) at `x`.
@@ -254,6 +317,9 @@ fn easeOut(t: f32, easing: Easing) f32 {
         .ease_out_quint => 1.0 - inv * inv * inv * inv * inv,
         .material => bezier(0.4, 0.0, 0.2, 1.0, t),
         .ease_out_quad => bezier(0.25, 0.46, 0.45, 0.94, t),
+        // Only reached by callers asking for a curve; the spring itself runs
+        // in `advanceSpring`. Its from-rest shape, normalised to end at 1.
+        .spring => (1.0 - @exp(-spring_k * t)) / (1.0 - @exp(-spring_k)),
     };
 }
 
@@ -270,6 +336,7 @@ pub fn advance(
     easing: Easing,
 ) void {
     if (!self.active()) return;
+    if (easing == .spring) return self.advanceSpring(dt_ms, duration_cfg_ms);
     const duration_ms = if (self.pace_ms > 0) @min(duration_cfg_ms, self.pace_ms) else duration_cfg_ms;
 
     // A stalled or hidden surface can hand us a huge dt. Finishing early is
@@ -296,6 +363,128 @@ pub fn advance(
     const remaining = self.start_px *
         (1.0 - easeOut(self.elapsed_ms / duration_ms, easing));
     self.offset_px = if (@abs(remaining) < min_offset_px) 0 else remaining;
+}
+
+/// Advance the `spring` easing by `dt_ms`.
+///
+/// Critically damped, integrated exactly rather than stepped, so the motion
+/// does not depend on the frame rate:
+///
+///     x(t) = (x0 + (v0 + w*x0) t) e^(-w t)
+///     v(t) = (v0 - w (v0 + w*x0) t) e^(-w t)
+///
+/// A push moves the model and the offset by the same distance, so the drawn
+/// position does not move and -- since the velocity is untouched -- neither
+/// does its speed. That is the whole point.
+///
+/// Two adjustments. A push onto an idle animation sets off at once
+/// (v0 = -w*x0, a plain exponential ease-out), or a single keypress would
+/// start from standstill and feel late. And the spring stiffens as the offset
+/// nears its cap, so a flood of rows pulls it along faster instead of piling
+/// up against the cap and being clipped -- which would snap.
+fn advanceSpring(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
+    if (!(dt_ms > 0)) return;
+    if (!(duration_ms > 0)) {
+        self.offset_px = 0;
+        self.vel_px_ms = 0;
+        return;
+    }
+    var w = spring_k / duration_ms;
+    // Stiffen only past the cap itself. Starting at half of it made one big
+    // batch -- nvim catching up 24 rows at once -- read as a flood, and it
+    // was retired in about a frame: a snap by another name (measured, 400 px
+    // in one refresh).
+    if (self.limit_px > 0) {
+        const over = @abs(self.offset_px) / self.limit_px;
+        if (over > 1) w *= over;
+    }
+    if (self.from_rest) {
+        self.vel_px_ms = -w * self.offset_px;
+        self.from_rest = false;
+    }
+    // A stalled surface can hand us a huge dt; the formula is exact for any
+    // dt, and e^(-w dt) simply goes to zero.
+    const x0 = self.offset_px;
+    const v0 = self.vel_px_ms;
+    const e = @exp(-w * dt_ms);
+    const b = v0 + w * x0;
+    const x = (x0 + b * dt_ms) * e;
+    const v = (v0 - w * b * dt_ms) * e;
+    if (@abs(x) < min_offset_px and @abs(v) * 16 < min_offset_px) {
+        self.offset_px = 0;
+        self.vel_px_ms = 0;
+        return;
+    }
+    self.offset_px = if (@abs(x) < min_offset_px * 0.01) 0 else x;
+    self.vel_px_ms = v;
+    // An offset of exactly zero ends the animation (`active`), so a spring
+    // passing through zero mid-motion must not land on it.
+    if (self.offset_px == 0) self.offset_px = std.math.copysign(min_offset_px * 0.01, v);
+}
+
+/// Decode a ghost row's grid y: rows above the region are stored as wrapped
+/// u16 (a grid position has no sign), so 65535 is the row just above row 0.
+pub fn ghostY(y: u16) i32 {
+    return @as(i16, @bitCast(y));
+}
+
+pub fn ghostYEncode(y: i32) u16 {
+    return @bitCast(@as(i16, @intCast(y)));
+}
+
+/// Move the kept rows along with a scroll of `rows` (content up by `rows`)
+/// and drop the ones that are no longer needed: back inside [top, bottom],
+/// where the application has drawn the real thing, or further than
+/// `max_ghost_rows` beyond either edge, where no offset will ever reach.
+/// `T` is any glyph type with a `grid_pos: [2]u16`.
+pub fn shiftGhosts(comptime T: type, ghosts: *std.ArrayListUnmanaged(T), rows: isize, top: usize, bottom: usize) void {
+    const t: i32 = @intCast(top);
+    const b: i32 = @intCast(bottom);
+    const far: i32 = @intCast(max_ghost_rows);
+    var w: usize = 0;
+    for (ghosts.items) |g| {
+        const y = ghostY(g.grid_pos[1]) - @as(i32, @intCast(rows));
+        if (y >= t and y <= b) continue;
+        if (y < t - far or y > b + far) continue;
+        var h = g;
+        h.grid_pos[1] = ghostYEncode(y);
+        ghosts.items[w] = h;
+        w += 1;
+    }
+    ghosts.shrinkRetainingCapacity(w);
+}
+
+/// Keep the rows a scroll of `rows` is about to carry out of [top, bottom],
+/// from `row_lists` (one glyph list per grid row, as last drawn), placed where
+/// they now are relative to the model: above the region for content moving
+/// up, below it for content moving down. Only glyphs in [left, right]: the
+/// shader displaces nothing outside those columns, so a glyph kept from
+/// beyond them would be drawn, undisplaced, on top of whatever is there.
+pub fn captureGhosts(
+    comptime T: type,
+    alloc: std.mem.Allocator,
+    ghosts: *std.ArrayListUnmanaged(T),
+    row_lists: []const std.ArrayListUnmanaged(T),
+    rows: isize,
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+) std.mem.Allocator.Error!void {
+    if (rows == 0 or bottom < top or bottom >= row_lists.len) return;
+    const n: usize = @min(@abs(rows), bottom - top + 1, max_ghost_rows);
+    // Departing rows, nearest the edge last so the closest ones survive the
+    // `max_ghost_rows` bound.
+    const first: usize = if (rows > 0) top else bottom + 1 - n;
+    for (first..first + n) |y| {
+        const ny: i32 = @as(i32, @intCast(y)) - @as(i32, @intCast(rows));
+        for (row_lists[y].items) |g| {
+            if (g.grid_pos[0] < left or g.grid_pos[0] > right) continue;
+            var h = g;
+            h.grid_pos[1] = ghostYEncode(ny);
+            try ghosts.append(alloc, h);
+        }
+    }
 }
 
 /// The detector's key for one cell: the glyph in the low half, a hash of
@@ -349,6 +538,47 @@ pub const Shift = struct {
     left: usize,
     right: usize,
 };
+
+/// How long after an application's own scroll a detected counter-shift is
+/// still read as its repair rather than a scroll. Generous: tmux can split
+/// nvim's redraw across several of its own writes and frames.
+pub const repair_window_ms: i64 = 250;
+
+/// Is a repaint-detected `shift` just the application putting back rows that
+/// its own scroll carried away?
+///
+/// An application that scrolls with a real scroll command (nvim's `DL`/`IL`,
+/// delivered as a `ScrollEvent`) moves every column of the region, including
+/// ones that are fixed to the SCREEN rather than to the text -- relative line
+/// numbers, a cursor-line number, a sign or fold column. It rewrites those a
+/// moment later, and when that rewrite lands in the next frame the detector
+/// sees those few columns move by the scroll's distance the other way. Pushing
+/// that is catastrophic: the animation keeps one offset for the region, so
+/// the -N cancels the +N and the whole page snaps instead of sliding.
+/// Measured on nvim with `relativenumber`: every 3-row wheel step read as
+/// `shift=-3 cols=2..3` straight after `rows=3`, and 30-40% of frames on a
+/// fast wheel spin had no slide at all.
+///
+/// A repair is: within `repair_window_ms` of the last event, and covering
+/// less than half the event's width -- in EITHER direction. The first version
+/// only caught the opposite sign; a fast wheel spin then produced
+/// `shift=8 cols=2..2` (the number column, same direction) mid-scroll, which
+/// pushed 160 px onto the whole page and lurched it backwards. While the
+/// application is scrolling with scroll commands, a narrow strip moving is
+/// always it repainting columns fixed to the screen. A full-width shift is
+/// still a scroll -- the user changed direction, or the app repainted rather
+/// than scrolled.
+pub fn isRepair(
+    last_event_rows: isize,
+    since_event_ms: i64,
+    event_cols: usize,
+    shift: Shift,
+) bool {
+    if (last_event_rows == 0 or shift.rows == 0) return false;
+    if (since_event_ms < 0 or since_event_ms > repair_window_ms) return false;
+    const width = shift.right - shift.left + 1;
+    return width * 2 < event_cols;
+}
 
 /// How many neutral columns a thinly-attested column may sit from the
 /// cluster it widens: none, it has to touch it. See `detectShift`.
@@ -1351,4 +1581,146 @@ test "ScrollAnim: a zero duration snaps rather than freezing" {
     a.advance(16, 0, .ease_out_cubic);
     try testing.expectEqual(@as(f32, 0), a.offset_px);
     try testing.expect(!a.active());
+}
+
+fn testShift(rows: isize, left: usize, right: usize) Shift {
+    return .{ .rows = rows, .top = 1, .bottom = 56, .left = left, .right = right };
+}
+
+test "isRepair: the number column put back after a scroll is not a scroll" {
+    // nvim scrolled 3 rows over 210 columns; the gutter reads as -3.
+    try std.testing.expect(isRepair(3, 16, 210, testShift(-3, 2, 3)));
+    try std.testing.expect(isRepair(-1, 40, 210, testShift(1, 0, 3)));
+}
+
+test "isRepair: a full-width reversal is the user changing direction" {
+    try std.testing.expect(!isRepair(3, 16, 210, testShift(-2, 0, 209)));
+    try std.testing.expect(!isRepair(3, 16, 210, testShift(-2, 4, 207)));
+}
+
+test "isRepair: the number column alone moving WITH the scroll is a repaint too" {
+    // Measured mid-spin: shift=8 over column 2 only, same sign as the scroll.
+    try std.testing.expect(isRepair(3, 16, 210, testShift(8, 2, 2)));
+    // But a full-width shift the same way is the app repainting a scroll.
+    try std.testing.expect(!isRepair(3, 16, 210, testShift(3, 0, 209)));
+}
+
+test "isRepair: long after the scroll, a narrow shift is its own movement" {
+    try std.testing.expect(!isRepair(3, repair_window_ms + 1, 210, testShift(-1, 2, 3)));
+    try std.testing.expect(!isRepair(0, 0, 210, testShift(-1, 2, 3)));
+}
+
+/// Drive `push`/`advance` like the renderer does: a push of `push_px` every
+/// `interval_ms`, frames every 1000/60 ms, and return the smallest and
+/// largest per-frame movement of the DRAWN position between `from_ms` and
+/// `to_ms` -- what the eye sees as steady or not.
+fn steadiness(easing: Easing, push_px: f32, interval_ms: f32, from_ms: f32, to_ms: f32) [2]f32 {
+    var a: ScrollAnim = .{};
+    const dt: f32 = 1000.0 / 60.0;
+    var model: f32 = 0;
+    var next_push: f32 = 0;
+    var t: f32 = 0;
+    var prev_drawn: ?f32 = null;
+    var lo: f32 = std.math.inf(f32);
+    var hi: f32 = 0;
+    while (t < to_ms) : (t += dt) {
+        while (next_push <= t) : (next_push += interval_ms) {
+            a.push(push_px, 0, 50, 0, 200, ghost_lag_rows * 20);
+            model += push_px;
+        }
+        a.advance(dt, 300, easing);
+        const drawn = model - a.offset_px;
+        if (prev_drawn) |p| if (t >= from_ms) {
+            lo = @min(lo, drawn - p);
+            hi = @max(hi, drawn - p);
+        };
+        prev_drawn = drawn;
+    }
+    return .{ lo, hi };
+}
+
+test "spring: a held key scrolls at a steady speed" {
+    // A row every 40 ms -- key repeat at 25 Hz -- is 8.3 px per frame on
+    // average. The spring holds within about a pixel of that.
+    const r = steadiness(.spring, 20, 40, 400, 1300);
+    try std.testing.expect(r[1] - r[0] < 2.0);
+    try std.testing.expect(r[0] > 6.0);
+}
+
+test "spring: control -- an ease-out restarted per row surges and sags" {
+    // The same input through ease-out-cubic: every push restarts the curve
+    // at its fastest, so the speed saws between ~5.5 and ~12 px per frame.
+    // Measured live holding j: 5 to 13. If this stops failing to be steady,
+    // the test above is no longer telling the two apart.
+    const r = steadiness(.ease_out_cubic, 20, 40, 400, 1300);
+    try std.testing.expect(r[1] - r[0] > 4.0);
+}
+
+test "spring: a single push sets off at once and settles" {
+    var a: ScrollAnim = .{};
+    a.push(20, 0, 50, 0, 200, 240);
+    a.advance(1000.0 / 60.0, 300, .spring);
+    // Moving on the first frame: no standstill start for a lone keypress.
+    try std.testing.expect(a.offset_px < 20 - 5);
+    var t: f32 = 1000.0 / 60.0;
+    while (a.active() and t < 1000) : (t += 1000.0 / 60.0) a.advance(1000.0 / 60.0, 300, .spring);
+    try std.testing.expect(!a.active());
+    try std.testing.expect(t <= 300);
+}
+
+test "spring: a flood stiffens instead of piling against the cap" {
+    // Three rows every frame (a touchpad flick nvim can barely keep up
+    // with): the spring must never be clipped by the cap.
+    var a: ScrollAnim = .{};
+    const limit: f32 = ghost_lag_rows * 20;
+    var worst: f32 = 0;
+    for (0..60) |_| {
+        a.push(60, 0, 50, 0, 200, limit);
+        a.advance(1000.0 / 60.0, 300, .spring);
+        worst = @max(worst, @abs(a.offset_px));
+    }
+    try std.testing.expect(worst < limit);
+}
+
+const TestGlyph = struct { grid_pos: [2]u16, id: u32 = 0 };
+
+test "ghosts: rows leaving the top are kept above it, in their columns only" {
+    const alloc = std.testing.allocator;
+    var rows: [6]std.ArrayListUnmanaged(TestGlyph) = @splat(.empty);
+    defer for (&rows) |*r| r.deinit(alloc);
+    for (&rows, 0..) |*r, y| {
+        try r.append(alloc, .{ .grid_pos = .{ 0, @intCast(y) }, .id = @intCast(y * 10) });
+        try r.append(alloc, .{ .grid_pos = .{ 5, @intCast(y) }, .id = @intCast(y * 10 + 1) });
+    }
+    var ghosts: std.ArrayListUnmanaged(TestGlyph) = .empty;
+    defer ghosts.deinit(alloc);
+    // Region rows 1..4, columns 2..9, content up by 2: rows 1 and 2 leave.
+    try captureGhosts(TestGlyph, alloc, &ghosts, &rows, 2, 1, 4, 2, 9);
+    try std.testing.expectEqual(@as(usize, 2), ghosts.items.len);
+    try std.testing.expectEqual(@as(i32, -1), ghostY(ghosts.items[0].grid_pos[1]));
+    try std.testing.expectEqual(@as(u32, 11), ghosts.items[0].id);
+    try std.testing.expectEqual(@as(i32, 0), ghostY(ghosts.items[1].grid_pos[1]));
+    try std.testing.expectEqual(@as(u32, 21), ghosts.items[1].id);
+}
+
+test "ghosts: moving the other way drops kept rows the model has again" {
+    const alloc = std.testing.allocator;
+    var ghosts: std.ArrayListUnmanaged(TestGlyph) = .empty;
+    defer ghosts.deinit(alloc);
+    try ghosts.append(alloc, .{ .grid_pos = .{ 3, ghostYEncode(0) } });
+    try ghosts.append(alloc, .{ .grid_pos = .{ 3, ghostYEncode(-3) } });
+    // Region 1..40; content moves DOWN 2: y 0 -> 2 (inside, dropped),
+    // -3 -> -1 (still above, kept).
+    shiftGhosts(TestGlyph, &ghosts, -2, 1, 40);
+    try std.testing.expectEqual(@as(usize, 1), ghosts.items.len);
+    try std.testing.expectEqual(@as(i32, -1), ghostY(ghosts.items[0].grid_pos[1]));
+}
+
+test "ghosts: rows beyond any possible lag are let go" {
+    const alloc = std.testing.allocator;
+    var ghosts: std.ArrayListUnmanaged(TestGlyph) = .empty;
+    defer ghosts.deinit(alloc);
+    try ghosts.append(alloc, .{ .grid_pos = .{ 3, ghostYEncode(-1) } });
+    shiftGhosts(TestGlyph, &ghosts, @intCast(max_ghost_rows + 1), 1, 40);
+    try std.testing.expectEqual(@as(usize, 0), ghosts.items.len);
 }

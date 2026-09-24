@@ -216,6 +216,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             grid_rows: usize,
         } = null,
 
+        /// Glyphs of rows the running scroll carried out of its region, kept
+        /// so the band a lagging offset uncovers shows them instead of a
+        /// hole. Their grid y is relative to the CURRENT model and lies
+        /// outside the region (wrapped u16 above it); the shader draws them
+        /// only while the animation is live. See `ScrollAnim.shiftGhosts`.
+        scroll_ghost: std.ArrayListUnmanaged(shaderpkg.CellText) = .empty,
+
+        /// The row lists plus the ghost list, handed to the GPU upload in one
+        /// go. Shallow copies of `cells.fg_rows`; rebuilt every frame.
+        scroll_ghost_view: std.ArrayListUnmanaged(std.ArrayListUnmanaged(shaderpkg.CellText)) = .empty,
+
+        /// The application's most recent scroll event: its rows and when.
+        /// See `ScrollAnim.isRepair`.
+        scroll_anim_last_event: ?struct {
+            rows: isize,
+            ts: std.Io.Timestamp,
+        } = null,
+
         /// When the last frame was actually drawn, so the scroll animation
         /// can pace itself against every draw rather than adding its own on
         /// top of them.
@@ -715,6 +733,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .@"ease-out-quint" => .ease_out_quint,
                         .@"ease-out-quad" => .ease_out_quad,
                         .material => .material,
+                        .spring => .spring,
                     },
                     .scroll_trace = config.@"scroll-trace",
                     .padding_color = config.@"window-padding-color",
@@ -901,6 +920,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             self.cells.deinit(self.alloc);
+            self.scroll_ghost.deinit(self.alloc);
+            self.scroll_ghost_view.deinit(self.alloc);
 
             self.font_shaper.deinit();
             self.font_shaper_cache.deinit(self.alloc);
@@ -1226,7 +1247,48 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(self.config.scroll_animation_duration_ms),
                 self.config.scroll_animation_easing,
             );
-            if (!self.scroll_anim.active()) self.scroll_anim_last = null;
+            if (!self.scroll_anim.active()) {
+                self.scroll_anim_last = null;
+                self.scroll_ghost.clearRetainingCapacity();
+            }
+        }
+
+        /// Keep the rows a push of `rows` over this region is about to carry
+        /// out of it. Must run BEFORE the push (to know whether it adds to
+        /// the running animation) and before this frame's cells are rebuilt
+        /// (`cells.fg_rows` still holds what was last drawn). See
+        /// `ScrollAnim.captureGhosts`.
+        fn keepScrollGhosts(self: *Self, rows: isize, top: usize, bottom: usize, left: usize, right: usize) void {
+            if (!self.scroll_anim.accumulates(
+                @floatFromInt(top),
+                @floatFromInt(bottom),
+                @floatFromInt(left),
+                @floatFromInt(right),
+            )) self.scroll_ghost.clearRetainingCapacity();
+            const nrows = self.cells.size.rows;
+            if (nrows == 0 or bottom >= nrows) return;
+            ScrollAnim.shiftGhosts(shaderpkg.CellText, &self.scroll_ghost, rows, top, bottom);
+            const before = self.scroll_ghost.items.len;
+            ScrollAnim.captureGhosts(
+                shaderpkg.CellText,
+                self.alloc,
+                &self.scroll_ghost,
+                self.cells.fg_rows[1 .. nrows + 1],
+                rows,
+                top,
+                bottom,
+                left,
+                right,
+            ) catch {
+                self.scroll_ghost.clearRetainingCapacity();
+                return;
+            };
+            if (comptime @hasField(@TypeOf(self.scroll_ghost.items[0].bools), "scroll_ghost")) {
+                for (self.scroll_ghost.items[before..]) |*g| g.bools.scroll_ghost = true;
+            } else {
+                // A backend whose shader cannot draw them: keep none.
+                self.scroll_ghost.clearRetainingCapacity();
+            }
         }
 
         /// Record that a key produced input, for the repaint detector's gate.
@@ -1353,21 +1415,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (bottom < top) return;
             }
 
+            // The application's own scroll carried screen-fixed columns (the
+            // relative line numbers) with it, and this is it rewriting them.
+            if (self.scroll_anim_last_event) |le| {
+                if (ScrollAnim.isRepair(le.rows, sinceMs(now, le.ts), cols, shift)) {
+                    if (self.config.scroll_trace) log.info(
+                        "repaintscroll repair shift={d} cols={d}..{d} after rows={d} mono_us={d}",
+                        .{ shift.rows, shift.left, shift.right, le.rows, @divTrunc(now.nanoseconds, std.time.ns_per_us) },
+                    );
+                    return;
+                }
+            }
+
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             const was_idle = !self.scroll_anim.active();
+            self.keepScrollGhosts(shift.rows, top, bottom, shift.left, shift.right);
             self.scroll_anim.push(
                 @as(f32, @floatFromInt(shift.rows)) * cell_h,
                 @floatFromInt(top),
                 @floatFromInt(bottom),
                 @floatFromInt(shift.left),
                 @floatFromInt(shift.right),
-                cell_h * ScrollAnim.max_lag_rows,
+                cell_h * ScrollAnim.ghost_lag_rows,
             );
             if (was_idle) self.scroll_anim_last = null;
 
             if (self.config.scroll_trace) log.info(
-                "repaintscroll shift={d} rows={d}..{d} clamped={d}..{d} cols={d}..{d} of {d}x{d}",
-                .{ shift.rows, shift.top, shift.bottom, top, bottom, shift.left, shift.right, n, cols },
+                "repaintscroll shift={d} rows={d}..{d} clamped={d}..{d} cols={d}..{d} of {d}x{d} mono_us={d}",
+                .{ shift.rows, shift.top, shift.bottom, top, bottom, shift.left, shift.right, n, cols, @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us) },
             );
         }
 
@@ -1386,7 +1461,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             const t_us = @divTrunc(base.durationTo(now).nanoseconds, std.time.ns_per_us);
             log.info(
-                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} top={d} bot={d} cell_h={d}",
+                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} top={d} bot={d} cell_h={d} mono_us={d} left={d} right={d}",
                 .{
                     t_us,
                     self.scroll_trace_rows,
@@ -1394,6 +1469,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.scroll_anim.top,
                     self.scroll_anim.bottom,
                     self.size.cell.height,
+                    @divTrunc(now.nanoseconds, std.time.ns_per_us),
+                    self.scroll_anim.left,
+                    self.scroll_anim.right,
                 },
             );
         }
@@ -1800,7 +1878,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // the *region* top (not the cursor row `top`), whether it
                     // counted as narrowed, and the offset actually drawn.
                     log.info(
-                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} cell_h={d}",
+                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} cell_h={d} mono_us={d}",
                         .{
                             ev.rows,
                             ev.top,
@@ -1809,6 +1887,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             self.size.grid().rows,
                             @tagName(ev.source),
                             self.size.cell.height,
+                            @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
                         },
                     );
                 } else {
@@ -1854,6 +1933,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const grid_rows = self.size.grid().rows;
                 const narrowed = ev.region_top > 0 or ev.bottom + 1 < grid_rows;
 
+                if (ev.rows != 0) self.scroll_anim_last_event = .{
+                    .rows = @intCast(ev.rows),
+                    .ts = .now(global.io(), .awake),
+                };
+
                 if (!self.config.scroll_animation) break :scroll;
                 if (ev.rows == 0) break :scroll;
 
@@ -1862,8 +1946,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // screenful of text past the eye more slowly than the instant
                 // change it replaces. Drop any animation in flight too: it
                 // describes rows that just stopped being where it thought.
-                if (@abs(ev.rows) > ScrollAnim.max_animated_rows) {
+                // Ghost rows (see `scroll_ghost`) let a longer scroll than the
+                // detector's slide: they fill the band the lag uncovers.
+                if (@abs(ev.rows) > ScrollAnim.max_ghost_animated_rows) {
                     self.scroll_anim.stop();
+                    self.scroll_ghost.clearRetainingCapacity();
                     break :scroll;
                 }
 
@@ -1880,7 +1967,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Scrolls arrive faster than the ramp retires them during a
                 // fling, so without a tight cap the offset winds up until the
                 // whole block sits half a screen from where it belongs.
-                const limit = cell_h * ScrollAnim.max_lag_rows;
+                const limit = cell_h * ScrollAnim.ghost_lag_rows;
                 // Accumulate rather than replace, and only reset the clock
                 // when starting from idle. Resetting it on every scroll would
                 // skip the integration frame each time, so during continuous
@@ -1919,6 +2006,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 const was_idle = !self.scroll_anim.active();
+                self.keepScrollGhosts(
+                    @intCast(ev.rows),
+                    ev.region_top,
+                    bottom,
+                    0,
+                    self.size.grid().columns -| 1,
+                );
                 self.scroll_anim.push(
                     offset,
                     @floatFromInt(ev.region_top),
@@ -2264,7 +2358,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
-            const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);
+            const fg_count = if (self.scroll_anim.active() and self.scroll_ghost.items.len > 0) ghosted: {
+                self.scroll_ghost_view.clearRetainingCapacity();
+                try self.scroll_ghost_view.appendSlice(self.alloc, self.cells.fg_rows);
+                try self.scroll_ghost_view.append(self.alloc, self.scroll_ghost);
+                break :ghosted try frame.cells.syncFromArrayLists(self.scroll_ghost_view.items);
+            } else try frame.cells.syncFromArrayLists(self.cells.fg_rows);
 
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
@@ -3025,6 +3124,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 new_size.rows = state.rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
+                self.scroll_ghost.clearRetainingCapacity();
 
                 // Update our uniforms accordingly, otherwise
                 // our background cells will be out of place.
