@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Look at a scroll mid-flight: are the ghost rows drawn where they belong?
 
-    python3 tools/scroll-harness/fast/visual.py [--out=DIR] [--notches=N]
+    python3 tools/scroll-harness/fast/visual.py [--out=DIR] [--notches=N] [--bin=PATH]
 
 The numbers from analyse.py say where the content WAS drawn, not what it
 looked like. Ghost rows (rows kept after they scrolled out of the region, to
@@ -41,7 +41,7 @@ def main():
     out = Path(opts.get("out", Path.home() / "playground" / "fast-scroll" / ("visual-" + time.strftime("%H%M%S"))))
     notches = int(opts.get("notches", "3"))
     rig = run.Rig(
-        run.REPO / "zig-out-release" / "bin" / "ghostty",
+        Path(opts.get("bin", run.REPO / "zig-out-release" / "bin" / "ghostty")),
         out,
         ["--conf-scroll-animation-duration=4000", "--conf-scroll-animation-easing=spring"],
     )
@@ -64,6 +64,7 @@ def main():
             shot(out / f"{name}.png")
             print(f"{name}: after shot {last_offset(rig.log)}")
             time.sleep(4.5)
+            shot(out / f"{name}-settled.png")  # the same view at rest, to compare
     finally:
         if mouse:
             mouse.close()

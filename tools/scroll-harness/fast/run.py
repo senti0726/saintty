@@ -101,7 +101,46 @@ class Rig:
         p.write_text("\n".join(out) + "\n")
         return p
 
+    def wake_screen(self):
+        """A screen that has gone to sleep stops Ghostty drawing at all (no
+        frame callbacks), and every run then fails as "nvim never came up".
+        Wake it, and remember to put it back: stop() does, via powerdevil's
+        own "Turn Off Screen" action -- `kscreen-doctor --dpms off` was
+        measured not to take."""
+        state = sh("kscreen-doctor", "--dpms", "show", timeout=10).stdout
+        self.woke = ": off" in state
+        if self.woke:
+            print("screen was asleep: waking it for the run")
+            # Right after powerdevil turned it off (the previous run's
+            # stop()), a wake is ignored for a moment: measured, every run
+            # started straight after another failed as "nvim never came up".
+            for _ in range(20):
+                sh("kscreen-doctor", "--dpms", "on", timeout=10)
+                time.sleep(1)
+                if ": on" in sh("kscreen-doctor", "--dpms", "show", timeout=10).stdout:
+                    break
+            else:
+                raise SystemExit("could not wake the screen")
+            time.sleep(1)
+
+    def sleep_screen(self):
+        if getattr(self, "woke", False):
+            time.sleep(1)  # the devices closing counts as activity
+            sh("qdbus-qt6", "org.kde.kglobalaccel", "/component/org_kde_powerdevil",
+               "org.kde.kglobalaccel.Component.invokeShortcut", "Turn Off Screen")
+            # The action lands a moment later. Returning before it does let
+            # the NEXT run see the screen on, start, and then go dark under
+            # it -- measured, every second run of a back-to-back pair.
+            for _ in range(20):
+                time.sleep(0.5)
+                if ": off" in sh("kscreen-doctor", "--dpms", "show", timeout=10).stdout:
+                    print("screen put back to sleep")
+                    break
+            else:
+                print("screen did not go back to sleep; it will on the idle timeout")
+
     def start(self):
+        self.wake_screen()
         if self.sock.exists():
             self.sock.unlink()
         sh("tmux", "-L", SOCK_NAME, "kill-server")
@@ -238,6 +277,7 @@ for (var i = 0; i < w.length; i++)
             except subprocess.TimeoutExpired:
                 os.killpg(self.proc.pid, signal.SIGKILL)
         sh("qdbus-qt6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "harness")
+        self.sleep_screen()
 
 
 def slice_file(path: Path, start: int) -> str:
