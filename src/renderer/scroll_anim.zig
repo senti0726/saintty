@@ -85,22 +85,32 @@ pub const pace_intervals: f32 = 4;
 /// `shiftGhosts`. This is what makes a lag of more than a row or two
 /// possible at all: without them the band is empty -- the rows left the grid
 /// the moment the application scrolled -- and a deep lag reads as a hole.
-pub const max_ghost_rows: usize = 40;
+/// More than `ghost_lag_rows`, so the deepest lag still has rows to draw.
+pub const max_ghost_rows: usize = 56;
 
 /// With ghost rows to fill the band, how far behind the model the drawn
 /// position may fall. A fast wheel spin in nvim arrives as 3-6 row batches
 /// 17-67 ms apart at ~3600 px/s, and a spring following that settles about
 /// sqrt(2 V cap / omega) behind: ~415 px, inside 24 rows. At 12 rows the
 /// spring had to stiffen against the cap and big batches collapsed in a frame.
-pub const ghost_lag_rows: f32 = 24;
+///
+/// 24 was still too few for flicks: once nvim falls behind it delivers 30-42
+/// rows in one redraw after a 100-130 ms gap, and everything past the cap
+/// landed in one frame ("offset pinned at cap" on every worst moment). At 40,
+/// three alternating A/B blocks on the fast harness, smooth% 24 -> 40: fast
+/// wheel 90-96 -> 100, touchpad drag ~95 -> 99-100, repeated drags ~85 ->
+/// 91-94, wheel flick ~92 -> 96-97, touchpad flick ~95 -> 96. The price is
+/// how stale the band may get, and it is drawn from real rows, not a hole.
+pub const ghost_lag_rows: f32 = 40;
 
 /// The largest single application scroll that slides rather than snaps,
 /// with ghost rows available. A touchpad flick in nvim delivers up to ~30
 /// rows in one redraw once nvim falls behind the input (up to 36 measured);
 /// sliding them reads as fast scrolling, snapping them reads as a jump. A
 /// half-page jump (`Ctrl-D`, ~29 rows) now slides too, as an Electron editor's
-/// Page Down does; a full page still snaps.
-pub const max_ghost_animated_rows: isize = 40;
+/// Page Down does; a full page still snaps. Up from 40 with `ghost_lag_rows`,
+/// for the 42-row batches measured in a wheel flick.
+pub const max_ghost_animated_rows: isize = 48;
 
 /// The stiffness of the `spring` easing, as a multiple of 1/duration. At 6 a
 /// single one-row push from rest is inside half a pixel in ~0.6 x duration,
@@ -584,6 +594,16 @@ pub fn isRepair(
 /// cluster it widens: none, it has to touch it. See `detectShift`.
 const weak_bridge_cols: usize = 0;
 
+/// The exception: thin evidence starting at the screen's LEFT EDGE may sit
+/// this many neutral columns from the strong cluster it widens. Claude Code
+/// draws its message bullets in column 0 and the text from column 2, with
+/// column 1 always blank; three bullets on screen are never `min_rows` of
+/// evidence, so the bullets stood still while their text slid past them.
+/// Nothing lies beyond the edge for such a column to have come from, which
+/// is what separates it from yazi's selection glyphs a blank column to the
+/// RIGHT of the relative numbers (see the test of that name).
+const edge_bridge_cols: usize = 2;
+
 /// Whether a cell can be evidence about a scroll: its text changed, to some
 /// text. See `detectShift`.
 fn testifies(cur: u64, prev: u64) bool {
@@ -750,7 +770,12 @@ pub fn detectShift(
             // one scroll into two regions, but never sets a bound.
             .neutral => {},
             .strong, .weak => {
-                const joins = if (cl_first != null) c - cl_last - 1 <= weak_bridge_cols else false;
+                const joins = if (cl_first) |f| joins: {
+                    const gap = c - cl_last - 1;
+                    if (gap <= weak_bridge_cols) break :joins true;
+                    // Thin evidence at the left edge, reaching inwards.
+                    break :joins f == 0 and cl_strong == 0 and gap <= edge_bridge_cols;
+                } else false;
                 if (!joins) {
                     cl_first = c;
                     cl_strong = 0;
@@ -830,6 +855,70 @@ pub fn detectShift(
     if (bottom - t + 1 < min_rows) return null;
 
     return .{ .rows = best_shift, .top = t, .bottom = bottom, .left = l, .right = right };
+}
+
+/// A run of this many unmoved, non-blank cells on a region's edge row pins
+/// that row. See `trimPinnedRows`.
+pub const pinned_min_cells: usize = 8;
+
+/// Shrink a detected region past edge rows holding something PINNED to the
+/// screen: text redrawn in the same place while everything around it moved.
+///
+/// Claude Code draws "Jump to bottom (ctrl+End) ↓" on the last row of its
+/// scrolling area, and a sticky copy of the current prompt on the first, on
+/// top of the transcript. Both rows also carry transcript text that did move,
+/// so they are rows of the scroll by every other test -- and displacing them
+/// slid the label along with the text, while the band behind a lagging
+/// offset filled with a fresh copy of it for every row scrolled: four labels
+/// stacked up the screen. Left out of the region, the row holds still, which
+/// is the label's intent; its bit of transcript arrives unanimated, the same
+/// as a status line's would.
+///
+/// A cell is pinned when it is unchanged in place and does NOT equal what the
+/// shift would have brought there. Unmoved blanks match at every offset and
+/// neither count nor break a run; anything else that moved or changed does
+/// break it. A run of `pinned_min_cells` non-blank pinned cells pins the row:
+/// prose coincides with the line above it a letter at a time, never eight in
+/// a row. Only edge rows, and only inward: a label in mid-region is drawn
+/// over content that must still slide, which one region cannot express.
+pub fn trimPinnedRows(
+    cur: []const u64,
+    prev: []const u64,
+    rows: usize,
+    cols: usize,
+    shift: isize,
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+) struct { top: usize, bottom: usize } {
+    const pinned = struct {
+        fn row(cu: []const u64, pr: []const u64, n: usize, cs: usize, s: isize, i: usize, l: usize, r: usize) bool {
+            const j = @as(isize, @intCast(i)) + s;
+            const src: ?usize = if (j < 0 or j >= @as(isize, @intCast(n))) null else @intCast(j);
+            var run: usize = 0;
+            for (l..r + 1) |c| {
+                const k = cu[i * cs + c];
+                const moved_in: ?u64 = if (src) |sr| pr[sr * cs + c] else null;
+                if (k == pr[i * cs + c] and (moved_in == null or moved_in.? != k)) {
+                    if (glyphOf(k) != blank_glyph) {
+                        run += 1;
+                        if (run >= pinned_min_cells) return true;
+                    }
+                } else if (k == pr[i * cs + c] and glyphOf(k) == blank_glyph) {
+                    // an unmoved blank: bridges
+                } else run = 0;
+            }
+            return false;
+        }
+    }.row;
+    if (cur.len != rows * cols or prev.len != cur.len or right >= cols or bottom >= rows)
+        return .{ .top = top, .bottom = bottom };
+    var t = top;
+    var b = bottom;
+    while (t < b and pinned(cur, prev, rows, cols, shift, b, left, right)) b -= 1;
+    while (t < b and pinned(cur, prev, rows, cols, shift, t, left, right)) t += 1;
+    return .{ .top = t, .bottom = b };
 }
 
 test "Easing: every curve starts at 0 and ends at 1" {
@@ -1235,6 +1324,99 @@ test "detectShift: the selection's own glyphs beside a gutter do not slide with 
     try testing.expectEqual(@as(isize, -1), got.rows);
     try testing.expectEqual(@as(usize, 0), got.left);
     try testing.expectEqual(@as(usize, 0), got.right);
+}
+
+test "detectShift: bullets at the left edge slide with their text" {
+    // Claude Code: a bullet in column 0 on three rows, column 1 always blank,
+    // prose from column 2. The bullets moved with the text and stood still.
+    const rows = 24;
+    const cols = 40;
+    var prev: [rows * cols]u64 = @splat(cellKey(blank_glyph, 0));
+    var cur: [rows * cols]u64 = @splat(cellKey(blank_glyph, 0));
+    for (0..rows + 1) |k| { // content line k is on row k (prev), k-1 (cur)
+        for (2..cols) |c| {
+            const key = cellKey(@intCast(1000 + k * cols + c), 0);
+            if (k < rows) prev[k * cols + c] = key;
+            if (k >= 1) cur[(k - 1) * cols + c] = key;
+        }
+        if (k == 5 or k == 11 or k == 17) {
+            if (k < rows) prev[k * cols] = cellKey('*', 7);
+            if (k >= 1) cur[(k - 1) * cols] = cellKey('*', 7);
+        }
+    }
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, 1), got.rows);
+    try testing.expectEqual(@as(usize, 0), got.left);
+    try testing.expectEqual(@as(usize, cols - 1), got.right);
+}
+
+/// A transcript scrolling up one row under a label pinned to `pin_row`.
+fn pinnedFrames(comptime rows: usize, comptime cols: usize, pin_row: ?usize, prev: *[rows * cols]u64, cur: *[rows * cols]u64) void {
+    for (0..rows + 1) |k| {
+        for (0..cols) |c| {
+            const key = cellKey(@intCast(1000 + k * cols + c), 0);
+            if (k < rows) prev[k * cols + c] = key;
+            if (k >= 1) cur[(k - 1) * cols + c] = key;
+        }
+    }
+    const label = "Jump to bottom";
+    if (pin_row) |r| for (label, 0..) |ch, i| {
+        const key = if (ch == ' ') cellKey(blank_glyph, 9) else cellKey(ch, 9);
+        prev[r * cols + 20 + i] = key;
+        cur[r * cols + 20 + i] = key;
+    };
+}
+
+test "trimPinnedRows: a label held on the bottom row leaves the region" {
+    const rows = 20;
+    const cols = 60;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    pinnedFrames(rows, cols, 18, &prev, &cur);
+    const got = trimPinnedRows(&cur, &prev, rows, cols, 1, 1, 18, 0, cols - 1);
+    try testing.expectEqual(@as(usize, 1), got.top);
+    try testing.expectEqual(@as(usize, 17), got.bottom);
+}
+
+test "trimPinnedRows: a sticky header on the top row leaves the region" {
+    const rows = 20;
+    const cols = 60;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    pinnedFrames(rows, cols, 1, &prev, &cur);
+    const got = trimPinnedRows(&cur, &prev, rows, cols, 1, 1, 18, 0, cols - 1);
+    try testing.expectEqual(@as(usize, 2), got.top);
+    try testing.expectEqual(@as(usize, 18), got.bottom);
+}
+
+test "trimPinnedRows: control -- the same scroll with no label keeps every row" {
+    const rows = 20;
+    const cols = 60;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    pinnedFrames(rows, cols, null, &prev, &cur);
+    const got = trimPinnedRows(&cur, &prev, rows, cols, 1, 1, 18, 0, cols - 1);
+    try testing.expectEqual(@as(usize, 1), got.top);
+    try testing.expectEqual(@as(usize, 18), got.bottom);
+}
+
+test "trimPinnedRows: repeating rows that moved are not pinned" {
+    // A table's rule lines, two rows apart, scrolled by two: every rule cell
+    // is unchanged in place, but it is also exactly what the shift brought.
+    const rows = 20;
+    const cols = 30;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows + 2) |k| {
+        for (0..cols) |c| {
+            const key = if (k % 2 == 0) cellKey('-', 3) else cellKey(@intCast(1000 + k * cols + c), 0);
+            if (k < rows) prev[k * cols + c] = key;
+            if (k >= 2) cur[(k - 2) * cols + c] = key;
+        }
+    }
+    const got = trimPinnedRows(&cur, &prev, rows, cols, 2, 0, rows - 1, 0, cols - 1);
+    try testing.expectEqual(@as(usize, 0), got.top);
+    try testing.expectEqual(@as(usize, rows - 1), got.bottom);
 }
 
 test "detectShift: a still screen is not a scroll" {

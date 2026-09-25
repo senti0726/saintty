@@ -1427,6 +1427,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
+            // A label pinned to the region's edge row holds still. The
+            // running animation may already hold that row from pushes before
+            // the label appeared, and its kept rows may hold copies of it:
+            // shrink the one and drop the other.
+            const kept = ScrollAnim.trimPinnedRows(cur, prev, n, cols, shift.rows, top, bottom, shift.left, shift.right);
+            if (kept.top != top or kept.bottom != bottom) {
+                top = kept.top;
+                bottom = kept.bottom;
+                if (self.scroll_anim.active()) {
+                    const t: f32 = @floatFromInt(top);
+                    const b: f32 = @floatFromInt(bottom);
+                    if (self.scroll_anim.top < t or self.scroll_anim.bottom > b) {
+                        self.scroll_anim.top = @max(self.scroll_anim.top, t);
+                        self.scroll_anim.bottom = @min(self.scroll_anim.bottom, b);
+                        self.scroll_ghost.clearRetainingCapacity();
+                    }
+                }
+                if (self.config.scroll_trace) log.info(
+                    "repaintscroll pinned rows={d}..{d} kept={d}..{d}",
+                    .{ shift.top, shift.bottom, top, bottom },
+                );
+            }
+
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             const was_idle = !self.scroll_anim.active();
             self.keepScrollGhosts(shift.rows, top, bottom, shift.left, shift.right);
