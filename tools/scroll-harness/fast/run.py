@@ -266,7 +266,13 @@ def main():
         time.sleep(1.0)  # let libinput/KWin adopt the new devices
         rig.park_pointer(mouse)
         for name in names:
-            sc = scenarios.ALL[name]
+            # `<scenario>+<variant>`: the same gesture after scenarios.VARIANTS[variant].
+            base, _, variant = name.partition("+")
+            sc = scenarios.ALL[base]
+            if sc.lua:
+                rig.nv_lua(sc.lua)
+            if variant:
+                rig.nv_lua(scenarios.VARIANTS[variant])
             rig.reset(sc.line)
             if sc.keys and not rig.probe_keys():
                 print(f"{name}: PROBE FAILED -- keys are not reaching the test nvim; skipped")

@@ -16,8 +16,10 @@ J = 36  # KEY_J
 
 
 class Scenario:
-    def __init__(self, fn, line=300, settle=2.0, keys=False, doc=""):
+    def __init__(self, fn, line=300, settle=2.0, keys=False, doc="", lua=""):
         self.fn, self.line, self.settle, self.keys, self.doc = fn, line, settle, keys, doc
+        # Run in the test nvim before the gesture (see the *_native scenarios).
+        self.lua = lua
 
     def run(self, **kw):
         self.fn(**kw)
@@ -28,6 +30,39 @@ def key(code, down):
 
 
 # ---- keyboard ---------------------------------------------------------------
+CTRL, D, F = 29, 32, 33
+
+
+def _chord(rec, code, n, every):
+    t0 = time.monotonic()
+    for i in range(n):
+        sleep_until(t0 + i * every)
+        subprocess.run(["ydotool", "key", f"{CTRL}:1", f"{code}:1", f"{code}:0", f"{CTRL}:0"], env=YDO, capture_output=True)
+        rec.mark("key", 1)
+
+
+def ctrl_d(rec, **_):
+    """Six half-page jumps, each left to finish before the next."""
+    _chord(rec, D, 6, 0.8)
+
+
+def ctrl_f(rec, **_):
+    """Four full-page jumps: past the fork's 40-row slide, so natively a cut."""
+    _chord(rec, F, 4, 1.2)
+
+
+def jumps(rec, **_):
+    """G, gg, G, gg a second apart: jumps smear-cursor should draw (+drawlog)."""
+    G, SHIFT = 34, 42
+    for seq in (["42:1", "34:1", "34:0", "42:0"], ["34:1", "34:0", "34:1", "34:0"]) * 2:
+        subprocess.run(["ydotool", "key", *seq], env=YDO, capture_output=True)
+        rec.mark("key", 1)
+        time.sleep(1.0)
+
+
+# neoscroll (nvim plugins/motion.lua) off: its keys back to nvim's own.
+NATIVE = "(function() for _, k in ipairs({'<C-d>', '<C-f>'}) do pcall(vim.keymap.del, 'n', k) end end)()"
+
 def j_spam(rec, **_):
     """Tapping j about 8 times a second -- the 'slow is fine' baseline."""
     t0 = time.monotonic()
@@ -110,4 +145,48 @@ ALL = {
     "tp_fast": Scenario(tp_fast, settle=3.0),
     "tp_flick": Scenario(tp_flick, settle=4.0),
     "tp_repeat": Scenario(tp_repeat, settle=3.0),
+    # Run the neoscroll pairs in this order: *_native unmaps it for good.
+    "ctrl_d": Scenario(ctrl_d, keys=True),
+    "ctrl_f": Scenario(ctrl_f, keys=True),
+    "jumps": Scenario(jumps, keys=True),
+    "ctrl_d_native": Scenario(ctrl_d, keys=True, lua=NATIVE),
+    "ctrl_f_native": Scenario(ctrl_f, keys=True, lua=NATIVE),
+}
+
+
+# Toggles for `run.py <scenario>+<variant>`; each stays in force for the rest of the run.
+VARIANTS = {
+    "nosmear": "(function() require('smear_cursor').enabled = false end)()",
+    # Who draws the smear: <runtime>/drawlog.txt, one caller chain per draw_quad.
+    "drawlog": """(function()
+  local f = io.open(vim.fn.stdpath('run') .. '/drawlog.txt', 'w')
+  local draw = require('smear_cursor.draw')
+  local orig = draw.draw_quad
+  draw.draw_quad = function(...)
+    local chain = {}
+    for lvl = 2, 6 do
+      local i = debug.getinfo(lvl, 'nl')
+      if not i then break end
+      chain[#chain + 1] = (i.name or '?') .. ':' .. (i.currentline or 0)
+    end
+    f:write(table.concat(chain, ' < ') .. '\\n')
+    f:flush()
+    return orig(...)
+  end
+end)()""",
+    # Every WinScrolled, which floats are visible (and why): <runtime>/floatlog.txt
+    "floatlog": """(function()
+  local f = io.open(vim.fn.stdpath('run') .. '/floatlog.txt', 'w')
+  vim.api.nvim_create_autocmd('WinScrolled', { callback = function()
+    local vis = {}
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      local c = vim.api.nvim_win_get_config(w)
+      if c.relative ~= '' and not c.hide then
+        vis[#vis + 1] = w .. ':' .. vim.bo[vim.api.nvim_win_get_buf(w)].filetype .. '@' .. (c.row or '?') .. ',' .. (c.col or '?')
+      end
+    end
+    f:write(math.floor(vim.uv.hrtime() / 1e6) .. ' ' .. table.concat(vis, ' ') .. '\\n')
+    f:flush()
+  end })
+end)()""",
 }
