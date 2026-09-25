@@ -1978,3 +1978,68 @@ screenshots both directions show continuous text through the band.
 - Metal shaders were never given the scroll animation; ghosts are Linux-only
   like the rest (`@hasField` guards the flag).
 - Measured on the 60 Hz laptop panel only; the AW2725Q was not connected.
+
+## 2026-09-25 — Claude Code's bullets and pinned label; flicks trail 40 rows
+
+Reported from a live Claude Code session: the "Jump to bottom (ctrl+End) ↓"
+label appeared four times up the screen while scrolling, and the white/green
+bullets did not glide with their text. Plus the open items from 09-24.
+
+Reproduced with `tools/scroll-harness/fast/claude_code.py` (Claude Code
+resumed on a throwaway transcript copy, animation slowed to 4 s, shots
+mid-slide). Claude Code's fullscreen view scrolls by **repainting**, so both
+are the repaint detector (`b6f51072c`):
+
+1. **Bullets**: trace said `cols=2..209` on every detection. The bullets are
+   column 0, column 1 is always blank, and three bullets per screen are
+   never `min_rows` of evidence -- a weak cluster, and weak clusters had to
+   touch strong ones (`weak_bridge_cols = 0`, for yazi's selection glyphs).
+   New `edge_bridge_cols = 2`: weak evidence STARTING AT COLUMN 0 may bridge
+   inward. yazi's case is the mirror (strong gutter, weak glyph to its right)
+   and its test still passes.
+2. **Label**: it sits on the region's last row, which also carries transcript
+   that moved, so the row slid -- and each push kept that row as a ghost,
+   one label per row scrolled. New `trimPinnedRows`: an edge row with a run
+   of 8+ non-blank cells unchanged in place and NOT what the shift brought
+   leaves the region; an active animation holding it shrinks and drops its
+   ghosts. Same for a sticky header on the first row.
+3. **Flicks**: every worst moment was "offset pinned at cap" -- nvim sends
+   30-42 rows per redraw after a 100-130 ms gap once it falls behind, and
+   the 24-row cap snapped the excess. `ghost_lag_rows` 40, `max_ghost_rows`
+   56, `max_ghost_animated_rows` 48. Alternating A/B, 3 blocks each:
+
+| scenario | lag 24 | lag 40 |
+|---|---|---|
+| wheel fast | 89.7 / 96.0 / 92.1 | 100 / 100 / 100 |
+| wheel flick | 92.1 / 93.1 / 91.7 | 95.6 / 97.1 / 97.5 |
+| touchpad fast | 96.0 / 94.6 / 95.5 | 99.4 / 100 / 99.4 |
+| touchpad flick | 94.4 / 93.6 / 96.4 | 96.2 / 95.8 / 95.8 |
+| touchpad repeated | 84.5 / 85.8 / 84.8 | 91.3 / 91.4 / 93.5 |
+
+Full suite on the final build, two runs (with the user's new neoscroll +
+smear-cursor): wheel slow/fast/flick 100 / 100 / 94-95, touchpad
+slow/fast/flick/repeated 100 / 98 / 98 / 91-93, held and tapped j 100,
+neoscroll C-d 99-100, C-f 100. Mid-slide shots at ~36 rows of lag: the band
+is continuous (old relative numbers, raw markdown as nvim sent it).
+
+Also: nvim's `@@@` last-line marker is blanked (`fillchars lastline: `,
+dotfiles), since the ghost band carried it mid-screen; and the harness now
+wakes a sleeping screen and puts it back (`8deea0372`).
+
+### Harness trap
+
+A screen put to sleep by powerdevil's "Turn Off Screen" goes dark a moment
+AFTER the call returns, and a wake sent right after it is ignored. Back-to-
+back runs therefore failed alternately ("nvim never came up"), and the
+failing half was whichever build ran second -- an A/B that looked like one
+build could not start. `run.py` now waits for the off to land and verifies
+the wake.
+
+### Open
+
+- Touchpad flicks and repeated drags still pin at 40 rows at the user's
+  600 ms duration: the spring's steady lag is V x 0.2 s, 1600 px at a flick's
+  8000 px/s. More cap is more staleness; the remaining 4-9% is that.
+- Once, a mid-slide shot showed the bottom third black under a figure; not
+  reproduced in three further tries.
+- Metal shaders still lack the animation. 60 Hz panel only.
