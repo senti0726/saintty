@@ -2070,8 +2070,9 @@ wheel 100 / 100 / 94.6, touchpad 100 / 98.1 / 98.9 / 91.6, held and tapped
 
 Harness: `count_j`, `count_j_sweep` (line 1 to the end), `count_j_short`,
 `count_j_tail`, and `+nosmear` / `+smearon` / `+normd` / `+floatlog` /
-`+drawlog` / `+spawnlog` variants. `~/playground/fast-scroll/cuts.py` and
-`bisect.py` (dotfiles playground) do per-press verdicts and late-press timing.
+`+drawlog` / `+spawnlog` variants. `cuts.py <run> <scenario>` says, per nvim
+scroll, whether the renderer saw it; `bisect.py <label> <lua> [spacing] [presses]`
+times late `15j` presses after a long run, with one thing switched off.
 
 ### Open
 
