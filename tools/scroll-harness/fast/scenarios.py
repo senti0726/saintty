@@ -60,6 +60,24 @@ def jumps(rec, **_):
         time.sleep(1.0)
 
 
+def count_j(rec, **_):
+    """`15j` a dozen times, 0.9 s apart -- counted j is nvim's own, not linewalk's."""
+    t0 = time.monotonic()
+    for i in range(12):
+        sleep_until(t0 + i * 0.9)
+        subprocess.run(["ydotool", "key", "2:1", "2:0", "6:1", "6:0", "36:1", "36:0"], env=YDO, capture_output=True)
+        rec.mark("key", 15)
+
+
+def count_j_sweep(rec, presses=285, **_):
+    """`15j` from line 1 to the end of the chapter, 0.7 s apart."""
+    t0 = time.monotonic()
+    for i in range(presses):
+        sleep_until(t0 + i * 0.7)
+        subprocess.run(["ydotool", "key", "2:1", "2:0", "6:1", "6:0", "36:1", "36:0"], env=YDO, capture_output=True)
+        rec.mark("key", 15)
+
+
 # neoscroll (nvim plugins/motion.lua) off: its keys back to nvim's own.
 NATIVE = "(function() for _, k in ipairs({'<C-d>', '<C-f>'}) do pcall(vim.keymap.del, 'n', k) end end)()"
 
@@ -149,6 +167,10 @@ ALL = {
     "ctrl_d": Scenario(ctrl_d, keys=True),
     "ctrl_f": Scenario(ctrl_f, keys=True),
     "jumps": Scenario(jumps, keys=True),
+    "count_j": Scenario(count_j, keys=True, settle=2.5),
+    "count_j_sweep": Scenario(count_j_sweep, line=1, keys=True, settle=2.5),
+    "count_j_tail": Scenario(lambda **kw: count_j_sweep(presses=80, **kw), line=3000, keys=True, settle=2.5),
+    "count_j_short": Scenario(lambda **kw: count_j_sweep(presses=45, **kw), line=1, keys=True, settle=2.5),
     "ctrl_d_native": Scenario(ctrl_d, keys=True, lua=NATIVE),
     "ctrl_f_native": Scenario(ctrl_f, keys=True, lua=NATIVE),
 }
@@ -157,6 +179,8 @@ ALL = {
 # Toggles for `run.py <scenario>+<variant>`; each stays in force for the rest of the run.
 VARIANTS = {
     "nosmear": "(function() require('smear_cursor').enabled = false end)()",
+    "normd": "(function() require('render-markdown').disable() end)()",
+    "smearon": "(function() require('smear_cursor').enabled = true end)()",
     # Who draws the smear: <runtime>/drawlog.txt, one caller chain per draw_quad.
     "drawlog": """(function()
   local f = io.open(vim.fn.stdpath('run') .. '/drawlog.txt', 'w')
@@ -172,6 +196,19 @@ VARIANTS = {
     f:write(table.concat(chain, ' < ') .. '\\n')
     f:flush()
     return orig(...)
+  end
+end)()""",
+    # Every converter process started from now on: <runtime>/spawnlog.txt
+    # (render-markdown's latex misses, once config/latex-warm.lua has run).
+    "spawnlog": """(function()
+  local f = io.open(vim.fn.stdpath('run') .. '/spawnlog.txt', 'w')
+  local orig = vim.system
+  vim.system = function(cmd, o, cb)
+    if type(cmd) == 'table' and (cmd[1] == 'utftex-md' or cmd[1] == 'latex2text') then
+      f:write(math.floor(vim.uv.hrtime() / 1e6) .. (cb and ' warm ' or ' BLOCKING ') .. cmd[1] .. ' ' .. (o and o.stdin or ''):gsub('\\n', ' '):sub(1, 60) .. '\\n')
+      f:flush()
+    end
+    return orig(cmd, o, cb)
   end
 end)()""",
     # Every WinScrolled, which floats are visible (and why): <runtime>/floatlog.txt

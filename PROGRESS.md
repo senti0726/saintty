@@ -2043,3 +2043,41 @@ the wake.
 - Once, a mid-slide shot showed the bottom third black under a figure; not
   reproduced in three further tries.
 - Metal shaders still lack the animation. 60 Hz panel only.
+
+## 2026-09-27 — the repaint gate follows a scroll the user started
+
+The user's `15j` in CSAPP ch. 2 sometimes landed in one frame. A `15j` sweep
+of the chapter (`count_j_sweep`): 96 of 299 scrolls reached the renderer with
+no scroll at all. 60 of the 67 that changed nvim's `skipcol` (the view starting
+part-way into a wrapped line) were full repaints; nvim does not use a terminal
+scroll across a skipcol change. The fix on the nvim side (dotfiles
+`config/linewalk.lua`) replays a counted `j`/`k` as one-row `<C-e>` steps
+over ~250-450 ms, like neoscroll does a page, so each step is a shift the
+detector can recover.
+
+That exposed the gate: `repaint_key_idle_ms` shut detection 150 ms after the
+key, so every repainted step after that snapped. New `scroll_chain_ts`: a real
+scroll event or a recovered shift that lands INSIDE an open gate re-arms it for
+`repaint_chain_ms` (100 ms, longer than the eased tail's slowest step, ~65 ms).
+It never opens the gate on its own, so output after Enter still does not slide.
+
+Result, per `15j` press over the whole chapter (whole move cut / all animated):
+69 / 166 before, 29 / 117 with the nvim glide on the old build, 13 / 137 with
+this build plus the nvim-side cache warm-up for render-markdown's maths (it
+blocked 150-300 ms converting formulas on first sight). Suite on this build:
+wheel 100 / 100 / 94.6, touchpad 100 / 98.1 / 98.9 / 91.6, held and tapped
+`j` 100, `C-d` 100, `C-f` 99.3. `scroll` tests 322/322.
+
+Harness: `count_j`, `count_j_sweep` (line 1 to the end), `count_j_short`,
+`count_j_tail`, and `+nosmear` / `+smearon` / `+normd` / `+floatlog` /
+`+drawlog` / `+spawnlog` variants. `~/playground/fast-scroll/cuts.py` and
+`bisect.py` (dotfiles playground) do per-press verdicts and late-press timing.
+
+### Open
+
+- The last ~13 whole-move cuts are all past line 3000 of the sweep and come
+  from nvim itself slowing (first step 130-240 ms after the key). Not a leak
+  (autocmds, active timers, extmarks flat over 120 glides) and not any one of
+  smear-cursor / render-markdown / obsidian's status footer: the same run lands
+  in a fast mode (4 ms / 11 ms per step) or a slow one (~31 / ~36 ms) whichever
+  of them is switched off. Something outside the nvim config flips it.
