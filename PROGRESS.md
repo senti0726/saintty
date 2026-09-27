@@ -2071,7 +2071,7 @@ wheel 100 / 100 / 94.6, touchpad 100 / 98.1 / 98.9 / 91.6, held and tapped
 Harness: `count_j`, `count_j_sweep` (line 1 to the end), `count_j_short`,
 `count_j_tail`, and `+nosmear` / `+smearon` / `+normd` / `+floatlog` /
 `+drawlog` / `+spawnlog` variants. `cuts.py <run> <scenario>` says, per nvim
-scroll, whether the renderer saw it; `bisect.py <label> <lua> [spacing] [presses]`
+scroll, whether the renderer saw it; `nvim_bisect.py <label> <lua> [spacing] [presses]` (renamed 09-28: `bisect.py` shadowed the stdlib module and broke analyse.py)
 times late `15j` presses after a long run, with one thing switched off.
 
 ### Open
@@ -2082,3 +2082,59 @@ times late `15j` presses after a long run, with one thing switched off.
   smear-cursor / render-markdown / obsidian's status footer: the same run lands
   in a fast mode (4 ms / 11 ms per step) or a slow one (~31 / ~36 ms) whichever
   of them is switched off. Something outside the nvim config flips it.
+
+## 2026-09-28 — crisp text in motion, coloured band, image edges, the tear, yazi's gutter
+
+Reported by eye: the screen "dims and brightens" on every scroll (zoomed
+screenshot: every glyph doubled/soft mid-slide); the first rows on a hard flick
+lose inline-code highlights; a tear at CSAPP 2 line 1273 (right half of the
+text a scroll behind the left); an image's edge row vanishes instead of sliding
+out; yazi at the bottom of a folder detaches the line number from its row.
+
+1. **Fractional offsets.** The offset reached the shaders in fractional
+   pixels and glyphs are sampled with linear filtering, so everything in
+   motion was drawn blended across two pixel rows. Rounded to whole pixels at
+   upload (at most half a pixel off the curve).
+2. **Band backgrounds.** Ghost rows kept glyphs only. Their backgrounds now
+   ride after the grid's own in the bg buffer, as an extended grid
+   (`max_ghost_rows` above and below; `ScrollAnim.shiftGhostBg` /
+   `captureGhostBg`), found by cell_bg.f through `scroll_anim.w`. Most of the
+   raw-looking top rows were NOT this, though: render-markdown's anti-conceal
+   un-renders the cursor's lines, and a scroll drags the cursor along the top
+   edge -- that is the nvim side's to fix (dotfiles, same day).
+3. **The tear** was the detector splitting one pane at text that re-wrapped
+   mid-scroll (`cols=0..145`, also 0..196, 5..170; 15 of ~70 detections around
+   line 1273). A contradicting column now splits the region only across a
+   DIVIDER column -- unchanged and non-blank on 60% of rows (tmux/yazi/nvim
+   separators, or a pane holding still); inside one pane the minority that
+   disagrees counts as weak evidence of the same scroll.
+4. **yazi's gutter.** At the bottom of a folder the list stops and the cursor
+   walks, relabelling every relative number: `shift=-1 cols=27..28` on each
+   `j`, which slid the numbers a row out of step with the selection bar. No
+   region narrower than `min_region_cols` (6) is a scroll. Also, Kitty image
+   placeholder cells no longer testify: two previews lined up 8 rows apart
+   and slid (`shift=-8 cols=105..208`).
+5. **Image edges.** Unicode-placeholder images are one-row slices; a slice
+   leaving the region now becomes a ghost like a text row
+   (`image.State.kitty_ghosts`, captured from a snapshot of the placements as
+   last drawn, because kittyUpdate runs before the scroll is handled), flagged
+   in the new `Image.flags` attribute, and every displaced slice is clipped to
+   the region in image.f (an image's last row no longer draws over the status
+   line mid-slide). The ghost list is only marked stale from
+   `clearScrollGhosts` -- drawFrame calls that with `draw_mutex` held.
+6. **Claude Code's band went blank** for a moment when its label was first
+   recognised as pinned (all ghosts were dropped). Now only the label's
+   copies are (`dropGhostCopies`, `dropGhostBgCopies`).
+
+Tried and dropped: a speed-adaptive spring (stiffen so a flick's steady lag
+stays under 70% of the cap). Alternating A/B, 3 blocks: within noise
+(wheel flick +1, everything else +/-2). Flicks already score 95-98.
+
+Tests: tear + divider control, bullets, pinned rows, ghost bg (+ control),
+ghost slices (+ control), label copies; the yazi gutter tests now expect no
+region. `scroll`, `ghost`, `detectShift` filters all pass. glslc: cell_bg.f
+clean and a broken copy errors; image.v/f report only the SPIR-V "location"
+diagnostic the pristine files also raise.
+
+Also: `bisect.py` renamed `nvim_bisect.py` -- it shadowed the stdlib module,
+and analyse.py died importing `statistics`.
