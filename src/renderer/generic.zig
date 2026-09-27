@@ -181,6 +181,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// plumbing, so without this the repaint detector never runs for it.
         input_activity_ts: ?std.Io.Timestamp = null,
 
+        /// When a scroll last arrived inside an open gate: a real scroll
+        /// event, or a shift the repaint detector recovered.
+        ///
+        /// Keeps the gate open for as long as a scroll the user started is
+        /// still arriving. See `repaint_chain_ms`.
+        scroll_chain_ts: ?std.Io.Timestamp = null,
+
         /// Row content hashes from the previous frame.
         ///
         /// Some applications move the picture without ever telling us they
@@ -1131,6 +1138,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// a command you just pressed Enter on from sliding.
         pub const repaint_key_idle_ms: i64 = 150;
 
+        /// How long after the last scroll of a gesture the gate stays open.
+        ///
+        /// A key can start a scroll that outlasts `repaint_key_idle_ms`: nvim
+        /// replays a page jump or a counted `15j` as one-row steps over
+        /// 250-450 ms (neoscroll; the user's linewalk.lua), and every step
+        /// that crosses a wrapped line (a `skipcol` change) arrives as a
+        /// repaint, not a scroll event. With the gate shut after 150 ms those
+        /// steps snapped -- a sweep of `15j` through a book chapter lost
+        /// about a third of its travel. Each scroll that lands inside the
+        /// gate re-arms it for this long, so the chain holds exactly as long
+        /// as the scroll keeps coming. It never opens the gate by itself, so
+        /// output that follows Enter still does not slide. Long enough for
+        /// the slowest step of an eased glide (its last row, ~65 ms).
+        pub const repaint_chain_ms: i64 = 100;
+
         pub const repaint_scroll_min_rows: usize = 6;
         pub const repaint_scroll_min_ratio: f32 = 0.6;
 
@@ -1324,13 +1346,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // output of a command you just pressed Enter on does not slide,
             // and key repeat at roughly 30Hz keeps it fresh while a key is
             // held.
-            if (sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms) {
+            if (sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms and
+                sinceMs(now, self.scroll_chain_ts) > repaint_chain_ms)
+            {
+                self.scroll_chain_ts = null;
                 self.scroll_row_hashes.clearRetainingCapacity();
                 // The gesture is over, so the region an application declared
                 // during it stops being what the next one will use.
                 self.scroll_anim_app_region = null;
                 return;
             }
+
+            // A real scroll inside the gate is the gesture still going.
+            if (had_event) self.scroll_chain_ts = now;
 
             const cells_list = self.terminal_state.row_data.items(.cells);
             const n = cells_list.len;
@@ -1462,6 +1490,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 cell_h * ScrollAnim.ghost_lag_rows,
             );
             if (was_idle) self.scroll_anim_last = null;
+            self.scroll_chain_ts = now;
 
             if (self.config.scroll_trace) log.info(
                 "repaintscroll shift={d} rows={d}..{d} clamped={d}..{d} cols={d}..{d} of {d}x{d} mono_us={d}",
