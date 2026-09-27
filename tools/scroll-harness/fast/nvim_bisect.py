@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bisect.py <label> <lua>: pre-scroll CSAPP ch.2 fast, then time 40 x `15j` near the end.
+"""nvim_bisect.py <label> <lua>: pre-scroll CSAPP ch.2 fast, then time 40 x `15j` near the end.
 
 Prints the median/p90 delay from a keypress to nvim's first scroll step, and the
 median/p90 gap between steps, with <lua> applied before anything runs."""
