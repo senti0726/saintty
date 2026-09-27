@@ -38,7 +38,26 @@ vec4 cell_bg() {
         // Clamping to the edge row instead replicates that row's colors down
         // the whole gap, which turns tmux's blue copy-mode row into a solid
         // blue block the height of the scroll.
-        if (gy < int(scroll_anim.y) || gy > int(scroll_anim.z)) return vec4(0.0);
+        //
+        // Unless the renderer kept that row: the rows a scroll carried out of
+        // the region are drawn in the band (ghost rows, cell_text), and their
+        // backgrounds are appended after the grid's own as an extended grid
+        // with `scroll_anim.w` rows above row 0 and below the last. Without
+        // them, kept text lost its highlight -- inline code, table headers --
+        // for as long as it was in the band.
+        if (gy < int(scroll_anim.y) || gy > int(scroll_anim.z)) {
+            int g = int(scroll_anim.w);
+            if (g > 0 && gy >= -g && gy < int(grid_size.y) + g &&
+                grid_pos.x >= 0 && grid_pos.x < int(grid_size.x)) {
+                uint idx = grid_size.x * grid_size.y +
+                    uint(gy + g) * grid_size.x + uint(grid_pos.x);
+                return load_color(
+                        unpack4u8(cells[idx]),
+                        (bools & USE_LINEAR_BLENDING) != 0
+                    );
+            }
+            return vec4(0.0);
+        }
         grid_pos.y = gy;
     }
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;

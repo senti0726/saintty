@@ -299,6 +299,8 @@ pub const Image = extern struct {
     cell_offset: [2]f32 align(8),
     source_rect: [4]f32 align(16),
     dest_size: [2]f32 align(8),
+    /// x: 1 for a kept row slice (see `image.State.kitty_ghosts`); y unused.
+    flags: [2]f32 align(8) = .{ 0, 0 },
 };
 
 /// Single parameter for the bg image shader.

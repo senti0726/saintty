@@ -6,8 +6,12 @@ layout(location = 0) in vec2 grid_pos;
 layout(location = 1) in vec2 cell_offset;
 layout(location = 2) in vec4 source_rect;
 layout(location = 3) in vec2 dest_size;
+layout(location = 4) in vec2 flags;
 
 out vec2 tex_coord;
+// 1 when this slice is displaced by the scroll animation, so the fragment
+// shader clips it to the region, as cell_text does for glyphs.
+out float scroll_clip;
 
 void main() {
     int vid = gl_VertexID;
@@ -76,12 +80,27 @@ void main() {
     // NOTE: this is the OpenGL path, which is the only one this machine uses.
     // shaders.metal carries the same uniform for the cell shaders and would
     // need the equivalent edit for the macOS renderer.
+    //
+    // A GHOST slice (flags.x) is an image row the scroll carried out of the
+    // region, kept so the image slides out of view the way text does instead
+    // of its edge row vanishing. It lies outside the region by construction,
+    // is always displaced, and is drawn only while the animation runs.
+    //
+    // Every displaced slice is clipped to the region's band (see
+    // image.f.glsl): an image's last row pushed past the region's edge would
+    // otherwise be drawn over the status line below it.
+    bool ghost = flags.x != 0.0;
+    scroll_clip = 0.0;
     if (scroll_anim.x != 0.0 &&
-        grid_pos.y >= scroll_anim.y &&
-        grid_pos.y <= scroll_anim.z &&
+        (ghost || (grid_pos.y >= scroll_anim.y && grid_pos.y <= scroll_anim.z)) &&
         grid_pos.x >= scroll_anim_cols.x &&
         grid_pos.x <= scroll_anim_cols.y) {
         image_pos.y += scroll_anim.x;
+        scroll_clip = 1.0;
+    } else if (ghost) {
+        // No animation, or outside its columns: nowhere to be.
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        return;
     }
 
     gl_Position = projection_matrix * vec4(image_pos.xy, 1.0, 1.0);

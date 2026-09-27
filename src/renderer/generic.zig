@@ -230,6 +230,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// only while the animation is live. See `ScrollAnim.shiftGhosts`.
         scroll_ghost: std.ArrayListUnmanaged(shaderpkg.CellText) = .empty,
 
+        /// The kept rows' backgrounds, as an extended grid. See
+        /// `ScrollAnim.shiftGhostBg`; appended after the real background
+        /// cells at upload, and read by the background shader for the band.
+        scroll_ghost_bg: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
+        scroll_ghost_bg_live: bool = false,
+        scroll_image_ghosts_stale: bool = false,
+
+        /// The image placements as last drawn, snapshotted before each
+        /// kitty update rebuilds them: by the time a scroll is handled the
+        /// placements already describe the new model, and the slices that
+        /// left are only in here. See `image.State.kitty_ghosts`.
+        scroll_prev_images: std.ArrayListUnmanaged(imagepkg.Placement) = .empty,
+        scroll_bg_view: std.ArrayListUnmanaged(std.ArrayListUnmanaged(shaderpkg.CellBg)) = .empty,
+
         /// The row lists plus the ghost list, handed to the GPU upload in one
         /// go. Shallow copies of `cells.fg_rows`; rebuilt every frame.
         scroll_ghost_view: std.ArrayListUnmanaged(std.ArrayListUnmanaged(shaderpkg.CellText)) = .empty,
@@ -928,6 +942,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.cells.deinit(self.alloc);
             self.scroll_ghost.deinit(self.alloc);
+            self.scroll_ghost_bg.deinit(self.alloc);
+            self.scroll_prev_images.deinit(self.alloc);
+            self.scroll_bg_view.deinit(self.alloc);
             self.scroll_ghost_view.deinit(self.alloc);
 
             self.font_shaper.deinit();
@@ -1271,7 +1288,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             );
             if (!self.scroll_anim.active()) {
                 self.scroll_anim_last = null;
-                self.scroll_ghost.clearRetainingCapacity();
+                self.clearScrollGhosts();
             }
         }
 
@@ -1286,7 +1303,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(bottom),
                 @floatFromInt(left),
                 @floatFromInt(right),
-            )) self.scroll_ghost.clearRetainingCapacity();
+            )) self.clearScrollGhosts();
             const nrows = self.cells.size.rows;
             if (nrows == 0 or bottom >= nrows) return;
             ScrollAnim.shiftGhosts(shaderpkg.CellText, &self.scroll_ghost, rows, top, bottom);
@@ -1302,15 +1319,63 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 left,
                 right,
             ) catch {
-                self.scroll_ghost.clearRetainingCapacity();
+                self.clearScrollGhosts();
                 return;
             };
             if (comptime @hasField(@TypeOf(self.scroll_ghost.items[0].bools), "scroll_ghost")) {
                 for (self.scroll_ghost.items[before..]) |*g| g.bools.scroll_ghost = true;
             } else {
                 // A backend whose shader cannot draw them: keep none.
-                self.scroll_ghost.clearRetainingCapacity();
+                self.clearScrollGhosts();
+                return;
             }
+
+            // Their backgrounds, the same way. `cells.bg_cells` still holds
+            // what was last drawn, as `fg_rows` does above.
+            const cols = self.cells.size.columns;
+            const want = ScrollAnim.ghostBgLen(nrows, cols);
+            if (self.scroll_ghost_bg.items.len != want) {
+                self.scroll_ghost_bg.resize(self.alloc, want) catch {
+                    self.clearScrollGhosts();
+                    return;
+                };
+                @memset(self.scroll_ghost_bg.items, .{ 0, 0, 0, 0 });
+            } else if (!self.scroll_ghost_bg_live) {
+                @memset(self.scroll_ghost_bg.items, .{ 0, 0, 0, 0 });
+            }
+            ScrollAnim.shiftGhostBg(shaderpkg.CellBg, self.scroll_ghost_bg.items, cols, rows, top, bottom);
+            ScrollAnim.captureGhostBg(shaderpkg.CellBg, self.scroll_ghost_bg.items, self.cells.bg_cells, cols, rows, top, bottom, left, right);
+            self.scroll_ghost_bg_live = true;
+
+            // And the image row slices, from the placements as last drawn.
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            if (self.scroll_image_ghosts_stale) {
+                self.images.kitty_ghosts.clearRetainingCapacity();
+                self.scroll_image_ghosts_stale = false;
+            }
+            ScrollAnim.shiftGhostSlices(imagepkg.Placement, &self.images.kitty_ghosts, rows, top, bottom);
+            ScrollAnim.captureGhostSlices(
+                imagepkg.Placement,
+                self.alloc,
+                &self.images.kitty_ghosts,
+                self.scroll_prev_images.items,
+                rows,
+                top,
+                bottom,
+                left,
+                right,
+            ) catch self.images.kitty_ghosts.clearRetainingCapacity();
+        }
+
+        /// Callable with or without `draw_mutex` held (drawFrame holds it
+        /// when the animation ends): the image slices live in the image
+        /// state drawFrame reads, so they are only marked here and emptied
+        /// under the lock by the next `keepScrollGhosts`.
+        fn clearScrollGhosts(self: *Self) void {
+            self.scroll_ghost.clearRetainingCapacity();
+            self.scroll_ghost_bg_live = false;
+            self.scroll_image_ghosts_stale = true;
         }
 
         /// Record that a key produced input, for the repaint detector's gate.
@@ -1391,7 +1456,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             h = (h ^ b) *% 0x100000001b3;
                         }
                         const cp = cell.codepoint();
-                        const glyph: u32 = if (!cell.hasText() or cp == ' ')
+                        // A Kitty image placeholder (U+10EEEE) is no
+                        // evidence either: its row is an index into an
+                        // image, and two different previews in yazi lined
+                        // up eight rows apart and slid as a scroll
+                        // (`shift=-8 cols=105..208`, on `j`). Images that
+                        // really scroll do so with the text around them.
+                        const glyph: u32 = if (!cell.hasText() or cp == ' ' or cp == 0x10EEEE)
                             ScrollAnim.blank_glyph
                         else
                             cp;
@@ -1469,7 +1540,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     if (self.scroll_anim.top < t or self.scroll_anim.bottom > b) {
                         self.scroll_anim.top = @max(self.scroll_anim.top, t);
                         self.scroll_anim.bottom = @min(self.scroll_anim.bottom, b);
-                        self.scroll_ghost.clearRetainingCapacity();
+                        // Drop only the label's copies, not the band.
+                        const nr = self.cells.size.rows;
+                        const nc = self.cells.size.columns;
+                        var r = shift.top;
+                        while (r <= shift.bottom and r < nr) : (r += 1) {
+                            if (r >= top and r <= bottom) continue;
+                            ScrollAnim.dropGhostCopies(shaderpkg.CellText, &self.scroll_ghost, self.cells.fg_rows[r + 1].items);
+                            if (self.scroll_ghost_bg_live and self.cells.bg_cells.len >= (r + 1) * nc)
+                                ScrollAnim.dropGhostBgCopies(shaderpkg.CellBg, self.scroll_ghost_bg.items, self.cells.bg_cells[r * nc ..][0..nc]);
+                        }
                     }
                 }
                 if (self.config.scroll_trace) log.info(
@@ -1867,6 +1947,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // our image state that drawFrame uses.
                     self.draw_mutex.lockUncancelable(global.io());
                     defer self.draw_mutex.unlock(global.io());
+                    if (self.config.scroll_animation) {
+                        self.scroll_prev_images.clearRetainingCapacity();
+                        self.scroll_prev_images.appendSlice(self.alloc, self.images.kitty_placements.items) catch
+                            self.scroll_prev_images.clearRetainingCapacity();
+                    }
                     self.images.kittyUpdate(
                         self.alloc,
                         state.terminal,
@@ -2002,7 +2087,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // detector's slide: they fill the band the lag uncovers.
                 if (@abs(ev.rows) > ScrollAnim.max_ghost_animated_rows) {
                     self.scroll_anim.stop();
-                    self.scroll_ghost.clearRetainingCapacity();
+                    self.clearScrollGhosts();
                     break :scroll;
                 }
 
@@ -2395,8 +2480,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .{ self.scroll_anim.top, self.scroll_anim.bottom }
             else
                 .{ 0, 0 };
+            // Whole device pixels. Glyphs are sampled from the atlas with
+            // linear filtering, so a fractional offset draws every glyph
+            // blended across two pixel rows: soft, doubled strokes and a
+            // visibly dimmer screen for as long as anything moves, which
+            // read as the screen dimming and brightening on every scroll.
+            // A rounded offset moves at most half a pixel off the curve.
             self.uniforms.scroll_anim = .{
-                if (@abs(total_off) < ScrollAnim.min_offset_px) 0 else total_off,
+                if (@abs(total_off) < ScrollAnim.min_offset_px) 0 else @round(total_off),
                 top,
                 bot,
                 0,
@@ -2409,7 +2500,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .{ 0, cols_f, 0, 0 };
 
             try frame.uniforms.sync(&.{self.uniforms});
-            try frame.cells_bg.sync(self.cells.bg_cells);
+            self.images.kitty_ghosts_live = self.scroll_anim.active() and
+                !self.scroll_image_ghosts_stale and self.images.kitty_ghosts.items.len > 0;
+            const ghost_bg = self.scroll_anim.active() and self.scroll_ghost_bg_live and
+                self.scroll_ghost_bg.items.len == ScrollAnim.ghostBgLen(self.cells.size.rows, self.cells.size.columns);
+            if (ghost_bg) {
+                // The kept rows' backgrounds ride after the grid's own; the
+                // shader finds them through `scroll_anim[3]`.
+                self.scroll_bg_view.clearRetainingCapacity();
+                try self.scroll_bg_view.append(self.alloc, .{ .items = self.cells.bg_cells, .capacity = self.cells.bg_cells.len });
+                try self.scroll_bg_view.append(self.alloc, self.scroll_ghost_bg);
+                _ = try frame.cells_bg.syncFromArrayLists(self.scroll_bg_view.items);
+                self.uniforms.scroll_anim[3] = @floatFromInt(ScrollAnim.max_ghost_rows);
+                try frame.uniforms.sync(&.{self.uniforms});
+            } else try frame.cells_bg.sync(self.cells.bg_cells);
             const fg_count = if (self.scroll_anim.active() and self.scroll_ghost.items.len > 0) ghosted: {
                 self.scroll_ghost_view.clearRetainingCapacity();
                 try self.scroll_ghost_view.appendSlice(self.alloc, self.cells.fg_rows);
@@ -3176,7 +3280,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 new_size.rows = state.rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
-                self.scroll_ghost.clearRetainingCapacity();
+                self.clearScrollGhosts();
 
                 // Update our uniforms accordingly, otherwise
                 // our background cells will be out of place.

@@ -497,6 +497,160 @@ pub fn captureGhosts(
     }
 }
 
+/// `shiftGhosts` for image row slices: anything with an `x: i32, y: i32`
+/// grid position (`image.Placement`). A slice back inside [top, bottom] is
+/// the model's again; one beyond `max_ghost_rows` can never be reached.
+pub fn shiftGhostSlices(comptime T: type, ghosts: *std.ArrayListUnmanaged(T), rows: isize, top: usize, bottom: usize) void {
+    const t: i32 = @intCast(top);
+    const b: i32 = @intCast(bottom);
+    const far: i32 = @intCast(max_ghost_rows);
+    var w: usize = 0;
+    for (ghosts.items) |g| {
+        const y = g.y - @as(i32, @intCast(rows));
+        if (y >= t and y <= b) continue;
+        if (y < t - far or y > b + far) continue;
+        var h = g;
+        h.y = y;
+        ghosts.items[w] = h;
+        w += 1;
+    }
+    ghosts.shrinkRetainingCapacity(w);
+}
+
+/// `captureGhosts` for image row slices: of `drawn` (the placements as last
+/// drawn), keep the one-row slices on the rows a scroll of `rows` carries out
+/// of [top, bottom], starting in [left, right], placed where they now are.
+/// Only unicode-placeholder slices qualify (z == -1, one row each); a
+/// classic placement spans rows and is not the grid's to move.
+pub fn captureGhostSlices(
+    comptime T: type,
+    alloc: std.mem.Allocator,
+    ghosts: *std.ArrayListUnmanaged(T),
+    drawn: []const T,
+    rows: isize,
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+) std.mem.Allocator.Error!void {
+    if (rows == 0 or bottom < top) return;
+    const n: usize = @min(@abs(rows), bottom - top + 1, max_ghost_rows);
+    const first: i32 = @intCast(if (rows > 0) top else bottom + 1 - n);
+    const last: i32 = first + @as(i32, @intCast(n)) - 1;
+    for (drawn) |p| {
+        if (p.z != -1) continue;
+        if (p.y < first or p.y > last) continue;
+        if (p.x < @as(i32, @intCast(left)) or p.x > @as(i32, @intCast(right))) continue;
+        var h = p;
+        h.y = p.y - @as(i32, @intCast(rows));
+        try ghosts.append(alloc, h);
+    }
+}
+
+/// Forget the kept copies of a row found PINNED (see `trimPinnedRows`):
+/// the glyphs in `row` (as last drawn) that some kept glyph duplicates in the
+/// same column, same glyph and colour. Before the row was recognised, the
+/// label on it slid with the region and was kept once per row scrolled; the
+/// rest of what was kept is real content and stays -- dropping all of it
+/// left the band behind the lag blank.
+pub fn dropGhostCopies(comptime T: type, ghosts: *std.ArrayListUnmanaged(T), row: []const T) void {
+    var w: usize = 0;
+    outer: for (ghosts.items) |g| {
+        for (row) |r| {
+            if (r.grid_pos[0] == g.grid_pos[0] and
+                std.mem.eql(u32, &r.glyph_pos, &g.glyph_pos) and
+                std.mem.eql(u8, &r.color, &g.color)) continue :outer;
+        }
+        ghosts.items[w] = g;
+        w += 1;
+    }
+    ghosts.shrinkRetainingCapacity(w);
+}
+
+/// The same for kept backgrounds: cells equal to the pinned row's own
+/// non-transparent background in that column.
+pub fn dropGhostBgCopies(comptime T: type, ext: []T, row_bg: []const T) void {
+    const cols = row_bg.len;
+    if (cols == 0 or ext.len % cols != 0) return;
+    const zero = std.mem.zeroes(T);
+    var e: usize = 0;
+    while (e < ext.len) : (e += cols) {
+        for (0..cols) |c| {
+            if (std.meta.eql(row_bg[c], zero)) continue;
+            if (std.meta.eql(ext[e + c], row_bg[c])) ext[e + c] = zero;
+        }
+    }
+}
+
+/// The backgrounds of the kept rows, as an EXTENDED grid: `max_ghost_rows`
+/// rows above row 0, the grid's own rows, and `max_ghost_rows` below, so
+/// grid row y is `ext` row `y + max_ghost_rows`. Only rows outside the
+/// region are ever set; the renderer appends this after the real
+/// background cells and the background shader reads it for the band.
+///
+/// Without it the band drew kept text on the global background: inline
+/// code, a highlighted line, a table header, lost their colour for the
+/// length of a slide -- "the first 4-8 lines look like a filter
+/// unhighlights them", on every hard flick.
+pub fn ghostBgLen(rows: usize, cols: usize) usize {
+    return (rows + 2 * max_ghost_rows) * cols;
+}
+
+/// Move the kept backgrounds with a scroll of `rows`, exactly as
+/// `shiftGhosts` moves the glyphs, and forget any that are back inside
+/// [top, bottom].
+pub fn shiftGhostBg(comptime T: type, ext: []T, cols: usize, rows: isize, top: usize, bottom: usize) void {
+    if (cols == 0 or ext.len % cols != 0) return;
+    const n: isize = @intCast(ext.len / cols);
+    const zero = std.mem.zeroes(T);
+    if (rows != 0) {
+        // new[e] = old[e + rows]: ascending when reading ahead, else descending.
+        var i: isize = 0;
+        while (i < n) : (i += 1) {
+            const e = if (rows > 0) i else n - 1 - i;
+            const src = e + rows;
+            const dst_row = ext[@as(usize, @intCast(e)) * cols ..][0..cols];
+            if (src < 0 or src >= n) {
+                @memset(dst_row, zero);
+            } else {
+                @memcpy(dst_row, ext[@as(usize, @intCast(src)) * cols ..][0..cols]);
+            }
+        }
+    }
+    const g: usize = max_ghost_rows;
+    const first = top + g;
+    const last = @min(bottom + g, @as(usize, @intCast(n)) - 1);
+    if (first <= last) @memset(ext[first * cols .. (last + 1) * cols], zero);
+}
+
+/// Keep the backgrounds of the rows a scroll of `rows` carries out of
+/// [top, bottom] (the same rows `captureGhosts` keeps), from `bg`, the grid's
+/// background cells as last drawn. Only columns [left, right].
+pub fn captureGhostBg(
+    comptime T: type,
+    ext: []T,
+    bg: []const T,
+    cols: usize,
+    rows: isize,
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+) void {
+    if (rows == 0 or cols == 0 or bottom < top or bg.len % cols != 0) return;
+    const grid_rows = bg.len / cols;
+    if (bottom >= grid_rows or ext.len != ghostBgLen(grid_rows, cols) or right >= cols) return;
+    const n: usize = @min(@abs(rows), bottom - top + 1, max_ghost_rows);
+    const first: usize = if (rows > 0) top else bottom + 1 - n;
+    for (first..first + n) |y| {
+        const e = @as(isize, @intCast(y + max_ghost_rows)) - rows;
+        if (e < 0 or e >= @as(isize, @intCast(ext.len / cols))) continue;
+        const dst = ext[@as(usize, @intCast(e)) * cols ..][0..cols];
+        @memset(dst, std.mem.zeroes(T));
+        @memcpy(dst[left .. right + 1], bg[y * cols + left .. y * cols + right + 1]);
+    }
+}
+
 /// The detector's key for one cell: the glyph in the low half, a hash of
 /// everything else drawn -- style, colour, width -- in the high half.
 ///
@@ -603,6 +757,50 @@ const weak_bridge_cols: usize = 0;
 /// is what separates it from yazi's selection glyphs a blank column to the
 /// RIGHT of the relative numbers (see the test of that name).
 const edge_bridge_cols: usize = 2;
+
+/// No region narrower than this is a scroll. The strip that shifts alone is
+/// a relative-number gutter being RELABELLED as the cursor moves over a list
+/// that holds still: yazi at the bottom of a folder, where the list stops
+/// scrolling and the cursor walks down. Measured `cols=27..28` on every `j`
+/// there, which slid the numbers a row out of step with the selection bar
+/// beside them ("58" and its icon detached from the rest of the row). A pane
+/// that really scrolls is wider than any gutter.
+const min_region_cols: usize = 6;
+
+/// The widest grid `detectShift` classifies with dividers; wider falls back
+/// to splitting at every contradiction, as before.
+const max_detect_cols: usize = 1024;
+
+/// A column unchanged and non-blank on this share of rows divides panes.
+const divider_ratio: f32 = 0.6;
+
+fn columnVerdict(
+    comptime V: type,
+    cur: []const u64,
+    prev: []const u64,
+    rows: usize,
+    cols: usize,
+    c: usize,
+    shift: isize,
+    min_rows: usize,
+    min_ratio: f32,
+) V {
+    const n: isize = @intCast(rows);
+    var changed: usize = 0;
+    var moved: usize = 0;
+    for (0..rows) |i| {
+        const row = i * cols;
+        if (!testifies(cur[row + c], prev[row + c])) continue;
+        changed += 1;
+        const j = @as(isize, @intCast(i)) + shift;
+        if (j < 0 or j >= n) continue;
+        if (cur[row + c] == prev[@as(usize, @intCast(j)) * cols + c]) moved += 1;
+    }
+    if (changed == 0) return .neutral;
+    const agrees = @as(f32, @floatFromInt(moved)) >= min_ratio * @as(f32, @floatFromInt(changed));
+    if (agrees and moved > 0) return if (moved >= min_rows) .strong else .weak;
+    return if (changed >= min_rows) .contradict else .neutral;
+}
 
 /// Whether a cell can be evidence about a scroll: its text changed, to some
 /// text. See `detectShift`.
@@ -736,26 +934,49 @@ pub fn detectShift(
     var cl_first: ?usize = null;
     var cl_last: usize = 0;
     var cl_strong: usize = 0;
-    for (0..cols) |c| {
-        var changed: usize = 0;
-        var moved: usize = 0;
-        for (0..rows) |i| {
-            const row = i * cols;
-            if (!testifies(cur[row + c], prev[row + c])) continue;
-            changed += 1;
-            const j = @as(isize, @intCast(i)) + best_shift;
-            if (j < 0 or j >= n) continue;
-            if (cur[row + c] == prev[@as(usize, @intCast(j)) * cols + c]) moved += 1;
+    // Pass 1: every column's verdict, and which columns are DIVIDERS --
+    // unchanged and non-blank down most of the screen: tmux's `│`, yazi's
+    // borders, an nvim split's separator, or a whole pane holding still.
+    var verdicts: [max_detect_cols]Verdict = undefined;
+    var divider: [max_detect_cols]bool = undefined;
+    const judged = cols <= max_detect_cols;
+    if (judged) for (0..cols) |c| {
+        verdicts[c] = columnVerdict(Verdict, cur, prev, rows, cols, c, best_shift, min_rows, min_ratio);
+        var still: usize = 0;
+        for (0..rows) |i_| {
+            const k = cur[i_ * cols + c];
+            if (k == prev[i_ * cols + c] and glyphOf(k) != blank_glyph) still += 1;
         }
-        const verdict: Verdict = verdict: {
-            if (changed == 0) break :verdict .neutral;
-            const agrees = @as(f32, @floatFromInt(moved)) >=
-                min_ratio * @as(f32, @floatFromInt(changed));
-            if (agrees and moved > 0) {
-                break :verdict if (moved >= min_rows) .strong else .weak;
-            }
-            break :verdict if (changed >= min_rows) .contradict else .neutral;
-        };
+        divider[c] = @as(f32, @floatFromInt(still)) >= divider_ratio * @as(f32, @floatFromInt(rows));
+    };
+    // Pass 2: a contradiction only splits the region across a DIVIDER. Within
+    // one pane, columns that disagree with the shift are its own text having
+    // changed as well as moved -- a paragraph re-wrapping as render-markdown
+    // conceals a formula, which is the TEAR at CSAPP 2's line 1273: measured
+    // `cols=0..145` (and 0..196, 5..170) while the prose was one window wide,
+    // so the left of every row slid and the right did not. A pane that mostly
+    // disagrees stays a genuinely separate region.
+    if (judged) {
+        var a: usize = 0;
+        while (a < cols) {
+            var b = a;
+            while (b < cols and !divider[b]) b += 1;
+            var strong: usize = 0;
+            var against: usize = 0;
+            for (a..b) |c| switch (verdicts[c]) {
+                .strong => strong += 1,
+                .contradict => against += 1,
+                else => {},
+            };
+            if (against <= strong) for (a..b) |c| {
+                // Weak: part of the scroll where it touches it, never a bound on its own.
+                if (verdicts[c] == .contradict) verdicts[c] = .weak;
+            };
+            a = b + 1;
+        }
+    }
+    for (0..cols) |c| {
+        const verdict: Verdict = if (judged) verdicts[c] else columnVerdict(Verdict, cur, prev, rows, cols, c, best_shift, min_rows, min_ratio);
         switch (verdict) {
             // A genuinely independent region: a tmux split, or yazi's file
             // list when its selection moves against the preview's scroll.
@@ -853,6 +1074,7 @@ pub fn detectShift(
         }
     }
     if (bottom - t + 1 < min_rows) return null;
+    if (right - l + 1 < @min(min_region_cols, cols)) return null;
 
     return .{ .rows = best_shift, .top = t, .bottom = bottom, .left = l, .right = right };
 }
@@ -1257,11 +1479,9 @@ test "detectShift: a selection bar moving is not the list scrolling" {
             cur[k] = cellKey(glyph, if (i == sel_new) bar else 0);
         }
     }
-    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
-    try testing.expectEqual(@as(isize, -1), got.rows);
-    // The gutter, and nothing of the names beside it.
-    try testing.expectEqual(@as(usize, 0), got.left);
-    try testing.expectEqual(@as(usize, 1), got.right);
+    // Not the names -- and since 2026-09-28 not the gutter either: numbers
+    // relabelled under a cursor are not a scroll (`min_region_cols`).
+    try testing.expectEqual(@as(?Shift, null), detectShift(&cur, &prev, rows, cols, 6, 0.6));
 }
 
 test "detectShift: a status line below the region does not stretch it" {
@@ -1287,11 +1507,12 @@ test "detectShift: a status line below the region does not stretch it" {
         prev[23 * cols + c] = cellKey(@intCast(700 + c), 2); // status: old name
         cur[23 * cols + c] = cellKey(@intCast(900 + c), 2); // status: new name
     }
-    for (1..21) |i| {
-        // Distinct per row, moving down one: the gutter.
-        prev[i * cols + 0] = cellKey(@intCast(100 + i), 0);
-        cur[i * cols + 0] = cellKey(@intCast(100 + i - 1), 0);
-    }
+    for (1..21) |i| for (0..10) |c| {
+        // Distinct per row, moving down one: the list (ten columns wide, so
+        // it is a region at all -- see `min_region_cols`).
+        prev[i * cols + c] = cellKey(@intCast(100 + i * cols + c), 0);
+        cur[i * cols + c] = cellKey(@intCast(100 + (i - 1) * cols + c), 0);
+    };
     const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
     try testing.expectEqual(@as(isize, -1), got.rows);
     try testing.expectEqual(@as(usize, 1), got.top);
@@ -1320,10 +1541,49 @@ test "detectShift: the selection's own glyphs beside a gutter do not slide with 
     cur[10 * cols + 2] = cellKey('(', 5);
     prev[9 * cols + 3] = cellKey('D', 5);
     cur[10 * cols + 3] = cellKey('D', 5);
+    // Neither the glyphs nor, since `min_region_cols`, the lone gutter.
+    try testing.expectEqual(@as(?Shift, null), detectShift(&cur, &prev, rows, cols, 6, 0.6));
+}
+
+/// One window of prose scrolled up a row, whose right third also changed on
+/// most rows (re-wrapped), with an optional divider column at 40.
+fn rewrapFrames(comptime rows: usize, comptime cols: usize, with_divider: bool, prev: *[rows * cols]u64, cur: *[rows * cols]u64) void {
+    for (0..rows) |i| for (0..cols) |c| {
+        const k = i * cols + c;
+        if (with_divider and c == 40) {
+            prev[k] = cellKey('|', 1);
+            cur[k] = cellKey('|', 1);
+        } else if (c < 40) {
+            prev[k] = cellKey(@intCast(10_000 + i * cols + c), 0);
+            cur[k] = cellKey(@intCast(10_000 + (i + 1) * cols + c), 0);
+        } else {
+            prev[k] = cellKey(@intCast(50_000 + i * cols + c), 0);
+            cur[k] = cellKey(@intCast(90_000 + i * cols + c), 0); // matches nothing
+        }
+    };
+}
+
+test "detectShift: text re-wrapping inside one pane does not tear it" {
+    const rows = 30;
+    const cols = 60;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    rewrapFrames(rows, cols, false, &prev, &cur);
     const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
-    try testing.expectEqual(@as(isize, -1), got.rows);
+    try testing.expectEqual(@as(isize, 1), got.rows);
     try testing.expectEqual(@as(usize, 0), got.left);
-    try testing.expectEqual(@as(usize, 0), got.right);
+    try testing.expectEqual(@as(usize, cols - 1), got.right);
+}
+
+test "detectShift: control -- the same disagreement behind a divider is a separate pane" {
+    const rows = 30;
+    const cols = 60;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    rewrapFrames(rows, cols, true, &prev, &cur);
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(usize, 0), got.left);
+    try testing.expectEqual(@as(usize, 39), got.right);
 }
 
 test "detectShift: bullets at the left edge slide with their text" {
@@ -1865,6 +2125,85 @@ test "spring: a flood stiffens instead of piling against the cap" {
 }
 
 const TestGlyph = struct { grid_pos: [2]u16, id: u32 = 0 };
+
+test "ghost slices: an image row leaving the top is kept above it" {
+    const S = struct { x: i32, y: i32, z: i32 };
+    var ghosts: std.ArrayListUnmanaged(S) = .empty;
+    defer ghosts.deinit(testing.allocator);
+    // Image rows at grid rows 1..4, one classic placement at row 1 (z 5).
+    const drawn = [_]S{
+        .{ .x = 3, .y = 1, .z = -1 }, .{ .x = 3, .y = 2, .z = -1 },
+        .{ .x = 3, .y = 3, .z = -1 }, .{ .x = 3, .y = 4, .z = -1 },
+        .{ .x = 3, .y = 1, .z = 5 },
+    };
+    // Content up by 2 over rows 1..10: rows 1 and 2 leave.
+    shiftGhostSlices(S, &ghosts, 2, 1, 10);
+    try captureGhostSlices(S, testing.allocator, &ghosts, &drawn, 2, 1, 10, 0, 20);
+    try testing.expectEqual(@as(usize, 2), ghosts.items.len);
+    try testing.expectEqual(@as(i32, -1), ghosts.items[0].y);
+    try testing.expectEqual(@as(i32, 0), ghosts.items[1].y);
+    // Back down by 2: both are the model's again.
+    shiftGhostSlices(S, &ghosts, -2, 1, 10);
+    try testing.expectEqual(@as(usize, 0), ghosts.items.len);
+}
+
+test "ghost slices: control -- a slice outside the region's columns is not kept" {
+    const S = struct { x: i32, y: i32, z: i32 };
+    var ghosts: std.ArrayListUnmanaged(S) = .empty;
+    defer ghosts.deinit(testing.allocator);
+    const drawn = [_]S{.{ .x = 30, .y = 1, .z = -1 }};
+    try captureGhostSlices(S, testing.allocator, &ghosts, &drawn, 2, 1, 10, 0, 20);
+    try testing.expectEqual(@as(usize, 0), ghosts.items.len);
+}
+
+test "ghosts: copies of a pinned label are dropped, the rest kept" {
+    const G = struct { grid_pos: [2]u16, glyph_pos: [2]u32, color: [4]u8 };
+    var ghosts: std.ArrayListUnmanaged(G) = .empty;
+    defer ghosts.deinit(testing.allocator);
+    const label = [_]G{
+        .{ .grid_pos = .{ 5, 20 }, .glyph_pos = .{ 1, 1 }, .color = .{ 9, 9, 9, 255 } },
+        .{ .grid_pos = .{ 6, 20 }, .glyph_pos = .{ 2, 1 }, .color = .{ 9, 9, 9, 255 } },
+    };
+    try ghosts.appendSlice(testing.allocator, &.{
+        .{ .grid_pos = .{ 5, 22 }, .glyph_pos = .{ 1, 1 }, .color = .{ 9, 9, 9, 255 } }, // copy
+        .{ .grid_pos = .{ 6, 23 }, .glyph_pos = .{ 2, 1 }, .color = .{ 9, 9, 9, 255 } }, // copy
+        .{ .grid_pos = .{ 5, 24 }, .glyph_pos = .{ 7, 1 }, .color = .{ 9, 9, 9, 255 } }, // text
+        .{ .grid_pos = .{ 9, 22 }, .glyph_pos = .{ 1, 1 }, .color = .{ 9, 9, 9, 255 } }, // same glyph, other column
+    });
+    dropGhostCopies(G, &ghosts, &label);
+    try testing.expectEqual(@as(usize, 2), ghosts.items.len);
+    try testing.expectEqual(@as(u32, 7), ghosts.items[0].glyph_pos[0]);
+    try testing.expectEqual(@as(u16, 9), ghosts.items[1].grid_pos[0]);
+}
+
+test "ghost bg: a row leaving the top keeps its colours above the region" {
+    const rows = 6;
+    const cols = 4;
+    var bg: [rows * cols]u32 = undefined;
+    for (&bg, 0..) |*v, i| v.* = @intCast(100 + i);
+    var ext = [_]u32{0} ** ghostBgLen(rows, cols);
+    // Content up by 2 over rows 1..4, columns 1..2: rows 1 and 2 leave.
+    shiftGhostBg(u32, &ext, cols, 2, 1, 4);
+    captureGhostBg(u32, &ext, &bg, cols, 2, 1, 4, 1, 2);
+    const g = max_ghost_rows;
+    // Grid row 1 is now at y = -1, row 2 at y = 0 (above region top 1).
+    try testing.expectEqualSlices(u32, &.{ 0, 105, 106, 0 }, ext[(g - 1) * cols ..][0..cols]);
+    try testing.expectEqualSlices(u32, &.{ 0, 109, 110, 0 }, ext[(g + 0) * cols ..][0..cols]);
+    // A second push by 1 carries them up one more and drops nothing yet.
+    shiftGhostBg(u32, &ext, cols, 1, 1, 4);
+    try testing.expectEqualSlices(u32, &.{ 0, 105, 106, 0 }, ext[(g - 2) * cols ..][0..cols]);
+    // Scrolling back down by 3 brings row 2's colours back inside: forgotten.
+    shiftGhostBg(u32, &ext, cols, -3, 1, 4);
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0 }, ext[(g + 1) * cols ..][0..cols]);
+}
+
+test "ghost bg: control -- without a capture the band has no colour" {
+    const rows = 6;
+    const cols = 4;
+    var ext = [_]u32{0} ** ghostBgLen(rows, cols);
+    shiftGhostBg(u32, &ext, cols, 2, 1, 4);
+    for (ext) |v| try testing.expectEqual(@as(u32, 0), v);
+}
 
 test "ghosts: rows leaving the top are kept above it, in their columns only" {
     const alloc = std.testing.allocator;
