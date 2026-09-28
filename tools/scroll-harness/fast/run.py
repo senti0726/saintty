@@ -318,7 +318,7 @@ def main():
                 print(f"{name}: PROBE FAILED -- keys are not reaching the test nvim; skipped")
                 continue
             if sc.keys:
-                rig.reset(sc.line, bottom=True)
+                rig.reset(sc.line, bottom=not sc.top)
                 rig.focus()
             g0, n0 = rig.log.stat().st_size, (rig.nvlog.stat().st_size if rig.nvlog.exists() else 0)
             rec.events.clear()

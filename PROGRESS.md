@@ -2167,3 +2167,54 @@ of the glide it caught. It now timestamps key and steps inside nvim.
 Tools: `press_cuts.py <run> [scenario]` -- per-press verdicts (all animated /
 snapped / whole move cut), which presses cut, and first-step / step-gap per
 fifth of the sweep.
+
+## 2026-09-29 — torn frames, overlays that stay, tmux unzoom, figures on repaint scrolls; the 4K panel
+
+1. **Torn frames (`67b9ee211`).** With GTK, drawFrame runs on the app thread
+   while updateFrame runs on the renderer thread. kittyUpdate, the scroll push
+   and ghost capture ran outside `draw_mutex`, so a draw could land between
+   them and rebuildCells: the old grid at the new offset, or new image
+   placements over the old grid. For one frame everything, or just a figure,
+   sat a scroll off and came back ("the image jumps a line and back").
+   updateFrame now holds the lock from the critical section to the end of the
+   rebuild. A/B against the previous build: no regression (wheel fast 88-89
+   vs 82-85).
+2. **Overlays stay put (`3ed73620e`).** `computePins` finds a one-row coloured
+   run that starts at the same column as the previous frame and is not what
+   the shift carried there: yazi's selection bar (as wide as the hovered name,
+   so only its left end is stable), Claude Code's "Jump to bottom" box, a
+   riding cursor line. Those cells are undisplaced, and sliding text passes
+   under them. The mask is appended to the bg buffer at offset
+   `scroll_anim_cols.w`, and read by cell_bg.f, cell_text.v and cell_text.f.
+   Its copies never enter the band: glyphs are filtered, and the bg under them
+   is filled from the left. This replaces cutting the label's whole row out,
+   which the user saw as the rest of that line freezing.
+   Rules paid for on screen:
+   - a tall block's edge rows are not pinned (holes in the green diff);
+   - pins are computed over the animation's union, not the push;
+   - the mask persists between animations for capture filtering;
+   - the slid copy of a pinned bg draws nothing.
+3. **tmux unzoom.** tmux redraws a row of panes with a SCROLL of the
+   region's whole height (rows=16 over 2..17). That is a clear, so it is no
+   longer animated: 134 animated frames per 3 zoom cycles → 0
+   (`tmux_zoom.py`). `layoutChanged` also refuses repaint detection when a
+   full-height vertical border appears or vanishes.
+4. **Claude Code tears.** Ragged line tails past a quiet column were left
+   out (`cols=0..132`). Weak evidence anywhere in the run's pane now joins it.
+5. **Figures on repaint scrolls (`1bf5add11`).** A placeholder's row/column
+   are combining marks, which the cell hash ignored, so every figure row
+   hashed alike, read as unchanged, and snapped while the text slid (`j`
+   above a half-visible figure: rows 1..44 of 52 → 1..52). Graphemes are
+   hashed now. Placeholders still never testify, but they mark moved rows.
+6. **Lag cap 48 rows, slides up to 64.** nvim got faster (another session
+   turned off obsidian.nvim's 10 s vault-wide rg) and delivers 36-57 row
+   batches. A/B, 3 blocks: wheel fast 86-88 → 91-94, touchpad repeat
+   95-96 → 96-98.
+
+The 4K AW2725Q is now connected: cells are 38 px, so each row of scroll is
+twice the pixels of the laptop panel.
+
+Harness: `yazi.py` (`--pre=N` j presses to reach the list-scrolls-under-cursor
+case), `tmux_zoom.py`, and new scenarios `hold_j_{figs,maths,tables}`,
+`hold_k{,_maths,_tables}`, `wheel_fast_up`, `tp_fast_up`, `tp_slow_up`
+(Scenario `top=True` starts a key scenario with the cursor on the top row).

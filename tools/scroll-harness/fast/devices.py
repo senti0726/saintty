@@ -84,11 +84,12 @@ class Mouse:
         self.ui.syn()
         self.rec.mark("wheel", direction / 8)
 
-    def notches(self, schedule):
-        """schedule: iterable of absolute monotonic times (s), one 1/8 step each."""
+    def notches(self, schedule, direction=1):
+        """schedule: iterable of absolute monotonic times (s), one 1/8 step each.
+        direction -1 scrolls back up."""
         for t in schedule:
             sleep_until(t)
-            self.tick(1)
+            self.tick(direction)
 
 
 class Touchpad:

@@ -16,8 +16,11 @@ J = 36  # KEY_J
 
 
 class Scenario:
-    def __init__(self, fn, line=300, settle=2.0, keys=False, doc="", lua=""):
+    def __init__(self, fn, line=300, settle=2.0, keys=False, doc="", lua="", top=False):
         self.fn, self.line, self.settle, self.keys, self.doc = fn, line, settle, keys, doc
+        # Key scenarios start with the cursor on the bottom row (so j scrolls
+        # at once); `top` puts it on the top row instead, for k.
+        self.top = top
         # Run in the test nvim before the gesture (see the *_native scenarios).
         self.lua = lua
 
@@ -102,7 +105,16 @@ def hold_j(rec, **_):
 
 
 # ---- wheel (MX Anywhere 3S-like, 1/8-notch hi-res steps) -------------------
-def _wheel(mouse, rate_of_t, duration):
+def hold_k(rec, **_):
+    """Hold k for 4 s from the top row: the same, scrolling back up."""
+    key(37, True)
+    rec.mark("key_down", -1)
+    time.sleep(4.0)
+    key(37, False)
+    rec.mark("key_up", 0)
+
+
+def _wheel(mouse, rate_of_t, duration, direction=1):
     """rate_of_t(t) in notches/s; integrates to 1/8-notch step times."""
     times, t, acc, dt = [], 0.0, 0.0, 0.0005
     start = time.monotonic() + 0.05
@@ -112,7 +124,7 @@ def _wheel(mouse, rate_of_t, duration):
             times.append(start + t)
             acc -= 1
         t += dt
-    mouse.notches(times)
+    mouse.notches(times, direction)
 
 
 def wheel_slow(mouse, **_):
@@ -131,6 +143,20 @@ def wheel_flick(mouse, **_):
 
 
 # ---- touchpad (two-finger) -------------------------------------------------
+def wheel_fast_up(mouse, **_):
+    """wheel_fast, scrolling back up."""
+    _wheel(mouse, lambda t: 20, 2.0, direction=-1)
+
+
+def tp_fast_up(pad, **_):
+    """tp_fast, fingers the other way: scrolling back up."""
+    pad.stroke(lambda t: 150 * t, 0.4, sign=-1)
+
+
+def tp_slow_up(pad, **_):
+    pad.stroke(lambda t: 15 * t, 3.0, sign=-1)
+
+
 def tp_slow(pad, **_):
     """Reading drag: 15 mm/s for 3 s."""
     pad.stroke(lambda t: 15 * t, 3.0)
@@ -156,6 +182,17 @@ def tp_repeat(pad, **_):
 ALL = {
     "j_spam": Scenario(j_spam, keys=True),
     "hold_j": Scenario(hold_j, keys=True, settle=2.5),
+    # The user's report: held j/k stutter where CSAPP 2 is dense -- figures
+    # (~570), maths (~1230), big tables (~2540). The line is the view's top.
+    "hold_j_figs": Scenario(hold_j, line=560, keys=True, settle=2.5),
+    "hold_j_maths": Scenario(hold_j, line=1210, keys=True, settle=2.5),
+    "hold_j_tables": Scenario(hold_j, line=2520, keys=True, settle=2.5),
+    "hold_k": Scenario(hold_k, line=700, keys=True, top=True, settle=2.5),
+    "hold_k_maths": Scenario(hold_k, line=1330, keys=True, top=True, settle=2.5),
+    "hold_k_tables": Scenario(hold_k, line=2640, keys=True, top=True, settle=2.5),
+    "wheel_fast_up": Scenario(wheel_fast_up, line=900),
+    "tp_fast_up": Scenario(tp_fast_up, line=900, settle=3.0),
+    "tp_slow_up": Scenario(tp_slow_up, line=900),
     "wheel_slow": Scenario(wheel_slow),
     "wheel_fast": Scenario(wheel_fast),
     "wheel_flick": Scenario(wheel_flick, settle=3.0),
