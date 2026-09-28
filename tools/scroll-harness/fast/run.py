@@ -235,7 +235,19 @@ for (var i = 0; i < w.length; i++)
         time.sleep(0.5)
         return self.view() != before
 
-    def park_pointer(self, mouse):
+    def park_pointer(self, mouse, tries=3):
+        """Retry: right after the screen wakes the first attempt sometimes
+        lands nowhere (getmousepos stays at row 1, col 1)."""
+        for i in range(tries):
+            try:
+                return self._park_pointer(mouse)
+            except SystemExit as e:
+                if i == tries - 1:
+                    raise
+                print(f"{e}; retrying")
+                time.sleep(1.0)
+
+    def _park_pointer(self, mouse):
         """Put the pointer over the middle of the text and prove it is there.
 
         Ghostty reports a wheel event at the last pointer position it saw, and
