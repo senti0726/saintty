@@ -19,7 +19,17 @@ vec4 cell_bg() {
     // stationary background. Undo the shift to find which cell is under this
     // pixel. Rows that shift out of the region are the gap left behind by the
     // scroll and draw as nothing.
-    if (scroll_anim.x != 0.0 &&
+    // A pinned cell (an overlay the scroll passes under: a selection bar, a
+    // label) keeps its own background, undisplaced. The mask rides after
+    // the bg cells at offset `scroll_anim_cols.w`.
+    bool pinned_here = false;
+    if (scroll_anim.x != 0.0 && scroll_anim_cols.w > 0.0 &&
+        grid_pos.x >= 0 && grid_pos.y >= 0 &&
+        grid_pos.x < int(grid_size.x) && grid_pos.y < int(grid_size.y)) {
+        uint pidx = uint(scroll_anim_cols.w) + uint(grid_pos.y) * grid_size.x + uint(grid_pos.x);
+        pinned_here = (cells[pidx] & 0xFFu) != 0u;
+    }
+    if (!pinned_here && scroll_anim.x != 0.0 &&
         float(grid_pos.y) >= scroll_anim.y &&
         float(grid_pos.y) <= scroll_anim.z &&
         float(grid_pos.x) >= scroll_anim_cols.x &&
@@ -57,6 +67,11 @@ vec4 cell_bg() {
                     );
             }
             return vec4(0.0);
+        }
+        // A pinned cell is drawn in place (above); its slid copy is not.
+        if (scroll_anim_cols.w > 0.0 && grid_pos.x >= 0 && grid_pos.x < int(grid_size.x)) {
+            uint sidx = uint(scroll_anim_cols.w) + uint(gy) * grid_size.x + uint(grid_pos.x);
+            if ((cells[sidx] & 0xFFu) != 0u) return vec4(0.0);
         }
         grid_pos.y = gy;
     }

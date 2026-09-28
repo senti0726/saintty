@@ -86,7 +86,7 @@ pub const pace_intervals: f32 = 4;
 /// possible at all: without them the band is empty -- the rows left the grid
 /// the moment the application scrolled -- and a deep lag reads as a hole.
 /// More than `ghost_lag_rows`, so the deepest lag still has rows to draw.
-pub const max_ghost_rows: usize = 56;
+pub const max_ghost_rows: usize = 72;
 
 /// With ghost rows to fill the band, how far behind the model the drawn
 /// position may fall. A fast wheel spin in nvim arrives as 3-6 row batches
@@ -101,7 +101,13 @@ pub const max_ghost_rows: usize = 56;
 /// wheel 90-96 -> 100, touchpad drag ~95 -> 99-100, repeated drags ~85 ->
 /// 91-94, wheel flick ~92 -> 96-97, touchpad flick ~95 -> 96. The price is
 /// how stale the band may get, and it is drawn from real rows, not a hole.
-pub const ghost_lag_rows: f32 = 40;
+///
+/// 40 -> 48 (2026-09-29): with nvim now keeping up, a fast wheel spin arrives
+/// as 36-57 row batches and sat pinned at 40 (on the 4K panel rows are 38 px,
+/// so every scroll is twice the pixels). Alternating A/B, 3 blocks: fast
+/// wheel 86-88 -> 91-94, repeated touchpad drags 95-96 -> 96-98, flicks
+/// unchanged or +1.
+pub const ghost_lag_rows: f32 = 48;
 
 /// The largest single application scroll that slides rather than snaps,
 /// with ghost rows available. A touchpad flick in nvim delivers up to ~30
@@ -110,7 +116,8 @@ pub const ghost_lag_rows: f32 = 40;
 /// half-page jump (`Ctrl-D`, ~29 rows) now slides too, as an Electron editor's
 /// Page Down does; a full page still snaps. Up from 40 with `ghost_lag_rows`,
 /// for the 42-row batches measured in a wheel flick.
-pub const max_ghost_animated_rows: isize = 48;
+/// 48 -> 64 with the lag cap, for those 57-row batches.
+pub const max_ghost_animated_rows: isize = 64;
 
 /// The stiffness of the `spring` easing, as a multiple of 1/duration. At 6 a
 /// single one-row push from rest is inside half a pixel in ~0.6 x duration,
@@ -582,6 +589,85 @@ pub fn dropGhostBgCopies(comptime T: type, ext: []T, row_bg: []const T) void {
     }
 }
 
+/// A run of this many cells pins (see `computePins`).
+pub const pin_min_cells: usize = 4;
+
+/// Mark the cells that are an OVERLAY on a scroll: a coloured background
+/// that stayed where it was on screen while the content under it moved.
+/// yazi's selection bar when the list scrolls under a cursor that stays on
+/// its row; Claude Code's "Jump to bottom" box on top of the transcript; an
+/// editor's cursor line riding the window's edge. Displacing them slid the
+/// bar away from the line number and caps drawn beside it, or dragged the
+/// label along with the text -- and pinning the whole row instead (the
+/// earlier fix for the label) froze the text beside it too.
+///
+/// A cell pins when its background is not the default, is the same as the
+/// frame before at the same place, and is NOT what the shift carried there.
+/// Runs of `pin_min_cells` only: an inline-code highlight coinciding with
+/// the one above it is a few cells, a bar or a label is a run. `pins` gets
+/// 255 in byte 0 for a pinned cell, 0 otherwise, over the whole grid.
+pub fn computePins(
+    comptime T: type,
+    pins: []T,
+    bg_prev: []const T,
+    bg_now: []const T,
+    cols: usize,
+    shift: isize,
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+) void {
+    const zero = std.mem.zeroes(T);
+    @memset(pins, zero);
+    if (cols == 0 or bg_now.len != bg_prev.len or pins.len != bg_now.len) return;
+    const rows = bg_now.len / cols;
+    if (bottom >= rows or right >= cols or top > bottom or left > right) return;
+    var mark = zero;
+    mark[0] = 255;
+    const eq = std.meta.eql;
+    for (top..bottom + 1) |r| {
+        const src = @as(isize, @intCast(r)) + shift;
+        const src_row: ?usize = if (src < 0 or src >= @as(isize, @intCast(rows))) null else @intCast(src);
+        var c = left;
+        while (c <= right) {
+            const v = bg_now[r * cols + c];
+            if (eq(v, zero)) {
+                c += 1;
+                continue;
+            }
+            // A run of one colour in this frame: [c, e).
+            var e = c + 1;
+            while (e <= right and eq(bg_now[r * cols + e], v)) e += 1;
+            // The previous frame's run of that colour starting at the SAME
+            // column: [c, pe). yazi's bar is as wide as the hovered name, so
+            // its right end moves; its left end and colour do not.
+            const starts_here = eq(bg_prev[r * cols + c], v) and
+                (c == 0 or !eq(bg_prev[r * cols + c - 1], v));
+            var pe = c;
+            if (starts_here) {
+                pe = c + 1;
+                while (pe <= right and eq(bg_prev[r * cols + pe], v)) pe += 1;
+            }
+            // ...and not simply what the shift carried there.
+            const carried = if (src_row) |sr| eq(bg_prev[sr * cols + c], v) and
+                (c == 0 or !eq(bg_prev[sr * cols + c - 1], v)) else false;
+            // One row tall: the rows above and below do not carry the same
+            // colour at the run's start. The first and last rows of a tall
+            // coloured block (Claude Code's green diff, a code block) are
+            // also "the same here, not what the shift carried" -- and
+            // pinning them froze a band of the block while the rest slid.
+            const above = r > 0 and eq(bg_now[(r - 1) * cols + c], v);
+            const below = r + 1 < rows and eq(bg_now[(r + 1) * cols + c], v);
+            const len = @max(e, pe) - c;
+            if (starts_here and !carried and !above and !below and len >= pin_min_cells) {
+                @memset(pins[r * cols + c .. r * cols + @max(e, pe)], mark);
+            }
+            c = e;
+        }
+    }
+}
+
 /// The backgrounds of the kept rows, as an EXTENDED grid: `max_ghost_rows`
 /// rows above row 0, the grid's own rows, and `max_ghost_rows` below, so
 /// grid row y is `ext` row `y + max_ghost_rows`. Only rows outside the
@@ -767,6 +853,35 @@ const edge_bridge_cols: usize = 2;
 /// that really scrolls is wider than any gutter.
 const min_region_cols: usize = 6;
 
+fn isVerticalRule(key: u64) bool {
+    const g = glyphOf(key);
+    return g == 0x2502 or g == 0x2503 or g == 0x2551 or g == '|' or
+        (g >= 0x2500 and g <= 0x257F and (g == 0x251C or g == 0x2524 or g == 0x253C));
+}
+
+/// A pane border that appears or disappears is a LAYOUT change, not a scroll.
+/// tmux's zoom (`C-a z`) out of one of eight Claude Code panes redrew the
+/// whole row of panes, and each pane's text, shifted by the new geometry,
+/// matched itself a few rows off: every pane in that row slid. A column that
+/// is a vertical rule on at least half the rows in one frame and on under a
+/// tenth in the other is a border coming or going. A table's `│` scrolling
+/// in by a row moves that count by one, never across both thresholds.
+pub fn layoutChanged(cur: []const u64, prev: []const u64, rows: usize, cols: usize) bool {
+    if (rows < 4) return false;
+    for (0..cols) |c| {
+        var a: usize = 0;
+        var b: usize = 0;
+        for (0..rows) |i| {
+            if (isVerticalRule(cur[i * cols + c])) a += 1;
+            if (isVerticalRule(prev[i * cols + c])) b += 1;
+        }
+        const hi = rows / 2;
+        const lo = rows / 10;
+        if ((a >= hi and b <= lo) or (b >= hi and a <= lo)) return true;
+    }
+    return false;
+}
+
 /// The widest grid `detectShift` classifies with dividers; wider falls back
 /// to splitting at every contradiction, as before.
 const max_detect_cols: usize = 1024;
@@ -850,6 +965,8 @@ pub fn detectShift(
     if (rows == 0 or cols == 0) return null;
     if (cur.len != rows * cols or prev.len != cur.len) return null;
     const n: isize = @intCast(rows);
+
+    if (layoutChanged(cur, prev, rows, cols)) return null;
 
     // The shift explaining the most changed cells.
     var best_shift: isize = 0;
@@ -1023,7 +1140,29 @@ pub fn detectShift(
             },
         }
     }
-    const l = left orelse return null;
+    var l = left orelse return null;
+
+    // Within the pane that holds the run -- the columns between the dividers
+    // around it -- thin evidence anywhere belongs to the same scroll. The
+    // ragged right ends of long lines are weak columns, and a column with
+    // nothing changed between them and the text cut them off: in Claude Code
+    // `cols=0..132` (also 0..95, 0..158) while lines ran on to column 200,
+    // so their tails stood still while their heads slid -- a tear. What the
+    // touching rule guards against, a coincidence across a pane border, has
+    // a divider in between and stays out.
+    if (judged) {
+        var pa = l;
+        while (pa > 0 and !divider[pa - 1]) pa -= 1;
+        var pb = right;
+        while (pb + 1 < cols and !divider[pb + 1]) pb += 1;
+        for (pa..pb + 1) |c| switch (verdicts[c]) {
+            .strong, .weak => {
+                if (c < l) l = c;
+                if (c > right) right = c;
+            },
+            else => {},
+        };
+    }
 
     // The rows that MOVED, within those columns only -- not every row that
     // changed there. yazi's status bar changes on every key (it names the
@@ -1586,6 +1725,26 @@ test "detectShift: control -- the same disagreement behind a divider is a separa
     try testing.expectEqual(@as(usize, 39), got.right);
 }
 
+test "detectShift: long lines' tails past a quiet column still slide" {
+    // Text in columns 0..29 on every row; tails in 35..44 on two rows only;
+    // column 30..34 never changes. Scrolled up one row.
+    const rows = 30;
+    const cols = 50;
+    var prev: [rows * cols]u64 = @splat(cellKey(blank_glyph, 0));
+    var cur: [rows * cols]u64 = @splat(cellKey(blank_glyph, 0));
+    for (0..rows + 1) |k| for (0..cols) |c| {
+        const body = c < 30;
+        const tail = c >= 35 and c < 45 and (k == 7 or k == 19);
+        if (!body and !tail) continue;
+        const key = cellKey(@intCast(1000 + k * cols + c), 0);
+        if (k < rows) prev[k * cols + c] = key;
+        if (k >= 1) cur[(k - 1) * cols + c] = key;
+    };
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(usize, 0), got.left);
+    try testing.expectEqual(@as(usize, 44), got.right);
+}
+
 test "detectShift: bullets at the left edge slide with their text" {
     // Claude Code: a bullet in column 0 on three rows, column 1 always blank,
     // prose from column 2. The bullets moved with the text and stood still.
@@ -1677,6 +1836,23 @@ test "trimPinnedRows: repeating rows that moved are not pinned" {
     const got = trimPinnedRows(&cur, &prev, rows, cols, 2, 0, rows - 1, 0, cols - 1);
     try testing.expectEqual(@as(usize, 0), got.top);
     try testing.expectEqual(@as(usize, rows - 1), got.bottom);
+}
+
+test "detectShift: a pane border appearing is a layout change, not a scroll" {
+    // Zoomed pane (full width) -> unzoomed: a border at column 20 appears and
+    // the text on its left happens to match its old self a row up.
+    const rows = 24;
+    const cols = 40;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows) |i| for (0..cols) |c| {
+        prev[i * cols + c] = cellKey(@intCast(1000 + i * cols + c), 0);
+        cur[i * cols + c] = if (c == 20) cellKey(0x2502, 3) else cellKey(@intCast(1000 + (i + 1) * cols + c), 0);
+    };
+    try testing.expectEqual(@as(?Shift, null), detectShift(&cur, &prev, rows, cols, 6, 0.6));
+    // Control: the same frames with the border already present in both.
+    for (0..rows) |i| prev[i * cols + 20] = cellKey(0x2502, 3);
+    try testing.expect(detectShift(&cur, &prev, rows, cols, 6, 0.6) != null);
 }
 
 test "detectShift: a still screen is not a scroll" {
@@ -2174,6 +2350,65 @@ test "ghosts: copies of a pinned label are dropped, the rest kept" {
     try testing.expectEqual(@as(usize, 2), ghosts.items.len);
     try testing.expectEqual(@as(u32, 7), ghosts.items[0].glyph_pos[0]);
     try testing.expectEqual(@as(u16, 9), ghosts.items[1].grid_pos[0]);
+}
+
+test "pins: the edge rows of a tall coloured block are not pinned" {
+    const rows = 12;
+    const cols = 20;
+    var prev = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    var now = prev;
+    // A green block over rows 3..8 moves down 2 (content down, shift -2).
+    for (3..9) |r| for (2..18) |c| {
+        prev[r * cols + c] = .{ 0, 99, 0, 255 };
+    };
+    for (5..11) |r| for (2..18) |c| {
+        now[r * cols + c] = .{ 0, 99, 0, 255 };
+    };
+    var pins = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    computePins([4]u8, &pins, &prev, &now, cols, -2, 0, rows - 1, 0, cols - 1);
+    for (pins) |v| try testing.expectEqual(@as(u8, 0), v[0]);
+}
+
+test "pins: a bar as wide as the hovered name keeps its left end" {
+    const rows = 6;
+    const cols = 30;
+    var prev = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    var now = prev;
+    for (3..8) |c| prev[4 * cols + c] = .{ 9, 9, 9, 255 }; // "tools"
+    for (3..12) |c| now[4 * cols + c] = .{ 9, 9, 9, 255 }; // "video-use"
+    var pins = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    computePins([4]u8, &pins, &prev, &now, cols, 1, 0, rows - 1, 0, cols - 1);
+    for (0..cols) |c| try testing.expectEqual(@as(u8, if (c >= 3 and c < 12) 255 else 0), pins[4 * cols + c][0]);
+}
+
+test "pins: a selection bar that stays while the list scrolls under it" {
+    const rows = 10;
+    const cols = 30;
+    var prev = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    var now = prev;
+    // Bar on row 6, columns 2..21, in both frames; an inline-code highlight
+    // of 3 cells on row 2 that coincides; a code block of rows 3..4 that
+    // scrolled up one (so rows 2..3 now) -- moved, not pinned.
+    for (2..22) |c| {
+        prev[6 * cols + c] = .{ 9, 9, 9, 255 };
+        now[6 * cols + c] = .{ 9, 9, 9, 255 };
+    }
+    for (5..8) |c| {
+        prev[2 * cols + c] = .{ 5, 5, 5, 255 };
+        now[2 * cols + c] = .{ 5, 5, 5, 255 };
+    }
+    for (0..cols) |c| {
+        prev[3 * cols + c] = .{ 7, 7, 7, 255 };
+        prev[4 * cols + c] = .{ 7, 7, 7, 255 };
+        now[2 * cols + c] = if (c >= 5 and c < 8) .{ 5, 5, 5, 255 } else .{ 7, 7, 7, 255 };
+        now[3 * cols + c] = .{ 7, 7, 7, 255 };
+    }
+    var pins = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    computePins([4]u8, &pins, &prev, &now, cols, 1, 0, rows - 1, 0, cols - 1);
+    for (0..rows) |r| for (0..cols) |c| {
+        const want: u8 = if (r == 6 and c >= 2 and c < 22) 255 else 0;
+        try testing.expectEqual(want, pins[r * cols + c][0]);
+    };
 }
 
 test "ghost bg: a row leaving the top keeps its colours above the region" {

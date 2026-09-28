@@ -237,6 +237,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scroll_ghost_bg_live: bool = false,
         scroll_image_ghosts_stale: bool = false,
 
+        /// Cells pinned as an overlay on the running scroll (see
+        /// `ScrollAnim.computePins`), one CellBg per grid cell, byte 0 = 255.
+        /// Uploaded after the bg cells (and the ghost backgrounds); the text
+        /// and bg shaders leave these cells undisplaced and let nothing
+        /// sliding draw over them.
+        scroll_pin: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
+        scroll_pin_live: bool = false,
+        /// The backgrounds as drawn before this frame's rebuild, for pins.
+        scroll_bg_prev: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
+        /// The last push this frame, for pins: set by `keepScrollGhosts`.
+        scroll_frame_push: ?struct { rows: isize, top: usize, bottom: usize, left: usize, right: usize } = null,
+
         /// The image placements as last drawn, snapshotted before each
         /// kitty update rebuilds them: by the time a scroll is handled the
         /// placements already describe the new model, and the slices that
@@ -944,6 +956,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.scroll_ghost.deinit(self.alloc);
             self.scroll_ghost_bg.deinit(self.alloc);
             self.scroll_prev_images.deinit(self.alloc);
+            self.scroll_pin.deinit(self.alloc);
+            self.scroll_bg_prev.deinit(self.alloc);
             self.scroll_bg_view.deinit(self.alloc);
             self.scroll_ghost_view.deinit(self.alloc);
 
@@ -1322,6 +1336,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.clearScrollGhosts();
                 return;
             };
+            self.scroll_frame_push = .{ .rows = rows, .top = top, .bottom = bottom, .left = left, .right = right };
+            // A pinned cell stays on screen; a kept copy of it would be a
+            // second one sliding away (Claude Code's label, once per row).
+            // The mask from the last computation, even between animations: the
+            // first push of a new scroll captures before this frame's pins
+            // exist, and a label that stayed put is still where it was.
+            if (self.scroll_pin.items.len == nrows * self.cells.size.columns) {
+                const pc = self.cells.size.columns;
+                var w: usize = before;
+                for (self.scroll_ghost.items[before..]) |g| {
+                    const sy = ScrollAnim.ghostY(g.grid_pos[1]) + @as(i32, @intCast(rows));
+                    const sx: usize = g.grid_pos[0];
+                    if (sy >= 0 and sy < @as(i32, @intCast(nrows)) and sx < pc and
+                        self.scroll_pin.items[@as(usize, @intCast(sy)) * pc + sx][0] != 0) continue;
+                    self.scroll_ghost.items[w] = g;
+                    w += 1;
+                }
+                self.scroll_ghost.shrinkRetainingCapacity(w);
+            }
             if (comptime @hasField(@TypeOf(self.scroll_ghost.items[0].bools), "scroll_ghost")) {
                 for (self.scroll_ghost.items[before..]) |*g| g.bools.scroll_ghost = true;
             } else {
@@ -1346,6 +1379,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ScrollAnim.shiftGhostBg(shaderpkg.CellBg, self.scroll_ghost_bg.items, cols, rows, top, bottom);
             ScrollAnim.captureGhostBg(shaderpkg.CellBg, self.scroll_ghost_bg.items, self.cells.bg_cells, cols, rows, top, bottom, left, right);
             self.scroll_ghost_bg_live = true;
+            // Not the background of a pinned cell either (grey stripes of the
+            // label's box sliding away in the band).
+            if (self.scroll_pin.items.len == nrows * cols and rows != 0 and bottom >= top) {
+                const g = ScrollAnim.max_ghost_rows;
+                const n_dep: usize = @min(@abs(rows), bottom - top + 1, g);
+                const first: usize = if (rows > 0) top else bottom + 1 - n_dep;
+                for (first..first + n_dep) |y| {
+                    const e = @as(isize, @intCast(y + g)) - rows;
+                    if (e < 0 or @as(usize, @intCast(e)) * cols >= self.scroll_ghost_bg.items.len) continue;
+                    // Under the label is unknown; carry the colour from its
+                    // left (a diff's green stays green, plain text stays bare).
+                    const row = self.scroll_ghost_bg.items[@as(usize, @intCast(e)) * cols ..][0..cols];
+                    var fill: shaderpkg.CellBg = .{ 0, 0, 0, 0 };
+                    for (0..cols) |c| {
+                        if (self.scroll_pin.items[y * cols + c][0] != 0) row[c] = fill else fill = row[c];
+                    }
+                }
+            }
 
             // And the image row slices, from the placements as last drawn.
             // (updateFrame holds `draw_mutex` here.)
@@ -1372,6 +1423,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// state drawFrame reads, so they are only marked here and emptied
         /// under the lock by the next `keepScrollGhosts`.
         fn clearScrollGhosts(self: *Self) void {
+            self.scroll_pin_live = false;
             self.scroll_ghost.clearRetainingCapacity();
             self.scroll_ghost_bg_live = false;
             self.scroll_image_ghosts_stale = true;
@@ -1525,37 +1577,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // A label pinned to the region's edge row holds still. The
-            // running animation may already hold that row from pushes before
-            // the label appeared, and its kept rows may hold copies of it:
-            // shrink the one and drop the other.
-            const kept = ScrollAnim.trimPinnedRows(cur, prev, n, cols, shift.rows, top, bottom, shift.left, shift.right);
-            if (kept.top != top or kept.bottom != bottom) {
-                top = kept.top;
-                bottom = kept.bottom;
-                if (self.scroll_anim.active()) {
-                    const t: f32 = @floatFromInt(top);
-                    const b: f32 = @floatFromInt(bottom);
-                    if (self.scroll_anim.top < t or self.scroll_anim.bottom > b) {
-                        self.scroll_anim.top = @max(self.scroll_anim.top, t);
-                        self.scroll_anim.bottom = @min(self.scroll_anim.bottom, b);
-                        // Drop only the label's copies, not the band.
-                        const nr = self.cells.size.rows;
-                        const nc = self.cells.size.columns;
-                        var r = shift.top;
-                        while (r <= shift.bottom and r < nr) : (r += 1) {
-                            if (r >= top and r <= bottom) continue;
-                            ScrollAnim.dropGhostCopies(shaderpkg.CellText, &self.scroll_ghost, self.cells.fg_rows[r + 1].items);
-                            if (self.scroll_ghost_bg_live and self.cells.bg_cells.len >= (r + 1) * nc)
-                                ScrollAnim.dropGhostBgCopies(shaderpkg.CellBg, self.scroll_ghost_bg.items, self.cells.bg_cells[r * nc ..][0..nc]);
-                        }
-                    }
-                }
-                if (self.config.scroll_trace) log.info(
-                    "repaintscroll pinned rows={d}..{d} kept={d}..{d}",
-                    .{ shift.top, shift.bottom, top, bottom },
-                );
-            }
+            // (A label held on screen -- Claude Code's "Jump to bottom" -- is
+            // no longer cut out of the region by rows: its cells are pinned
+            // individually after the rebuild, see `ScrollAnim.computePins`.)
 
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             const was_idle = !self.scroll_anim.active();
@@ -2095,6 +2119,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // describes rows that just stopped being where it thought.
                 // Ghost rows (see `scroll_ghost`) let a longer scroll than the
                 // detector's slide: they fill the band the lag uncovers.
+                // A scroll of the region's whole height or more moves every
+                // row out: nothing on screen before is on screen after, so it
+                // is a clear, not a scroll. tmux uses exactly that to redraw
+                // panes on unzoom (`C-a z`): rows=16 over region 2..17, and the
+                // whole row of panes slid.
+                const region_h: i64 = @as(i64, @intCast(ev.bottom)) - @as(i64, @intCast(ev.region_top)) + 1;
+                if (region_h > 0 and @abs(@as(i64, ev.rows)) >= region_h) {
+                    self.scroll_anim.stop();
+                    self.clearScrollGhosts();
+                    break :scroll;
+                }
                 if (@abs(ev.rows) > ScrollAnim.max_ghost_animated_rows) {
                     self.scroll_anim.stop();
                     self.clearScrollGhosts();
@@ -2265,6 +2300,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Still under the draw mutex taken above, for all remaining
             // state updates.
             {
+                // Overlay pins compare this frame's backgrounds with the last.
+                const pin_push = self.scroll_frame_push;
+                self.scroll_frame_push = null;
+                if (pin_push != null) {
+                    self.scroll_bg_prev.clearRetainingCapacity();
+                    self.scroll_bg_prev.appendSlice(self.alloc, self.cells.bg_cells) catch
+                        self.scroll_bg_prev.clearRetainingCapacity();
+                }
+
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
@@ -2281,6 +2325,47 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     comptime assert(@TypeOf(err) == error{OutOfMemory});
                     log.warn("error rebuilding GPU cells err={}", .{err});
                 };
+
+                if (pin_push) |pp| pins: {
+                    const n = self.cells.bg_cells.len;
+                    if (self.scroll_bg_prev.items.len != n) break :pins;
+                    self.scroll_pin.resize(self.alloc, n) catch break :pins;
+                    // Over everything the running animation displaces, not just
+                    // this push's rows: pushes jitter a row (1..48, then 1..49)
+                    // and the union is what the shaders move -- a label on the
+                    // row one push left out still slid with the next.
+                    const a = self.scroll_anim;
+                    const f2u = struct {
+                        fn f(v: f32, dflt: usize) usize {
+                            return if (v >= 0) @intFromFloat(v) else dflt;
+                        }
+                    }.f;
+                    ScrollAnim.computePins(
+                        shaderpkg.CellBg,
+                        self.scroll_pin.items,
+                        self.scroll_bg_prev.items,
+                        self.cells.bg_cells,
+                        self.cells.size.columns,
+                        pp.rows,
+                        if (a.active()) @min(pp.top, f2u(a.top, pp.top)) else pp.top,
+                        if (a.active()) @min(@max(pp.bottom, f2u(a.bottom, pp.bottom)), self.cells.size.rows - 1) else pp.bottom,
+                        if (a.active()) @min(pp.left, f2u(a.left, pp.left)) else pp.left,
+                        if (a.active()) @min(@max(pp.right, f2u(a.right, pp.right)), self.cells.size.columns - 1) else pp.right,
+                    );
+                    self.scroll_pin_live = self.scroll_anim.active();
+                    if (self.config.scroll_trace) {
+                        const pc = self.cells.size.columns;
+                        for (0..self.cells.size.rows) |r| {
+                            var first: ?usize = null;
+                            var cnt: usize = 0;
+                            for (0..pc) |c| if (self.scroll_pin.items[r * pc + c][0] != 0) {
+                                if (first == null) first = c;
+                                cnt += 1;
+                            };
+                            if (cnt > 0) log.info("scrollpin row={d} col={d} n={d} shift={d}", .{ r, first.?, cnt, pp.rows });
+                        }
+                    }
+                }
 
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
@@ -2512,16 +2597,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try frame.uniforms.sync(&.{self.uniforms});
             self.images.kitty_ghosts_live = self.scroll_anim.active() and
                 !self.scroll_image_ghosts_stale and self.images.kitty_ghosts.items.len > 0;
+            const grid_n: usize = @as(usize, self.cells.size.rows) * self.cells.size.columns;
             const ghost_bg = self.scroll_anim.active() and self.scroll_ghost_bg_live and
                 self.scroll_ghost_bg.items.len == ScrollAnim.ghostBgLen(self.cells.size.rows, self.cells.size.columns);
-            if (ghost_bg) {
-                // The kept rows' backgrounds ride after the grid's own; the
-                // shader finds them through `scroll_anim[3]`.
+            const pinned = self.scroll_anim.active() and self.scroll_pin_live and
+                self.scroll_pin.items.len == grid_n;
+            if (ghost_bg or pinned) {
+                // The kept rows' backgrounds ride after the grid's own (found
+                // through `scroll_anim[3]`), then the pin mask (found through
+                // `scroll_anim_cols[3]`, its offset; 0 = none).
                 self.scroll_bg_view.clearRetainingCapacity();
                 try self.scroll_bg_view.append(self.alloc, .{ .items = self.cells.bg_cells, .capacity = self.cells.bg_cells.len });
-                try self.scroll_bg_view.append(self.alloc, self.scroll_ghost_bg);
+                var off = grid_n;
+                if (ghost_bg) {
+                    try self.scroll_bg_view.append(self.alloc, self.scroll_ghost_bg);
+                    off += self.scroll_ghost_bg.items.len;
+                    self.uniforms.scroll_anim[3] = @floatFromInt(ScrollAnim.max_ghost_rows);
+                }
+                if (pinned) {
+                    try self.scroll_bg_view.append(self.alloc, self.scroll_pin);
+                    self.uniforms.scroll_anim_cols[3] = @floatFromInt(off);
+                }
                 _ = try frame.cells_bg.syncFromArrayLists(self.scroll_bg_view.items);
-                self.uniforms.scroll_anim[3] = @floatFromInt(ScrollAnim.max_ghost_rows);
                 try frame.uniforms.sync(&.{self.uniforms});
             } else try frame.cells_bg.sync(self.cells.bg_cells);
             const fg_count = if (self.scroll_anim.active() and self.scroll_ghost.items.len > 0) ghosted: {

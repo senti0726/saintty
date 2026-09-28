@@ -70,7 +70,14 @@ void main() {
     // not move, which is why this is bounded rather than a whole-grid shift.
     bool scroll_clipped = false;
     out_data.scroll_clip = 0.0;
-    if (scroll_anim.x != 0.0 &&
+    // A glyph on a pinned cell (see cell_bg.f.glsl) stays where it is.
+    bool pinned = false;
+    if (!ghost && scroll_anim.x != 0.0 && scroll_anim_cols.w > 0.0 &&
+        grid_pos.x < grid_size.x && grid_pos.y < grid_size.y) {
+        uint pidx = uint(scroll_anim_cols.w) + uint(grid_pos.y) * grid_size.x + uint(grid_pos.x);
+        pinned = (bg_colors[pidx] & 0xFFu) != 0u;
+    }
+    if (!pinned && scroll_anim.x != 0.0 &&
         (ghost || (gy >= scroll_anim.y && gy <= scroll_anim.z)) &&
         float(grid_pos.x) >= scroll_anim_cols.x &&
         float(grid_pos.x) <= scroll_anim_cols.y) {

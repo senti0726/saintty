@@ -7,6 +7,11 @@ layout(origin_upper_left) in vec4 gl_FragCoord;
 layout(binding = 0) uniform sampler2DRect atlas_grayscale;
 layout(binding = 1) uniform sampler2DRect atlas_color;
 
+// The bg cells buffer, for its pin mask (see cell_bg.f.glsl).
+layout(binding = 1, std430) readonly buffer bg_cells {
+    uint bg_colors[];
+};
+
 in CellTextVertexOut {
     flat uint atlas;
     flat vec4 color;
@@ -41,6 +46,15 @@ void main() {
         float band_top = grid_padding.x + scroll_anim.y * cell_size.y;
         float band_bot = grid_padding.x + (scroll_anim.z + 1.0) * cell_size.y;
         if (gl_FragCoord.y < band_top || gl_FragCoord.y >= band_bot) discard;
+        // Sliding text passes UNDER a pinned cell, not over it.
+        if (scroll_anim_cols.w > 0.0) {
+            uvec2 gsz = unpack2u16(grid_size_packed_2u16);
+            ivec2 cell = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+            if (cell.x >= 0 && cell.y >= 0 && cell.x < int(gsz.x) && cell.y < int(gsz.y)) {
+                uint pidx = uint(scroll_anim_cols.w) + uint(cell.y) * gsz.x + uint(cell.x);
+                if ((bg_colors[pidx] & 0xFFu) != 0u) discard;
+            }
+        }
     }
 
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
