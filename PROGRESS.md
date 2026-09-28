@@ -2138,3 +2138,32 @@ diagnostic the pristine files also raise.
 
 Also: `bisect.py` renamed `nvim_bisect.py` -- it shadowed the stdlib module,
 and analyse.py died importing `statistics`.
+
+## 2026-09-28 — the "fast/slow nvim mode" was matchparen, and is already gone
+
+Closes the 2026-09-27 Open item. Not a mode and not this renderer: nvim's
+matchparen asks `vim.treesitter.get_captures_at_pos` about every bracket in
+view on each cursor move, and stock nvim answers by walking every parse tree
+of the buffer. CSAPP ch. 2 grows from a few hundred trees to ~5000 as it is
+read, so each glide step cost more the deeper the sweep got. The dotfiles'
+round-3 `ts-highlight-index.lua` indexes that call, which already removed it.
+
+Proof, embedded nvim with a UI and no terminal, 285 `15j` 0.7 s apart, first
+step per fifth of the sweep / presses over 100 ms:
+current 27 → 40 ms, 14/285; stock lookup restored 35 → 259 ms, 155/285;
+stock lookup + `:NoMatchParen` 24 → 27 ms, 7/285.
+Real-device `count_j_sweep` (press_cuts.py): whole-move cuts 13 → 0 / 0 / 1
+(09-28 final-a, final-b, and today on battery), all-animated 137 → 251 / 254 / 211.
+
+Not the terminal: a 5 ms /proc sampler over nvim server + TUI, tmux and
+Ghostty never caught nvim in `pipe_write`. Power is a constant factor (first
+step ~6 ms on AC, ~12 ms on battery `quiet`), not growth and not cuts.
+
+Why it looked like a per-run flip: `nvim_bisect.py` took the key time from a
+`--remote-expr` sent after `--remote-send` returned (two client processes,
+~25 ms late) and dropped every step before it, so it measured whichever part
+of the glide it caught. It now timestamps key and steps inside nvim.
+
+Tools: `press_cuts.py <run> [scenario]` -- per-press verdicts (all animated /
+snapped / whole move cut), which presses cut, and first-step / step-gap per
+fifth of the sweep.

@@ -2,11 +2,17 @@
 """nvim_bisect.py <label> <lua>: pre-scroll CSAPP ch.2 fast, then time 40 x `15j` near the end.
 
 Prints the median/p90 delay from a keypress to nvim's first scroll step, and the
-median/p90 gap between steps, with <lua> applied before anything runs."""
+median/p90 gap between steps, with <lua> applied before anything runs.
+
+Both ends are timestamped INSIDE nvim with hrtime: the key by vim.on_key, each
+step by WinScrolled. Until 2026-09-28 the key time came from a --remote-expr
+issued after --remote-send returned -- two client processes later, ~25 ms in --
+and steps before it were dropped, so it measured whichever stretch of the
+glide it happened to catch. That read as nvim "flipping between a fast and a
+slow mode" per run (SETUP-LOG 2026-09-28)."""
 import sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pathlib import Path
 import run
 label, lua = sys.argv[1], sys.argv[2]
 spacing = float(sys.argv[3]) if len(sys.argv) > 3 else 0.15
@@ -22,11 +28,10 @@ try:
         time.sleep(280 * spacing)             # the same wall time, idle
     time.sleep(2)
     rig.reset(3000, bottom=True)
-    rig.nv_lua("(function() _G.__steps = {} vim.api.nvim_create_autocmd('WinScrolled', { callback = function() table.insert(_G.__steps, vim.uv.now()) end }) return 1 end)()")
-    sends = []
+    rig.nv_lua("(function() _G.__steps, _G.__keys = {}, {} vim.on_key(function(k) if k == 'j' then table.insert(_G.__keys, math.floor(vim.uv.hrtime() / 1e6)) end end, vim.api.nvim_create_namespace('nvim-bisect')) vim.api.nvim_create_autocmd('WinScrolled', { callback = function() table.insert(_G.__steps, math.floor(vim.uv.hrtime() / 1e6)) end }) return 1 end)()")
     for i in range(40):
-        run.sh("nvim", "--server", str(rig.sock), "--remote-send", "15j")
-        sends.append(int(rig.nv("luaeval('vim.uv.now()')"))); time.sleep(0.7)
+        run.sh("nvim", "--server", str(rig.sock), "--remote-send", "15j"); time.sleep(0.7)
+    sends = [int(x) for x in rig.nv("join(luaeval('_G.__keys'), ',')").split(",") if x]
     steps = [int(x) for x in rig.nv("join(luaeval('_G.__steps'), ',')").split(",") if x]
     first, gaps = [], []
     for i, s in enumerate(sends):
