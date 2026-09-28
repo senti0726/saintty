@@ -1348,8 +1348,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.scroll_ghost_bg_live = true;
 
             // And the image row slices, from the placements as last drawn.
-            self.draw_mutex.lockUncancelable(global.io());
-            defer self.draw_mutex.unlock(global.io());
+            // (updateFrame holds `draw_mutex` here.)
             if (self.scroll_image_ghosts_stale) {
                 self.images.kitty_ghosts.clearRetainingCapacity();
                 self.scroll_image_ghosts_stale = false;
@@ -1832,6 +1831,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 scroll_event: ?terminal.Terminal.ScrollEvent,
             };
 
+            // Hold the draw mutex from here until the rebuilt cells are in
+            // place. With GTK, frames are drawn on the app thread while this
+            // runs on the renderer thread, and three things below change
+            // what a draw would show before the cells catch up: the image
+            // placements (kittyUpdate), the scroll offset (push), and the kept
+            // band rows. A draw landing in between showed the old grid at the
+            // new offset, or new image placements over the old grid -- for one
+            // frame everything, or just a figure, sat a scroll's distance off
+            // and came back ("the image jumps up a line and back"). The draw
+            // thread waits at most one update for this.
+            self.draw_mutex.lockUncancelable(global.io());
+            var draw_held = true;
+            defer if (draw_held) self.draw_mutex.unlock(global.io());
+
             // Update all our data as tightly as possible within the mutex.
             var critical: Critical = critical: {
                 // NOTE: This code needs be updated to 0.16.0 before you
@@ -1943,10 +1956,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // kitty state on every frame because any cell change can move
                 // an image.
                 if (self.images.kittyRequiresUpdate(state.terminal)) {
-                    // We need to grab the draw mutex since this updates
-                    // our image state that drawFrame uses.
-                    self.draw_mutex.lockUncancelable(global.io());
-                    defer self.draw_mutex.unlock(global.io());
+                    // The draw mutex is already held (see above).
                     if (self.config.scroll_animation) {
                         self.scroll_prev_images.clearRetainingCapacity();
                         self.scroll_prev_images.appendSlice(self.alloc, self.images.kitty_placements.items) catch
@@ -2252,11 +2262,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
             };
 
-            // Acquire the draw mutex for all remaining state updates.
+            // Still under the draw mutex taken above, for all remaining
+            // state updates.
             {
-                self.draw_mutex.lockUncancelable(global.io());
-                defer self.draw_mutex.unlock(global.io());
-
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
@@ -2314,6 +2322,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Update custom shader uniforms that depend on terminal state.
                 self.updateCustomShaderUniformsFromState();
             }
+            self.draw_mutex.unlock(global.io());
+            draw_held = false;
 
             // Start the display link now that the rebuilt frame is ready.
             self.syncDisplayLink(null, null);
