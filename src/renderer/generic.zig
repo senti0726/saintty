@@ -1489,6 +1489,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             defer self.alloc.free(cur);
             for (cells_list, 0..) |*cells, i| {
                 const raw = cells.items(.raw);
+                const graphemes = cells.items(.grapheme);
                 const base = i * cols;
                 for (0..cols) |c| {
                     // FNV-1a over the cell's bytes. Cheaper than Wyhash per
@@ -1506,14 +1507,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         for (std.mem.asBytes(&cell)) |b| {
                             h = (h ^ b) *% 0x100000001b3;
                         }
+                        // And the combining marks, which live outside the raw
+                        // cell. A Kitty image placeholder's row and column ARE
+                        // its marks: without them every row of a figure hashed
+                        // the same, read as unchanged, and the figure was left
+                        // out of the region -- it snapped while text slid.
+                        if (cell.content_tag == .codepoint_grapheme and c < graphemes.len) {
+                            for (graphemes[c]) |gcp| {
+                                h = (h ^ @as(u64, gcp)) *% 0x100000001b3;
+                            }
+                        }
                         const cp = cell.codepoint();
-                        // A Kitty image placeholder (U+10EEEE) is no
-                        // evidence either: its row is an index into an
-                        // image, and two different previews in yazi lined
-                        // up eight rows apart and slid as a scroll
-                        // (`shift=-8 cols=105..208`, on `j`). Images that
-                        // really scroll do so with the text around them.
-                        const glyph: u32 = if (!cell.hasText() or cp == ' ' or cp == 0x10EEEE)
+                        // Kitty image placeholders (U+10EEEE) keep their
+                        // glyph: they cannot testify to a shift (see
+                        // `ScrollAnim.testifies`) but do say which rows moved.
+                        const glyph: u32 = if (!cell.hasText() or cp == ' ')
                             ScrollAnim.blank_glyph
                         else
                             cp;

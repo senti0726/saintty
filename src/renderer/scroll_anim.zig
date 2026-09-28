@@ -921,7 +921,22 @@ fn columnVerdict(
 /// text. See `detectShift`.
 fn testifies(cur: u64, prev: u64) bool {
     const g = glyphOf(cur);
-    return g != blank_glyph and g != glyphOf(prev);
+    return g != blank_glyph and g != placeholder_glyph and g != glyphOf(prev);
+}
+
+/// Kitty's unicode image placeholder. Its row is an index into an image, so
+/// two different pictures line up at any offset -- yazi's previews of two
+/// folders matched eight rows apart and slid as a scroll (`shift=-8`). It
+/// never decides WHETHER something scrolled. But once a shift is found, a
+/// row of an image that moved with it is a row that moved: leaving image
+/// rows out of the row range snapped a figure while the text above it slid
+/// (nvim, `j` above a half-visible figure: `rows=1..44` of 52).
+pub const placeholder_glyph: u32 = 0x10EEEE;
+
+fn movedWith(cur: u64, prev: u64, src: u64) bool {
+    const g = glyphOf(cur);
+    if (g == placeholder_glyph) return cur != prev and cur == src;
+    return testifies(cur, prev) and cur == src;
 }
 
 /// Find the whole-row shift that best maps `cur` onto `prev`, or null.
@@ -1182,7 +1197,7 @@ pub fn detectShift(
             const row = i * cols_;
             const src = @as(usize, @intCast(j)) * cols_;
             for (l_..r_ + 1) |c| {
-                if (testifies(cu[row + c], pr[row + c]) and cu[row + c] == pr[src + c]) return true;
+                if (movedWith(cu[row + c], pr[row + c], pr[src + c])) return true;
             }
             return false;
         }
@@ -1743,6 +1758,36 @@ test "detectShift: long lines' tails past a quiet column still slide" {
     const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
     try testing.expectEqual(@as(usize, 0), got.left);
     try testing.expectEqual(@as(usize, 44), got.right);
+}
+
+test "detectShift: image rows that moved with the text are in the region" {
+    // Text on rows 0..19, an image (placeholder cells, row index in the
+    // hash) on rows 20..27; everything scrolled up one row.
+    const rows = 28;
+    const cols = 30;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows + 1) |k| for (0..cols) |c| {
+        const key = if (k >= 20) cellKey(placeholder_glyph, @intCast(k * 64 + c)) else cellKey(@intCast(1000 + k * cols + c), 0);
+        if (k < rows) prev[k * cols + c] = key;
+        if (k >= 1) cur[(k - 1) * cols + c] = key;
+    };
+    const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, 1), got.rows);
+    try testing.expectEqual(@as(usize, rows - 1), got.bottom);
+}
+
+test "detectShift: two unrelated images lining up is not a scroll" {
+    const rows = 20;
+    const cols = 20;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    // The same placeholder cells, eight rows apart: yazi's two previews.
+    for (0..rows) |i| for (0..cols) |c| {
+        prev[i * cols + c] = cellKey(placeholder_glyph, @intCast(i * 64 + c));
+        cur[i * cols + c] = cellKey(placeholder_glyph, @intCast(((i + 8) % 64) * 64 + c));
+    };
+    try testing.expectEqual(@as(?Shift, null), detectShift(&cur, &prev, rows, cols, 6, 0.6));
 }
 
 test "detectShift: bullets at the left edge slide with their text" {
