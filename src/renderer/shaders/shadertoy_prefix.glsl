@@ -28,6 +28,16 @@ layout(binding = 1, std140) uniform Globals {
     uniform vec3  iCursorText;
     uniform vec3  iSelectionForegroundColor;
     uniform vec3  iSelectionBackgroundColor;
+    // This fork. A move is the cursor changing CELL (not a bar/block width
+    // change), and never while a scroll animates: iCursorMoveFrom/To are
+    // the rects either side of it. A mode change is the cursor's style or
+    // colour changing. A pulse is OSC 777;cursor-pulse. Times are iTime
+    // seconds; -1000 when it never happened.
+    uniform vec4  iCursorMoveFrom;
+    uniform vec4  iCursorMoveTo;
+    uniform float iTimeCursorMove;
+    uniform float iTimeCursorMode;
+    uniform float iTimeCursorPulse;
 };
 
 #define CURSORSTYLE_BLOCK        0

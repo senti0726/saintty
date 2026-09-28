@@ -130,6 +130,8 @@ pub const Action = union(Key) {
     semantic_prompt: SemanticPrompt,
     kitty_clipboard: KittyClipboard,
     kitty_dnd: KittyDnd,
+    /// OSC 777;cursor-pulse (this fork): see osc.Command.cursor_pulse.
+    cursor_pulse,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -231,6 +233,7 @@ pub const Action = union(Key) {
             "semantic_prompt",
             "kitty_clipboard",
             "kitty_dnd",
+            "cursor_pulse",
         },
     );
 
@@ -2650,6 +2653,8 @@ pub fn Stream(comptime H: type) type {
                 .kitty_color_protocol => |v| {
                     self.handler.vt(.kitty_color_report, v);
                 },
+
+                .cursor_pulse => self.handler.vt(.cursor_pulse, {}),
 
                 .show_desktop_notification => |v| {
                     self.handler.vt(.show_desktop_notification, .{

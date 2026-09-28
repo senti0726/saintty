@@ -167,6 +167,11 @@ pub const Command = union(Key) {
     /// Kitty desktop notifications (OSC 99)
     kitty_desktop_notification: KittyDesktopNotification,
 
+    /// OSC 777;cursor-pulse (this fork). Asks custom shaders to play a
+    /// one-shot effect at the cursor: iTimeCursorPulse. tmux sends it
+    /// when a pane gains focus.
+    cursor_pulse,
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const KittyClipboardProtocol = parsers.kitty_clipboard_protocol.OSC;
@@ -206,6 +211,7 @@ pub const Command = union(Key) {
             "kitty_dnd_protocol",
             "context_signal",
             "kitty_desktop_notification",
+            "cursor_pulse",
         },
     );
 
@@ -454,6 +460,7 @@ pub const Parser = struct {
             .kitty_dnd_protocol,
             .kitty_desktop_notification,
             .context_signal,
+            .cursor_pulse,
             => {},
         }
 

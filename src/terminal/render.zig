@@ -188,6 +188,9 @@ pub const RenderState = struct {
         /// Cursor blink state determined by the terminal mode.
         blinking: bool,
 
+        /// Terminal.cursor_pulse at the last update (this fork).
+        pulse: u32 = 0,
+
         pub const Viewport = struct {
             /// The x/y position of the cursor within the viewport.
             x: size.CellCountInt,
@@ -424,6 +427,7 @@ pub const RenderState = struct {
         self.cursor.password_input = t.flags.password_input;
         self.cursor.visible = t.modes.get(.cursor_visible);
         self.cursor.blinking = t.modes.get(.cursor_blinking);
+        self.cursor.pulse = t.cursor_pulse;
 
         // Always reset the cursor viewport position. In the future we can
         // probably cache this by comparing the cursor pin and viewport pin

@@ -105,6 +105,10 @@ cursor: Cursor = .{},
 /// The most recently set mouse shape for the terminal.
 mouse_shape: mouse.Shape = .text,
 
+/// Bumped by OSC 777;cursor-pulse (this fork). The renderer notices the
+/// change and stamps iTimeCursorPulse for custom shaders; wraps harmlessly.
+cursor_pulse: u32 = 0,
+
 /// Per-session Glyph Protocol registrations.
 glyph_glossary: glyph.Glossary = .empty,
 

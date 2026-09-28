@@ -278,6 +278,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Custom shader uniform values.
         custom_shader_uniforms: shadertoy.Uniforms,
 
+        /// Cursor-effect tracking (this fork), see updateCursorFx. The
+        /// cell and mode last seen, the pulse counter last seen, and when
+        /// the latest effect-starting event happened, which is what
+        /// `custom-shader-animation = cursor` animates after.
+        cursor_fx_cell: ?[2]u16 = null,
+        cursor_fx_mode: ?struct { style: i32, color: [4]f32 } = null,
+        cursor_fx_pulse_seen: u32 = 0,
+        cursor_fx_pulse_pending: bool = false,
+        cursor_fx_last_event: ?std.Io.Timestamp = null,
+
         /// Timestamp we rendered out first frame.
         ///
         /// This is used when updating custom shader uniforms.
@@ -910,6 +920,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cursor_text = @splat(0),
                     .selection_background_color = @splat(0),
                     .selection_foreground_color = @splat(0),
+                    .cursor_move_from = @splat(0),
+                    .cursor_move_to = @splat(0),
+                    .time_cursor_move = -1000,
+                    .time_cursor_mode = -1000,
+                    .time_cursor_pulse = -1000,
                 },
                 .bg_image_buffer = undefined,
 
@@ -1204,6 +1219,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
         };
 
+        /// How long after a cursor move, mode change or pulse the
+        /// `cursor` animation mode keeps drawing. Longer than any effect
+        /// in shaders/cursor-fx.glsl, so the last frame is a clean one.
+        const cursor_fx_window_ns: i96 = 1300 * std.time.ns_per_ms;
+
+        fn cursorFxLive(self: *const Self) bool {
+            const last = self.cursor_fx_last_event orelse return false;
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            return last.durationTo(now).nanoseconds < cursor_fx_window_ns;
+        }
+
         /// The soonest animation wake this renderer needs, if any:
         /// custom shader animation wants continuous draw-only wakes
         /// at draw_interval_ms while active, and a running Kitty
@@ -1221,6 +1247,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .false => null,
                     .always => draw_interval_ms,
                     .true => if (self.focused) draw_interval_ms else null,
+                    .cursor => if (self.cursorFxLive()) draw_interval_ms else null,
                 };
             };
 
@@ -2222,6 +2249,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
 
+            // A cursor pulse changes no cell, so nothing else would draw a
+            // frame for it: note it here, and animationWake asks for frames.
+            if (self.terminal_state.cursor.pulse != self.cursor_fx_pulse_seen) {
+                self.cursor_fx_pulse_seen = self.terminal_state.cursor.pulse;
+                self.cursor_fx_pulse_pending = true;
+                self.cursor_fx_last_event = .now(global.io(), .awake);
+            }
+
             // Now the render state is readable, look for movement no event
             // described. Must come after endUpdate: row_data is not valid
             // until the update it began is completed.
@@ -3180,6 +3215,57 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
         }
 
+        /// This fork's cursor-effect uniforms, from the cursor as drawn this
+        /// frame. Unlike iTimeCursorChange, a MOVE is only the cell
+        /// changing (a bar/block width change is not one) and a MODE change
+        /// is only the style or colour changing, so an effect for one is
+        /// never cut short by the other: typing right after `i` keeps the
+        /// insert ripple.
+        ///
+        /// A move while the scroll animation runs is a snap, not a move:
+        /// the cursor is riding the text, and a smear there would fly over
+        /// every scrolled row. Snapping also ends any smear in flight.
+        fn updateCursorFx(
+            self: *Self,
+            cell_pos: [2]u16,
+            rect: [4]f32,
+            color: [4]f32,
+            now: std.Io.Timestamp,
+        ) void {
+            const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
+            const style = uniforms.current_cursor_style;
+
+            if (self.cursor_fx_cell) |old| {
+                if (old[0] != cell_pos[0] or old[1] != cell_pos[1]) {
+                    const riding = self.scroll_anim.active();
+                    if (riding) {
+                        uniforms.cursor_move_from = rect;
+                        uniforms.time_cursor_move = -1000;
+                    } else {
+                        uniforms.cursor_move_from = uniforms.cursor_move_to;
+                        uniforms.time_cursor_move = uniforms.time;
+                        self.cursor_fx_last_event = now;
+                    }
+                    if (self.config.scroll_trace) log.info(
+                        "cursorfx move {s} ({},{})->({},{})",
+                        .{ if (riding) "snap" else "smear", old[0], old[1], cell_pos[0], cell_pos[1] },
+                    );
+                }
+            } else {
+                uniforms.cursor_move_from = rect;
+            }
+            self.cursor_fx_cell = cell_pos;
+            uniforms.cursor_move_to = rect;
+
+            if (self.cursor_fx_mode) |old| {
+                if (old.style != style or !std.meta.eql(old.color, color)) {
+                    uniforms.time_cursor_mode = uniforms.time;
+                    self.cursor_fx_last_event = now;
+                }
+            }
+            self.cursor_fx_mode = .{ .style = style, .color = color };
+        }
+
         /// Update per-frame custom shader uniforms.
         ///
         /// This should be called exactly once per frame, inside `drawFrame`.
@@ -3289,6 +3375,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     uniforms.current_cursor_color = cursor_color;
                     uniforms.cursor_change_time = uniforms.time;
                 }
+
+                self.updateCursorFx(
+                    .{ cursor.grid_pos[0], cursor.grid_pos[1] },
+                    new_cursor,
+                    cursor_color,
+                    now,
+                );
+            }
+
+            if (self.cursor_fx_pulse_pending) {
+                self.cursor_fx_pulse_pending = false;
+                uniforms.time_cursor_pulse = uniforms.time;
             }
 
             // Update focus uniforms

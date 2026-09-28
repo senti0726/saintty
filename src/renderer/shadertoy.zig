@@ -39,6 +39,12 @@ pub const Uniforms = extern struct {
     cursor_text: [4]f32 align(16),
     selection_background_color: [4]f32 align(16),
     selection_foreground_color: [4]f32 align(16),
+    // This fork's cursor-effect uniforms. See generic.zig updateCursorFx.
+    cursor_move_from: [4]f32 align(16),
+    cursor_move_to: [4]f32 align(16),
+    time_cursor_move: f32 align(4),
+    time_cursor_mode: f32 align(4),
+    time_cursor_pulse: f32 align(4),
 };
 
 /// The target to load shaders for.

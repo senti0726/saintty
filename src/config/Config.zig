@@ -3326,6 +3326,12 @@ keybind: Keybinds = .{},
 /// depending on the shader and your terminal usage.
 ///
 /// This can be changed at runtime and will affect all open terminals.
+///
+/// `cursor` (this fork) animates only for a moment after the cursor moves,
+/// changes style or colour, or an `OSC 777;cursor-pulse` arrives, and never
+/// otherwise: for shaders whose only motion is a cursor effect. Those events
+/// are also exposed as `iTimeCursorMove`, `iTimeCursorMode` and
+/// `iTimeCursorPulse`.
 @"custom-shader-animation": CustomShaderAnimation = .true,
 
 /// Bell features to enable if bell support is available in your runtime. Not
@@ -5588,6 +5594,7 @@ pub const CustomShaderAnimation = enum(c_int) {
     false,
     true,
     always,
+    cursor,
 };
 
 /// Valid values for macos-non-native-fullscreen
