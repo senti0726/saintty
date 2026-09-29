@@ -629,6 +629,12 @@ pub fn computePins(
     for (top..bottom + 1) |r| {
         const src = @as(isize, @intCast(r)) + shift;
         const src_row: ?usize = if (src < 0 or src >= @as(isize, @intCast(rows))) null else @intCast(src);
+        // Where the last pinned run on this row ended: a coloured run that
+        // starts right there belongs to the same overlay. yazi's hovered
+        // row is the bar over the name AND a second shade over a symlink's
+        // `-> target`; only the first was held, so the target's highlight
+        // slid off the bar and left the name's black box behind.
+        var pinned_end: ?usize = null;
         var c = left;
         while (c <= right) {
             const v = bg_now[r * cols + c];
@@ -660,8 +666,10 @@ pub fn computePins(
             const above = r > 0 and eq(bg_now[(r - 1) * cols + c], v);
             const below = r + 1 < rows and eq(bg_now[(r + 1) * cols + c], v);
             const len = @max(e, pe) - c;
-            if (starts_here and !carried and !above and !below and len >= pin_min_cells) {
+            const joins = pinned_end != null and pinned_end.? == c;
+            if ((starts_here or joins) and !carried and !above and !below and (joins or len >= pin_min_cells)) {
                 @memset(pins[r * cols + c .. r * cols + @max(e, pe)], mark);
+                pinned_end = @max(e, pe);
             }
             c = e;
         }
@@ -690,6 +698,151 @@ pub fn computePins(
 /// A run's text is held when most of its glyphs are the same as last frame.
 /// `now`/`before` are the detector's cell hashes; without them (the gate was
 /// closed) every pinned run holds its text, as before this existed.
+/// Pin TEXT that stayed put while the scroll says something else should be
+/// there -- an overlay whose colour cannot find it. Claude Code's "Jump to
+/// bottom" box on a row of the same grey (its sticky prompt rows) is one run
+/// of one colour with the row, so `computePins` never saw it: the label slid
+/// with the text, and every kept row carried a copy -- a stack of labels.
+///
+/// A cell qualifies when its full key (glyph and style) is the same as last
+/// frame AND differs from what the shift carried there, so identical lines
+/// moving past each other never do. A run is those cells with gaps of at most
+/// one blank (words), holding at least `pin_text_min` glyphs: relative line
+/// numbers also stay put, but are never that long.
+pub const pin_text_min: usize = 8;
+
+pub fn pinStillText(
+    comptime T: type,
+    pins: []T,
+    now: []const u64,
+    before: []const u64,
+    cols: usize,
+    shift: isize,
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+) void {
+    if (cols == 0 or now.len != pins.len or before.len != pins.len) return;
+    const rows = pins.len / cols;
+    if (bottom >= rows or right >= cols or top > bottom or left > right) return;
+    for (top..bottom + 1) |r| {
+        const src = @as(isize, @intCast(r)) + shift;
+        if (src < 0 or src >= @as(isize, @intCast(rows))) continue;
+        const sr: usize = @intCast(src);
+        // On a row that already holds a coloured overlay, any glyph that
+        // stayed put belongs to it: yazi draws its bar's round end caps as
+        // characters in the bar's colour on no background, and the cursor's
+        // line number beside it; they slid off the held bar. Not glyphs
+        // INSIDE the bar -- its text is the list's (see markPinnedText).
+        var bar_row = false;
+        for (left..right + 1) |x| if (pins[r * cols + x][0] != 0) {
+            bar_row = true;
+            break;
+        };
+        // And the row must have MOVED around the run -- its other text
+        // changed. A row the application has not redrawn yet this frame
+        // also "stayed put", all of it (yazi's last row, once).
+        var others: usize = 0;
+        var changed: usize = 0;
+        for (left..right + 1) |x| {
+            const k = r * cols + x;
+            if (glyphOf(now[k]) == blank_glyph) continue;
+            others += 1;
+            if (now[k] != before[k]) changed += 1;
+        }
+        if (changed * 2 < others) continue;
+        const min_run: usize = if (bar_row) 1 else pin_text_min;
+        var run_start: ?usize = null;
+        var run_end: usize = 0; // one past the last still glyph
+        var glyphs: usize = 0;
+        var c = left;
+        while (c <= right + 1) : (c += 1) {
+            const k = r * cols + c;
+            const still = c <= right and glyphOf(now[k]) != blank_glyph and
+                now[k] == before[k] and now[k] != before[sr * cols + c] and
+                !(bar_row and pins[k][0] != 0 and pins[k][1] == 0);
+            if (still) {
+                if (run_start == null) run_start = c;
+                run_end = c + 1;
+                glyphs += 1;
+                continue;
+            }
+            // A single blank inside a run continues it.
+            if (run_start != null and c <= right and c == run_end and
+                glyphOf(now[k]) == blank_glyph and now[k] == before[k]) continue;
+            if (run_start) |st| {
+                if (glyphs >= min_run) {
+                    for (st..run_end) |x| {
+                        pins[r * cols + x][0] = 255;
+                        pins[r * cols + x][1] = 255;
+                    }
+                }
+            }
+            run_start = null;
+            glyphs = 0;
+        }
+    }
+}
+
+test "pins: a label the same colour as its row is found by its text" {
+    const T = [4]u8;
+    const cols = 30;
+    const rows = 3;
+    var pins: [rows * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var now: [rows * cols]u64 = undefined;
+    var before: [rows * cols]u64 = undefined;
+    // Content moves up a row (shift 1); row 1 carries a label at 10..23.
+    for (0..rows) |i| for (0..cols) |c| {
+        before[i * cols + c] = cellKey(@intCast(1000 + i * cols + c), 0);
+        now[i * cols + c] = cellKey(@intCast(1000 + (i + 1) * cols + c), 0);
+    };
+    const label = "Jump to bottom";
+    for (label, 0..) |ch, j| {
+        const k = cellKey(if (ch == ' ') blank_glyph else ch, 9);
+        before[1 * cols + 10 + j] = k;
+        now[1 * cols + 10 + j] = k;
+    }
+    pinStillText(T, &pins, &now, &before, cols, 1, 0, 1, 0, cols - 1);
+    try std.testing.expectEqual(@as(u8, 255), pins[1 * cols + 10][0]);
+    try std.testing.expectEqual(@as(u8, 255), pins[1 * cols + 23][0]);
+    try std.testing.expectEqual(@as(u8, 0), pins[1 * cols + 9][0]);
+    // Control: row 0 moved (now == what the shift carried), nothing pinned.
+    for (0..cols) |c| try std.testing.expectEqual(@as(u8, 0), pins[c][0]);
+}
+
+test "pins: a held bar's end caps are held with it, the names inside are not" {
+    const T = [4]u8;
+    const cols = 20;
+    const rows = 3;
+    var pins: [rows * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var now: [rows * cols]u64 = undefined;
+    var before: [rows * cols]u64 = undefined;
+    for (0..rows) |i| for (0..cols) |c| {
+        before[i * cols + c] = cellKey(@intCast(1000 + i * cols + c), 0);
+        now[i * cols + c] = cellKey(@intCast(1000 + (i + 1) * cols + c), 0);
+    };
+    // Row 1: the bar's colour held at 5..14 (computePins found it); a cap
+    // glyph at 4 and 15 that never moves; the name inside is new, except
+    // that its first glyph happens to equal last frame's.
+    for (5..15) |c| pins[1 * cols + c][0] = 255;
+    for ([_]usize{ 4, 15 }) |c| {
+        before[1 * cols + c] = cellKey(0xE0B6, 7);
+        now[1 * cols + c] = cellKey(0xE0B6, 7);
+    }
+    before[1 * cols + 5] = cellKey('.', 8);
+    now[1 * cols + 5] = cellKey('.', 8);
+    pinStillText(T, &pins, &now, &before, cols, 1, 0, 1, 0, cols - 1);
+    try std.testing.expectEqual(@as(u8, 255), pins[1 * cols + 4][1]);
+    try std.testing.expectEqual(@as(u8, 255), pins[1 * cols + 15][1]);
+    try std.testing.expectEqual(@as(u8, 0), pins[1 * cols + 5][1]);
+    // Control: row 0 has no bar, so a lone still glyph there is not held.
+    before[0 * cols + 3] = cellKey('x', 1);
+    now[0 * cols + 3] = cellKey('x', 1);
+    pinStillText(T, &pins, &now, &before, cols, 1, 0, 1, 0, cols - 1);
+    try std.testing.expectEqual(@as(u8, 0), pins[0 * cols + 3][0]);
+}
+
 pub fn markPinnedText(comptime T: type, pins: []T, now: []const u64, before: []const u64, cols: usize) void {
     const have = now.len == pins.len and before.len == pins.len and cols > 0;
     var i: usize = 0;
@@ -708,8 +861,12 @@ pub fn markPinnedText(comptime T: type, pins: []T, now: []const u64, before: []c
             glyphs += 1;
             if (g == glyphOf(before[k])) same += 1;
         };
-        const hold: u8 = if (!have or (glyphs > 0 and same * 5 >= glyphs * 4)) 255 else 0;
-        for (i..e) |k| pins[k][1] = hold;
+        const hold = !have or (glyphs > 0 and same * 5 >= glyphs * 4);
+        // Only ever sets: cells `pinStillText` held individually (a bar's
+        // end caps) stay held inside a run whose text moves.
+        if (hold) for (i..e) |k| {
+            pins[k][1] = 255;
+        };
         i = e;
     }
 }
@@ -736,6 +893,40 @@ test "pins: a label's text is held, a bar's changing names are not" {
     // Control: without the detector's hashes every pin holds its text.
     markPinnedText(T, &pins, &.{}, &.{}, cols);
     try std.testing.expectEqual(@as(u8, 255), pins[cols + 2][1]);
+}
+
+/// The background under each pinned cell, for its slid copy: the nearest
+/// unpinned colour to its LEFT on the same row of the current frame (a
+/// diff's green stays green, plain text stays bare), refreshed every frame.
+/// Taking the colour the last push carried there instead was stale whenever
+/// the application finished its redraw a frame later -- Claude Code: a red
+/// box on a green row. Unpinned cells are left alone.
+pub fn fillUnderlay(comptime T: type, under: []T, pins: []const T, bg_now: []const T, cols: usize) void {
+    if (cols == 0 or under.len != pins.len or bg_now.len != pins.len) return;
+    const nrows = pins.len / cols;
+    for (0..nrows) |y| {
+        var fill = std.mem.zeroes(T);
+        for (0..cols) |c| {
+            const k = y * cols + c;
+            if (pins[k][0] == 0) fill = bg_now[k] else under[k] = fill;
+        }
+    }
+}
+
+test "underlay: a pinned cell's slid copy takes its row's colour from the left" {
+    const T = [4]u8;
+    const cols = 4;
+    var pins: [2 * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var now: [2 * cols]T = undefined;
+    var under: [2 * cols]T = @splat(.{ 0, 0, 0, 0 });
+    for (0..2 * cols) |k| now[k] = .{ @intCast(k), 0, 0, 255 };
+    pins[1 * cols + 2][0] = 255;
+    pins[1 * cols + 3][0] = 255;
+    pins[0][0] = 255; // at the left edge: nothing to its left
+    fillUnderlay(T, &under, &pins, &now, cols);
+    try std.testing.expectEqual(now[1 * cols + 1], under[1 * cols + 2]);
+    try std.testing.expectEqual(now[1 * cols + 1], under[1 * cols + 3]);
+    try std.testing.expectEqual(T{ 0, 0, 0, 0 }, under[0]);
 }
 
 pub fn ghostBgLen(rows: usize, cols: usize) usize {
@@ -1273,6 +1464,14 @@ pub fn detectShift(
             },
             else => {},
         };
+        // And the pane's blank columns with it, out to its dividers. A
+        // column with no text says nothing either way, but its BACKGROUND
+        // moves with the rows: Claude Code's green diff runs to column 200
+        // while its text stops at 130, and the scroll stopped with the text
+        // -- the green right-hand block stood still while the left slid, a
+        // tear through every coloured row (2026-09-29, round 6).
+        if (pa < l) l = pa;
+        if (pb > right) right = pb;
         // A run that starts within `gutter_cols` of the screen's left edge,
         // with no divider before it, starts AT the edge. That strip is a
         // line-number gutter: nvim's relative numbers are relabelled on
@@ -1742,7 +1941,8 @@ test "detectShift: a lone coincidence across a pane border cannot widen the regi
     const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
     try testing.expectEqual(@as(isize, 1), got.rows);
     try testing.expectEqual(@as(usize, 0), got.left);
-    try testing.expectEqual(@as(usize, 29), got.right);
+    // The list and its blank padding (col 30), never past the border.
+    try testing.expectEqual(@as(usize, 30), got.right);
 }
 
 test "detectShift: a selection bar moving is not the list scrolling" {
@@ -1905,7 +2105,9 @@ test "detectShift: long lines' tails past a quiet column still slide" {
     };
     const got = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
     try testing.expectEqual(@as(usize, 0), got.left);
-    try testing.expectEqual(@as(usize, 44), got.right);
+    // Tails included -- and, since the pane's blank columns move with it
+    // (backgrounds), out to the screen edge.
+    try testing.expectEqual(@as(usize, cols - 1), got.right);
 }
 
 test "detectShift: image rows that moved with the text are in the region" {
@@ -2113,7 +2315,7 @@ test "detectShift: a column of identical icons slides with its names" {
     iconListFrames(rows, cols, 0xF48A, &prev, &cur);
     const s = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
     try testing.expectEqual(@as(isize, 1), s.rows);
-    try testing.expectEqual(@as(usize, 13), s.left);
+    try testing.expectEqual(@as(usize, 12), s.left); // icon (13) and the blank before it
     try testing.expectEqual(@as(usize, cols - 1), s.right);
 }
 
@@ -2124,7 +2326,7 @@ test "detectShift: control -- a drawn border in that column still divides" {
     var cur: [rows * cols]u64 = undefined;
     iconListFrames(rows, cols, 0x2502, &prev, &cur);
     const s = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
-    try testing.expectEqual(@as(usize, 15), s.left);
+    try testing.expectEqual(@as(usize, 14), s.left); // past the border (13)
 }
 
 test "detectShift: a still screen is not a scroll" {

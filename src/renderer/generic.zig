@@ -253,6 +253,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// and bg shaders leave these cells undisplaced and let nothing
         /// sliding draw over them.
         scroll_pin: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
+        /// Per cell, what the last push carried in UNDER a pinned overlay:
+        /// its background, uploaded after the mask for the slid copy of a
+        /// pinned cell to draw (cell_bg.f). Its text goes into
+        /// `scroll_ghost` as underlay glyphs. See `keepScrollGhosts`.
+        scroll_pin_under: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
         scroll_pin_live: bool = false,
         /// The backgrounds as drawn before this frame's rebuild, for pins.
         scroll_bg_prev: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
@@ -984,6 +989,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.scroll_ghost_bg.deinit(self.alloc);
             self.scroll_prev_images.deinit(self.alloc);
             self.scroll_pin.deinit(self.alloc);
+            self.scroll_pin_under.deinit(self.alloc);
             self.scroll_bg_prev.deinit(self.alloc);
             self.scroll_bg_view.deinit(self.alloc);
             self.scroll_ghost_view.deinit(self.alloc);
@@ -1354,7 +1360,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// the running animation) and before this frame's cells are rebuilt
         /// (`cells.fg_rows` still holds what was last drawn). See
         /// `ScrollAnim.captureGhosts`.
-        fn keepScrollGhosts(self: *Self, rows: isize, top: usize, bottom: usize, left: usize, right: usize) void {
+        fn keepScrollGhosts(self: *Self, rows: isize, top: usize, bottom: usize, left: usize, right: usize, hashes: ?[2][]const u64) void {
             if (!self.scroll_anim.accumulates(
                 @floatFromInt(top),
                 @floatFromInt(bottom),
@@ -1437,6 +1443,68 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     var fill: shaderpkg.CellBg = .{ 0, 0, 0, 0 };
                     for (0..cols) |c| {
                         if (self.scroll_pin.items[y * cols + c][0] != 0) row[c] = fill else fill = row[c];
+                    }
+                }
+            }
+
+            // What this push slides UNDER a pinned overlay: model row y now
+            // holds what row y + rows held, and where y is pinned the overlay
+            // hides it -- but the frame about to be replaced still shows it
+            // whole. Keep those glyphs, as underlay ghosts at row y that the
+            // shader never draws over the overlay (the colour is
+            // `fillUnderlay`'s, every frame). The next push drops them
+            // (shiftGhosts: back inside the region), by which time the model
+            // draws that text itself, clear of the overlay. The mask is the
+            // last one computed, as for the filter above. `same_row` says,
+            // per row, whether the new frame's row y really is the old row
+            // y + rows where it is visible (repaint path: the hashes); a row
+            // an application has not finished redrawing gets no underlay
+            // rather than the wrong one.
+            if (self.scroll_pin.items.len == nrows * cols) under: {
+                const nr: isize = @intCast(nrows);
+                for (0..nrows) |y| {
+                    const pin_row = self.scroll_pin.items[y * cols ..][0..cols];
+                    var any = false;
+                    for (pin_row) |m| if (m[0] != 0) {
+                        any = true;
+                        break;
+                    };
+                    if (!any) continue;
+                    const src = @as(isize, @intCast(y)) + rows;
+                    if (src < 0 or src >= nr) continue;
+                    if (hashes) |h| {
+                        // Where the new row y is visible, is it the old row
+                        // `src`? (cur = h[0], prev = h[1].)
+                        if (h[0].len != nrows * cols or h[1].len != nrows * cols) continue;
+                        const su: usize = @intCast(src);
+                        var seen: usize = 0;
+                        var same: usize = 0;
+                        // Only the scrolling columns: yazi relabels its line
+                        // numbers every step, which failed every row.
+                        for (left..@min(right + 1, cols)) |c| {
+                            if (pin_row[c][0] != 0) continue;
+                            const k = h[0][y * cols + c];
+                            if (ScrollAnim.glyphOf(k) == ScrollAnim.blank_glyph) continue;
+                            seen += 1;
+                            // Glyphs, not styles: the row that just became
+                            // the hovered one is restyled (yazi's size column).
+                            if (ScrollAnim.glyphOf(k) == ScrollAnim.glyphOf(h[1][su * cols + c])) same += 1;
+                        }
+                        if (same * 5 < seen * 4) continue;
+                    }
+                    // The whole row within the scroll, not just the cells
+                    // pinned now: the next mask can be wider (yazi's bar
+                    // grows to cover a symlink's target), and the shader
+                    // draws an underlay glyph only where its own cell is
+                    // pinned in the CURRENT mask.
+                    for (self.cells.fg_rows[@as(usize, @intCast(src)) + 1].items) |g| {
+                        const x: usize = g.grid_pos[0];
+                        if (x >= cols or x < left or x > right) continue;
+                        var h = g;
+                        h.grid_pos[1] = ScrollAnim.ghostYEncode(@intCast(y));
+                        h.bools.scroll_ghost = true;
+                        h.bools.scroll_underlay = true;
+                        self.scroll_ghost.append(self.alloc, h) catch break :under;
                     }
                 }
             }
@@ -1668,7 +1736,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             const was_idle = !self.scroll_anim.active();
-            self.keepScrollGhosts(shift.rows, top, bottom, shift.left, shift.right);
+            self.keepScrollGhosts(shift.rows, top, bottom, shift.left, shift.right, .{ cur, prev });
             self.scroll_anim.push(
                 @as(f32, @floatFromInt(shift.rows)) * cell_h,
                 @floatFromInt(top),
@@ -2279,6 +2347,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     bottom,
                     0,
                     self.size.grid().columns -| 1,
+                    null,
                 );
                 self.scroll_anim.push(
                     offset,
@@ -2438,6 +2507,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.scroll_pin.items,
                         self.scroll_bg_prev.items,
                         self.cells.bg_cells,
+                        self.cells.size.columns,
+                        pp.rows,
+                        if (a.active()) @min(pp.top, f2u(a.top, pp.top)) else pp.top,
+                        if (a.active()) @min(@max(pp.bottom, f2u(a.bottom, pp.bottom)), self.cells.size.rows - 1) else pp.bottom,
+                        if (a.active()) @min(pp.left, f2u(a.left, pp.left)) else pp.left,
+                        if (a.active()) @min(@max(pp.right, f2u(a.right, pp.right)), self.cells.size.columns - 1) else pp.right,
+                    );
+                    ScrollAnim.pinStillText(
+                        shaderpkg.CellBg,
+                        self.scroll_pin.items,
+                        self.scroll_row_hashes.items,
+                        self.scroll_hashes_before.items,
                         self.cells.size.columns,
                         pp.rows,
                         if (a.active()) @min(pp.top, f2u(a.top, pp.top)) else pp.top,
@@ -2717,6 +2798,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (pinned) {
                     try self.scroll_bg_view.append(self.alloc, self.scroll_pin);
                     self.uniforms.scroll_anim_cols[3] = @floatFromInt(off);
+                    // The underlay grid directly after the mask: the shader
+                    // reads it at mask index + grid size, so it must be there.
+                    if (self.scroll_pin_under.items.len != grid_n) {
+                        try self.scroll_pin_under.resize(self.alloc, grid_n);
+                        @memset(self.scroll_pin_under.items, .{ 0, 0, 0, 0 });
+                    }
+                    ScrollAnim.fillUnderlay(shaderpkg.CellBg, self.scroll_pin_under.items, self.scroll_pin.items, self.cells.bg_cells, self.cells.size.columns);
+                    try self.scroll_bg_view.append(self.alloc, self.scroll_pin_under);
                 }
                 _ = try frame.cells_bg.syncFromArrayLists(self.scroll_bg_view.items);
                 try frame.uniforms.sync(&.{self.uniforms});

@@ -69,9 +69,21 @@ vec4 cell_bg() {
             return vec4(0.0);
         }
         // A pinned cell is drawn in place (above); its slid copy is not.
+        // What slides away from under it is what the overlay hid: the
+        // colour the scroll carried into that cell, kept from the frame
+        // before (the grid after the mask; see generic.zig
+        // `scroll_pin_under`). Drawing nothing there showed a black box the
+        // size of Claude Code's label, or of yazi's bar, beside the real one
+        // on every fast scroll.
         if (scroll_anim_cols.w > 0.0 && grid_pos.x >= 0 && grid_pos.x < int(grid_size.x)) {
             uint sidx = uint(scroll_anim_cols.w) + uint(gy) * grid_size.x + uint(grid_pos.x);
-            if ((cells[sidx] & 0xFFu) != 0u) return vec4(0.0);
+            if ((cells[sidx] & 0xFFu) != 0u) {
+                uint uidx = sidx + grid_size.x * grid_size.y;
+                return load_color(
+                        unpack4u8(cells[uidx]),
+                        (bools & USE_LINEAR_BLENDING) != 0
+                    );
+            }
         }
         grid_pos.y = gy;
     }

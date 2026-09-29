@@ -34,6 +34,10 @@ const uint IS_CURSOR_GLYPH = 2u;
 // so it is displaced unconditionally, clipped to the region like any
 // displaced row, and never drawn once the animation is over.
 const uint SCROLL_GHOST = 4u;
+// A kept glyph of what slid UNDER a pinned overlay (with SCROLL_GHOST): the
+// text a label or bar hides, taken from the frame before the scroll. It is
+// displaced like any ghost and never drawn over a pinned cell (cell_text.f).
+const uint SCROLL_UNDERLAY = 8u;
 
 out CellTextVertexOut {
     flat uint atlas;
@@ -44,6 +48,8 @@ out CellTextVertexOut {
     // the fragment stage knows to clip it to the region. Rows outside the
     // region never move and must be left alone -- clipping them too erases
     // exactly the things an application parks outside its margins.
+    // 2.0: an underlay glyph (SCROLL_UNDERLAY). 3.0: a glyph of a colour-only
+    // pin (yazi's hovered name), drawn only where it is over the bar.
     flat float scroll_clip;
 } out_data;
 
@@ -72,18 +78,31 @@ void main() {
     out_data.scroll_clip = 0.0;
     // A glyph on a pinned cell (see cell_bg.f.glsl) stays where it is.
     bool pinned = false;
+    bool bar_glyph = false;
     if (!ghost && scroll_anim.x != 0.0 && scroll_anim_cols.w > 0.0 &&
         grid_pos.x < grid_size.x && grid_pos.y < grid_size.y) {
         uint pidx = uint(scroll_anim_cols.w) + uint(grid_pos.y) * grid_size.x + uint(grid_pos.x);
+        uint m = bg_colors[pidx];
         // Byte 1: the pin holds its text too (ScrollAnim.markPinnedText).
-        pinned = ((bg_colors[pidx] >> 8u) & 0xFFu) != 0u;
+        pinned = ((m >> 8u) & 0xFFu) != 0u;
+        // Byte 0 alone: only the colour is held; the text slides, but is
+        // this colour's text, so it shows only while over the bar.
+        bar_glyph = !pinned && (m & 0xFFu) != 0u;
+    }
+    bool underlay = (glyph_bools & SCROLL_UNDERLAY) != 0u;
+    // An underlay glyph stands for the text hidden under a pinned cell: where
+    // its own cell is not pinned now, the model draws that text itself.
+    if (underlay && scroll_anim_cols.w > 0.0 &&
+        grid_pos.x < grid_size.x && gy >= 0.0 && gy < float(grid_size.y)) {
+        uint hidx = uint(scroll_anim_cols.w) + uint(gy) * grid_size.x + uint(grid_pos.x);
+        if ((bg_colors[hidx] & 0xFFu) == 0u) scroll_clipped = true;
     }
     if (!pinned && scroll_anim.x != 0.0 &&
         (ghost || (gy >= scroll_anim.y && gy <= scroll_anim.z)) &&
         float(grid_pos.x) >= scroll_anim_cols.x &&
         float(grid_pos.x) <= scroll_anim_cols.y) {
         cell_pos.y += scroll_anim.x;
-        out_data.scroll_clip = 1.0;
+        out_data.scroll_clip = underlay ? 2.0 : (bar_glyph ? 3.0 : 1.0);
 
         // A row displaced past the edge of the region must not be drawn: it
         // would land on rows that are deliberately stationary, painting

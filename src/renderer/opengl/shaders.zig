@@ -275,7 +275,11 @@ pub const CellText = extern struct {
         /// A row the scroll animation carried out of its region, drawn in
         /// the band its lag uncovers. See generic.zig `scroll_ghost`.
         scroll_ghost: bool = false,
-        _padding: u5 = 0,
+        /// A kept glyph from what slid UNDER a pinned overlay (with
+        /// `scroll_ghost`): drawn only where it is not under the overlay.
+        /// See generic.zig `keepScrollGhosts`.
+        scroll_underlay: bool = false,
+        _padding: u4 = 0,
     } align(1) = .{},
 
     pub const Atlas = enum(u8) {

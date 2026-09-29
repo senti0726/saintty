@@ -2256,3 +2256,38 @@ Suite unchanged within noise (hold_* 100, tp 98-100, ctrl_d/f 100, wheel
 fast 87-95). `tmux_zoom.py` now counts mid-slide frames (0), not event
 lines. The Claude Code "empty line" was Claude Code's own spacer row above
 the prompt box (present in tmux's grid) — not ours.
+
+## 2026-09-29 (round 6) — overlays: no black box, no stacked labels, no tear
+
+User report: a black box beside Claude Code's "Jump to bottom" label and
+yazi's bar on fast scrolls (it hid text on plain rows), several labels
+stacked when the label sits on a grey row, and a tear through Claude Code's
+green diff rows.
+
+1. **What slides out from under a pinned overlay.** The slid copy of a
+   pinned cell drew nothing (the box). Now: its background is the nearest
+   unpinned colour to its left on the same row of the CURRENT frame
+   (`fillUnderlay`, every frame; the push-time colour was stale when Claude
+   Code finished a redraw a frame later -- a red box on a green row), and
+   its text is the previous frame's row the shift carried there, kept as
+   underlay ghosts (`CellText.bools.scroll_underlay`), captured over the
+   whole scrolling row, drawn only where their own cell is pinned now and
+   never over a pinned cell, and only when the new row's visible glyphs
+   match that old row (a half-redrawn row gets none). A colour-only pin's
+   own glyphs (yazi's hovered name) draw only over the bar.
+2. **Labels found by text.** `pinStillText`: a run of >= 8 glyphs unchanged
+   in place and different from what the shift carried there is an overlay,
+   whatever its colour (the label on Claude Code's grey prompt rows was one
+   colour run with the row, so never pinned, and every kept row carried a
+   copy). On a row that already has a bar, any such glyph (yazi's end caps,
+   the cursor's number). Only if the rest of the row changed: a row the app
+   has not redrawn yet also "stays put".
+3. **Bars keep their tail.** A coloured run starting where a pinned run ends
+   is the same overlay (yazi's second shade over a symlink target).
+4. **A scroll covers its whole pane.** Blank columns out to the dividers
+   move with it: backgrounds scroll too (Claude Code's green diff to column
+   200, text to 130: the tear).
+
+Suite subset unchanged (hold_* 97-100, tp 100, wheel fast 89-95, ctrl_d 100).
+Harness: `sweep.py` (hidden nvim, whole-chapter held-j or wheel sweep,
+flags multi-row steps and reflows) -- it found the figures arriving late.

@@ -50,11 +50,24 @@ void main() {
         if (scroll_anim_cols.w > 0.0) {
             uvec2 gsz = unpack2u16(grid_size_packed_2u16);
             ivec2 cell = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+            uint m = 0u;
             if (cell.x >= 0 && cell.y >= 0 && cell.x < int(gsz.x) && cell.y < int(gsz.y)) {
                 uint pidx = uint(scroll_anim_cols.w) + uint(cell.y) * gsz.x + uint(cell.x);
-                // Byte 1: the pin holds its text (see ScrollAnim.markPinnedText);
-                // a bar that only holds its colour lets the names slide over it.
-                if (((bg_colors[pidx] >> 8u) & 0xFFu) != 0u) discard;
+                m = bg_colors[pidx];
+            }
+            bool pin = (m & 0xFFu) != 0u;
+            // Byte 1: the pin holds its text (see ScrollAnim.markPinnedText).
+            bool held = ((m >> 8u) & 0xFFu) != 0u;
+            if (in_data.scroll_clip > 2.5) {
+                // A colour-only pin's own text (yazi's hovered name, drawn in
+                // the bar's colours): only where it is over the bar. Off it,
+                // the underlay draws the same name in its normal colours.
+                if (!pin) discard;
+            } else if (in_data.scroll_clip > 1.5) {
+                // What the overlay hides: never over the overlay itself.
+                if (pin) discard;
+            } else if (held) {
+                discard;
             }
         }
     }
