@@ -75,10 +75,14 @@ for (var i = 0; i < w.length; i++) if (String(w[i].caption).indexOf("{TITLE}") >
             logf.flush()
             a = (out / "ghostty.full.log").stat().st_size
             key(f"{code}:1", f"{code}:0")
-            time.sleep(0.2)
+            at = float(opts.get("shot-at", "0.2"))
+            gap = float(opts.get("gap", "0.7"))
             if n in shots:
+                time.sleep(at)
                 shot(out / f"j{n}.png")
-            time.sleep(4.5 if n in shots and extra else float(opts.get("gap", "0.7")) - 0.2)
+                time.sleep(4.5 if extra else max(0.0, gap - at))
+            else:
+                time.sleep(gap)
             (out / f"j{n}.txt").write_text(tm("capture-pane", "-p", "-t", "h"))
             logf.flush()
             seg = run.slice_file(out / "ghostty.full.log", a)

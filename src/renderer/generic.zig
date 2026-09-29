@@ -259,10 +259,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// `scroll_ghost` as underlay glyphs. See `keepScrollGhosts`.
         scroll_pin_under: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
         scroll_pin_live: bool = false,
+        /// The mask before this frame's recomputation (frames without a push).
+        scroll_pin_prev: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
         /// The backgrounds as drawn before this frame's rebuild, for pins.
         scroll_bg_prev: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
         /// The last push this frame, for pins: set by `keepScrollGhosts`.
         scroll_frame_push: ?struct { rows: isize, top: usize, bottom: usize, left: usize, right: usize } = null,
+        /// The last push, kept: pins are recomputed on every frame of a
+        /// running animation, not only on frames that pushed (see the
+        /// rebuild block).
+        scroll_last_push: ?struct { rows: isize, top: usize, bottom: usize, left: usize, right: usize } = null,
 
         /// The image placements as last drawn, snapshotted before each
         /// kitty update rebuilds them: by the time a scroll is handled the
@@ -280,7 +286,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scroll_anim_last_event: ?struct {
             rows: isize,
             ts: std.Io.Timestamp,
+            /// The rows it animated (region top .. bottom after the reserve).
+            top: usize = 0,
+            bottom: usize = 0,
         } = null,
+
+        /// Every row any scroll event of this gesture covered: the only rows
+        /// `extendEventRows` may take as "arriving" content. A changed row
+        /// just outside an event can be the app's own status line (nvim's,
+        /// row 53: its position readout changes on every step).
+        scroll_event_span: ?struct { top: usize, bottom: usize } = null,
 
         /// When the last frame was actually drawn, so the scroll animation
         /// can pace itself against every draw rather than adding its own on
@@ -990,6 +1005,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.scroll_prev_images.deinit(self.alloc);
             self.scroll_pin.deinit(self.alloc);
             self.scroll_pin_under.deinit(self.alloc);
+            self.scroll_pin_prev.deinit(self.alloc);
             self.scroll_bg_prev.deinit(self.alloc);
             self.scroll_bg_view.deinit(self.alloc);
             self.scroll_ghost_view.deinit(self.alloc);
@@ -1547,6 +1563,74 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.input_activity_ts = .now(global.io(), .awake);
         }
 
+        /// An application's scroll may leave out rows that moved with it,
+        /// repainting them instead. nvim scrolling up onto a figure hung above
+        /// its top line (virtual lines, `topfill`) scrolls only the rows BELOW
+        /// the figure -- `IL` in a region starting there, `region=5..52`, then
+        /// 6..52, 7..52 -- and repaints the figure's rows, one row lower. The
+        /// event animated only its region, so the figure's lower rows slid and
+        /// its upper rows did not: the picture tore, its first row drawn twice
+        /// and a later one lost (recorded with OBS at CSAPP ch. 2 line 291).
+        /// Rows next to the event's region whose content IS last frame's
+        /// shifted by the same amount join the animation, and the region the
+        /// rest of the gesture is held to. Rows arriving at the edge the
+        /// content comes from (new, so matching nothing) come along, as in
+        /// `detectShift`.
+        fn extendEventRows(self: *Self, cur: []const u64, prev: []const u64, n: usize, cols: usize) void {
+            const le = self.scroll_anim_last_event orelse return;
+            if (le.rows == 0 or !self.scroll_anim.active()) return;
+            if (le.bottom >= n or le.top > le.bottom) return;
+            const rowMoved = struct {
+                fn f(cu: []const u64, pr: []const u64, r: usize, rows: isize, n_: usize, cols_: usize) bool {
+                    const src = @as(isize, @intCast(r)) + rows;
+                    if (src < 0 or src >= @as(isize, @intCast(n_))) return false;
+                    const a = cu[r * cols_ ..][0..cols_];
+                    const b = pr[@as(usize, @intCast(src)) * cols_ ..][0..cols_];
+                    return std.mem.eql(u64, a, b) and !std.mem.eql(u64, a, pr[r * cols_ ..][0..cols_]);
+                }
+            }.f;
+            const rowChanged = struct {
+                fn f(cu: []const u64, pr: []const u64, r: usize, cols_: usize) bool {
+                    return !std.mem.eql(u64, cu[r * cols_ ..][0..cols_], pr[r * cols_ ..][0..cols_]);
+                }
+            }.f;
+            var lo = le.top;
+            while (lo > 0 and rowMoved(cur, prev, lo - 1, le.rows, n, cols)) lo -= 1;
+            var hi = le.bottom;
+            while (hi + 1 < n and rowMoved(cur, prev, hi + 1, le.rows, n, cols)) hi += 1;
+            // The rows arriving from the edge: above for content moving down.
+            // Only into rows some event of this gesture scrolled -- never the
+            // status line (see `scroll_event_span`).
+            // A row holding part of a figure is content wherever it is.
+            const sp = self.scroll_event_span orelse return;
+            const hasImage = struct {
+                fn f(cu: []const u64, r: usize, cols_: usize) bool {
+                    for (cu[r * cols_ ..][0..cols_]) |key| {
+                        if (ScrollAnim.glyphOf(key) == ScrollAnim.placeholder_glyph) return true;
+                    }
+                    return false;
+                }
+            }.f;
+            var k: usize = 0;
+            while (k < @abs(le.rows)) : (k += 1) {
+                if (le.rows < 0 and lo > 0 and rowChanged(cur, prev, lo - 1, cols) and
+                    (lo > sp.top or hasImage(cur, lo - 1, cols))) lo -= 1;
+                if (le.rows > 0 and hi + 1 < n and rowChanged(cur, prev, hi + 1, cols) and
+                    (hi < sp.bottom or hasImage(cur, hi + 1, cols))) hi += 1;
+            }
+            if (lo == le.top and hi == le.bottom) return;
+            self.scroll_anim.top = @min(self.scroll_anim.top, @as(f32, @floatFromInt(lo)));
+            self.scroll_anim.bottom = @max(self.scroll_anim.bottom, @as(f32, @floatFromInt(hi)));
+            if (self.scroll_anim_app_region) |*r| {
+                r.top = @min(r.top, lo);
+                r.bottom = @max(r.bottom, hi);
+            }
+            if (self.config.scroll_trace) log.info(
+                "scroll event widened rows={d} {d}..{d} -> {d}..{d}",
+                .{ le.rows, le.top, le.bottom, lo, hi },
+            );
+        }
+
         /// Recover a scroll that an application performed by repainting.
         ///
         /// `had_event` is true when a real scroll event already described this
@@ -1582,6 +1666,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // The gesture is over, so the region an application declared
                 // during it stops being what the next one will use.
                 self.scroll_anim_app_region = null;
+                self.scroll_event_span = null;
                 return;
             }
 
@@ -1653,9 +1738,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (had_event) {
                 self.scroll_pre_event_hashes.clearRetainingCapacity();
                 self.scroll_pre_event_hashes.appendSlice(self.alloc, prev) catch {};
+                if (prev.len == cur.len) self.extendEventRows(cur, prev, n, cols);
                 return;
             }
             if (prev.len != cur.len) return;
+
+            // The rows an event left out are often repainted a frame AFTER it
+            // (nvim's figure rows, see `extendEventRows`): check again against
+            // the screen from before the event, while that event is recent.
+            if (self.scroll_anim_last_event) |le| {
+                const pre = self.scroll_pre_event_hashes.items;
+                if (sinceMs(now, le.ts) <= repair_partial_ms and pre.len == cur.len)
+                    self.extendEventRows(cur, pre, n, cols);
+            }
 
             const shift = ScrollAnim.detectShift(
                 cur,
@@ -2330,6 +2425,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.config.scroll_animation_reserve_bottom;
                 const bottom = ev.bottom -| reserve;
                 if (bottom < ev.region_top) break :scroll;
+                if (self.scroll_anim_last_event) |*le| {
+                    le.top = ev.region_top;
+                    le.bottom = bottom;
+                }
+                self.scroll_event_span = if (self.scroll_event_span) |sp| .{
+                    .top = @min(sp.top, ev.region_top),
+                    .bottom = @max(sp.bottom, bottom),
+                } else .{ .top = ev.region_top, .bottom = bottom };
 
                 // Remember it for the repaint detector, which cannot see a
                 // scrolling margin and would otherwise animate the rows this
@@ -2463,7 +2566,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // state updates.
             {
                 // Overlay pins compare this frame's backgrounds with the last.
-                const pin_push = self.scroll_frame_push;
+                // On every frame of a running animation, not only on frames
+                // that pushed: an application can move its overlay between
+                // scrolls (yazi's bar moving down a list that stopped), and a
+                // mask left from the last push held the old row still and
+                // left the new one sliding -- a bar half on one row, its caps
+                // on another. Frames without a push use the last push's
+                // direction for "carried".
+                const pushed = self.scroll_frame_push != null;
+                if (self.scroll_frame_push) |fp| self.scroll_last_push = .{ .rows = fp.rows, .top = fp.top, .bottom = fp.bottom, .left = fp.left, .right = fp.right };
+                const pin_push = if (self.scroll_frame_push) |fp| fp else if (self.scroll_anim.active() and self.scroll_pin_live) if (self.scroll_last_push) |lp| @TypeOf(self.scroll_frame_push.?){ .rows = lp.rows, .top = lp.top, .bottom = lp.bottom, .left = lp.left, .right = lp.right } else null else null;
                 self.scroll_frame_push = null;
                 if (pin_push != null) {
                     self.scroll_bg_prev.clearRetainingCapacity();
@@ -2502,6 +2614,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             return if (v >= 0) @intFromFloat(v) else dflt;
                         }
                     }.f;
+                    // A frame that did not scroll cannot find text that
+                    // stayed while the rest moved (`pinStillText`): carry
+                    // those pins over where the cell is unchanged.
+                    if (!pushed) {
+                        self.scroll_pin_prev.clearRetainingCapacity();
+                        self.scroll_pin_prev.appendSlice(self.alloc, self.scroll_pin.items) catch {};
+                    }
                     ScrollAnim.computePins(
                         shaderpkg.CellBg,
                         self.scroll_pin.items,
@@ -2514,7 +2633,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (a.active()) @min(pp.left, f2u(a.left, pp.left)) else pp.left,
                         if (a.active()) @min(@max(pp.right, f2u(a.right, pp.right)), self.cells.size.columns - 1) else pp.right,
                     );
-                    ScrollAnim.pinStillText(
+                    if (!pushed) carry: {
+                        const now_h = self.scroll_row_hashes.items;
+                        const bef_h = self.scroll_hashes_before.items;
+                        const old = self.scroll_pin_prev.items;
+                        if (old.len != n or now_h.len != n or bef_h.len != n) break :carry;
+                        for (0..n) |k| if (old[k][1] != 0 and now_h[k] == bef_h[k]) {
+                            self.scroll_pin.items[k][0] = 255;
+                            self.scroll_pin.items[k][1] = 255;
+                        };
+                    } else ScrollAnim.pinStillText(
                         shaderpkg.CellBg,
                         self.scroll_pin.items,
                         self.scroll_row_hashes.items,

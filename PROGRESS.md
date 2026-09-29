@@ -2291,3 +2291,33 @@ green diff rows.
 Suite subset unchanged (hold_* 97-100, tp 100, wheel fast 89-95, ctrl_d 100).
 Harness: `sweep.py` (hidden nvim, whole-chapter held-j or wheel sweep,
 flags multi-row steps and reflows) -- it found the figures arriving late.
+
+## 2026-09-29 (round 7) — the figure tear, readable bars
+
+From the user's OBS recordings (frame-exact):
+
+1. **A figure torn in two while scrolling up onto it** (CSAPP 291: its first
+   row drawn twice, a later one lost, for one frame). nvim scrolls only the
+   rows BELOW a figure hung above its top line (`IL` in a region starting
+   there: `region=5..52`, `6..52`, ...) and repaints the figure's rows one row
+   lower; the event animated its region only, so part of the figure slid and
+   part did not. Ruled out first by replaying nvim's own output (396 frames)
+   and tmux's output to the terminal (506 frames) through pyte: no frame had
+   a duplicated image row -- it was ours. `extendEventRows`: rows beside the
+   event whose content is last frame's shifted by the same amount join the
+   animation and the gesture's app region; rows arriving at the edge join
+   only inside rows some event of the gesture covered (the status line, row
+   53, changes every step) or if they hold a figure. Also checked on the
+   frames after the event within 60 ms (nvim often repaints those rows a
+   frame later), against the pre-event hashes.
+2. **yazi's hovered name unreadable while j is held**: the list is always
+   part-way into a slide, and a name in its normal light colour on the light
+   bar vanished. Text over a light colour-only pin is drawn in the terminal
+   background colour (cell_text.f `recolor`).
+3. **Bar-coloured block sliding off the bar**: `fillUnderlay` skips cells of
+   the pin's own colour (yazi's icon cell is bar-coloured, unpinned).
+4. **Stale pins when the bar moves without a scroll**: pins are recomputed on
+   every frame of a running animation (last push's direction), text pins
+   carried over on frames that did not scroll.
+
+Suite subset: hold_* 100, tp 100, ctrl_d 100, wheel fast 92-95; tmux zoom 0.

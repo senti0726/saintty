@@ -904,11 +904,25 @@ test "pins: a label's text is held, a bar's changing names are not" {
 pub fn fillUnderlay(comptime T: type, under: []T, pins: []const T, bg_now: []const T, cols: usize) void {
     if (cols == 0 or under.len != pins.len or bg_now.len != pins.len) return;
     const nrows = pins.len / cols;
+    const eq = std.meta.eql;
     for (0..nrows) |y| {
-        var fill = std.mem.zeroes(T);
         for (0..cols) |c| {
             const k = y * cols + c;
-            if (pins[k][0] == 0) fill = bg_now[k] else under[k] = fill;
+            if (pins[k][0] == 0) continue;
+            // Nearest unpinned cell to the left whose colour is NOT the pin's
+            // own: yazi paints the icon cell in the bar's colour without it
+            // being pinned, and filling from there slid a bar-coloured block
+            // off the bar.
+            var fill = std.mem.zeroes(T);
+            var x = c;
+            while (x > 0) {
+                x -= 1;
+                const j = y * cols + x;
+                if (pins[j][0] != 0 or eq(bg_now[j], bg_now[k])) continue;
+                fill = bg_now[j];
+                break;
+            }
+            under[k] = fill;
         }
     }
 }

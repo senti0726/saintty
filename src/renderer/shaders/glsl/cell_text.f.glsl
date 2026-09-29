@@ -42,6 +42,7 @@ void main() {
     // tmux's status line, nvim's bars, a prompt box an application keeps
     // pinned to the bottom -- for as long as any offset was live, so they
     // vanished and reappeared on every scrolled frame.
+    bool recolor = false;
     if (in_data.scroll_clip > 0.5) {
         float band_top = grid_padding.x + scroll_anim.y * cell_size.y;
         float band_bot = grid_padding.x + (scroll_anim.z + 1.0) * cell_size.y;
@@ -58,6 +59,19 @@ void main() {
             bool pin = (m & 0xFFu) != 0u;
             // Byte 1: the pin holds its text (see ScrollAnim.markPinnedText).
             bool held = ((m >> 8u) & 0xFFu) != 0u;
+            // Text sliding across a colour-only bar is drawn in the bar's
+            // own text colour: in yazi's light bar a name in its normal light
+            // colour vanished, and with j held the list is always part-way
+            // into a slide, so the hovered name was never readable. The bar
+            // colour is the cell's background (not displaced: pinned); on a
+            // light bar the text goes dark (the terminal's background colour),
+            // on a dark one it stays as it is.
+            if (pin && !held && in_data.scroll_clip < 2.5 && cell.x >= 0 && cell.y >= 0 &&
+                cell.x < int(gsz.x) && cell.y < int(gsz.y)) {
+                vec4 bar = load_color(unpack4u8(bg_colors[uint(cell.y) * gsz.x + uint(cell.x)]), true);
+                float lum = dot(bar.rgb, vec3(0.2126, 0.7152, 0.0722));
+                if (bar.a > 0.5 && lum > 0.35) recolor = true;
+            }
             if (in_data.scroll_clip > 2.5) {
                 // A colour-only pin's own text (yazi's hovered name, drawn in
                 // the bar's colours): only where it is over the bar. Off it,
@@ -81,6 +95,7 @@ void main() {
         {
             // Our input color is always linear.
             vec4 color = in_data.color;
+            if (recolor) color = vec4(load_color(unpack4u8(bg_color_packed_4u8), true).rgb, 1.0);
 
             // If we're not doing linear blending, then we need to
             // re-apply the gamma encoding to our color manually.
