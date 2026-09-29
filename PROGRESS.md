@@ -2218,3 +2218,41 @@ Harness: `yazi.py` (`--pre=N` j presses to reach the list-scrolls-under-cursor
 case), `tmux_zoom.py`, and new scenarios `hold_j_{figs,maths,tables}`,
 `hold_k{,_maths,_tables}`, `wheel_fast_up`, `tp_fast_up`, `tp_slow_up`
 (Scenario `top=True` starts a key scenario with the cursor on the top row).
+
+## 2026-09-29 (round 5) — held-j jumps, yazi icons/bar/short lists, the gutter
+
+The user's report after round 4, tested on the 4K panel. New tool:
+`steps.py` presses j/k one at a time and diffs `capture-pane` text, flagging
+any press that moved more than one row or reflowed. smooth% could not see
+these: they slid smoothly, just too far. The nvim causes were fixed in
+dotfiles (raw cursor line off in normal mode, linewalk stale w_botline,
+snacks figures placed only on screen); every press in 1555-1580,
+1800-1880, 2650-2690 and 2795-2825 is now one row, at 0.35 s and 0.12 s.
+
+Renderer (`scroll_anim.zig`, `generic.zig`, text shaders):
+1. **Identical-icon columns ride.** A column the same down every row (a
+   folder of one file type in yazi) is unchanged AND what the shift would put
+   there; it counted as a divider, so icons stood while names slid. Only a
+   column drawn as a rule (`isVerticalRule`) divides now; others join the
+   scroll they touch (across ≤2 blank columns).
+2. **Short lists do not shake.** `min_region_cols` is checked on the run's
+   own evidence before pane-wide weak widening: yazi's relabelled numbers
+   (2 cols) plus scraps from the cursor's rows grew to `cols=28..103` on every
+   `j`. Test uses the real captured frames (`src/renderer/testdata/`); a
+   synthetic version passed even without the fix.
+3. **The gutter moves the same way every step.** A run starting within 5
+   columns of the left edge, with no drawn border before it, starts at 0.
+   Relative numbers mostly keep their value per row, so the gutter read as a
+   still divider on some frames and not others: the left edge wandered 0/2/5
+   while events always moved the full width.
+4. **A frame caught mid-redraw.** A counter-shift within 60 ms of an event,
+   which the pre-event frame explains as exactly the event, is dropped
+   (`shift=-1 cols=0..162` 1 ms after `rows=1` at CSAPP 2808).
+5. **Pins hold text only when the text stayed** (mask byte 1,
+   `markPinnedText`): Claude Code's label and sticky header yes; yazi's bar
+   no — its name froze while the number and size on the same row slid.
+
+Suite unchanged within noise (hold_* 100, tp 98-100, ctrl_d/f 100, wheel
+fast 87-95). `tmux_zoom.py` now counts mid-slide frames (0), not event
+lines. The Claude Code "empty line" was Claude Code's own spacer row above
+the prompt box (present in tmux's grid) — not ours.

@@ -62,8 +62,11 @@ for (var i = 0; i < w.length; i++) if (String(w[i].caption).indexOf("{TITLE}") >
         logf.flush()
         log = run.slice_file(out / "ghostty.full.log", g0)
         (out / "zoom.log").write_text(log)
-        n = sum(1 for l in log.splitlines() if "repaintscroll shift" in l or "scroll event:" in l)
-        print(f"animated scrolls during 3 zoom/unzoom cycles: {n}")
+        # Frames drawn off their model position. Not "scroll event" lines:
+        # tmux's unzoom IS a scroll event (the whole region), logged before
+        # the renderer declines to animate it.
+        n = sum(1 for l in log.splitlines() if "scrolltrace" in l and "off_px=0.000" not in l)
+        print(f"frames drawn mid-slide during 3 zoom/unzoom cycles: {n}")
     finally:
         tm("kill-server")
         if proc.poll() is None:

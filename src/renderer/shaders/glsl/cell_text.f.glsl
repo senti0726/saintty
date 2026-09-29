@@ -52,7 +52,9 @@ void main() {
             ivec2 cell = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
             if (cell.x >= 0 && cell.y >= 0 && cell.x < int(gsz.x) && cell.y < int(gsz.y)) {
                 uint pidx = uint(scroll_anim_cols.w) + uint(cell.y) * gsz.x + uint(cell.x);
-                if ((bg_colors[pidx] & 0xFFu) != 0u) discard;
+                // Byte 1: the pin holds its text (see ScrollAnim.markPinnedText);
+                // a bar that only holds its colour lets the names slide over it.
+                if (((bg_colors[pidx] >> 8u) & 0xFFu) != 0u) discard;
             }
         }
     }

@@ -202,6 +202,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// noticing that this frame's rows are last frame's rows, shifted.
         scroll_row_hashes: std.ArrayList(u64) = .empty,
 
+        /// The cell hashes from just BEFORE the last frame that carried a
+        /// scroll event. See "a frame caught mid-redraw" in
+        /// `detectRepaintScroll`.
+        scroll_pre_event_hashes: std.ArrayList(u64) = .empty,
+
+        /// The previous frame's cell hashes, kept one frame longer than
+        /// `scroll_row_hashes` so the pin pass can ask whether a pinned
+        /// cell's TEXT stayed too. See `markPinnedText`.
+        scroll_hashes_before: std.ArrayList(u64) = .empty,
+
         /// The scrolling region the application last declared for itself,
         /// while a gesture is in progress.
         ///
@@ -955,6 +965,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn deinit(self: *Self) void {
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.scroll_row_hashes.deinit(self.alloc);
+            self.scroll_pre_event_hashes.deinit(self.alloc);
+            self.scroll_hashes_before.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
@@ -1202,6 +1214,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub const repaint_scroll_min_rows: usize = 6;
         pub const repaint_scroll_min_ratio: f32 = 0.6;
 
+        /// How soon after a scroll event a counter-shift may be the rest of
+        /// that event's redraw. See "a frame caught mid-redraw".
+        pub const repair_partial_ms: i64 = 60;
+
         /// A point in the future when the renderer needs to be driven
         /// again to keep animating, and what kind of drive it needs.
         pub const AnimationWake = struct {
@@ -1376,7 +1392,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const sy = ScrollAnim.ghostY(g.grid_pos[1]) + @as(i32, @intCast(rows));
                     const sx: usize = g.grid_pos[0];
                     if (sy >= 0 and sy < @as(i32, @intCast(nrows)) and sx < pc and
-                        self.scroll_pin.items[@as(usize, @intCast(sy)) * pc + sx][0] != 0) continue;
+                        self.scroll_pin.items[@as(usize, @intCast(sy)) * pc + sx][1] != 0) continue;
                     self.scroll_ghost.items[w] = g;
                     w += 1;
                 }
@@ -1494,6 +1510,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             {
                 self.scroll_chain_ts = null;
                 self.scroll_row_hashes.clearRetainingCapacity();
+                self.scroll_hashes_before.clearRetainingCapacity();
                 // The gesture is over, so the region an application declared
                 // during it stops being what the next one will use.
                 self.scroll_anim_app_region = null;
@@ -1559,11 +1576,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const prev = self.scroll_row_hashes.items;
             defer {
+                self.scroll_hashes_before.clearRetainingCapacity();
+                self.scroll_hashes_before.appendSlice(self.alloc, prev) catch {};
                 self.scroll_row_hashes.clearRetainingCapacity();
                 self.scroll_row_hashes.appendSlice(self.alloc, cur) catch {};
             }
 
-            if (had_event) return;
+            if (had_event) {
+                self.scroll_pre_event_hashes.clearRetainingCapacity();
+                self.scroll_pre_event_hashes.appendSlice(self.alloc, prev) catch {};
+                return;
+            }
             if (prev.len != cur.len) return;
 
             const shift = ScrollAnim.detectShift(
@@ -1598,6 +1621,33 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // interface at its bottom edge to reserve.
                 bottom = bottom -| self.config.scroll_animation_reserve_bottom;
                 if (bottom < top) return;
+            }
+
+            // A FRAME CAUGHT MID-REDRAW. The frame with the event can be drawn
+            // between the application's scroll command and its repaint of the
+            // rows below it, so the NEXT frame's rows differ from that
+            // half-done one -- and can match it a row the other way. nvim at
+            // CSAPP ch. 2 line 2808 (a formula at the top of the window): `j`
+            // gave `rows=1`, and 1 ms later `shift=-1 rows=7..52 cols=0..162`
+            // against it, which slid the left three quarters of the page back
+            // down, gutter included, and pinned a dozen runs of text. Against
+            // the screen from before the event the same rows moved exactly as
+            // the event said, so the event already animates them: drop it.
+            if (self.scroll_anim_last_event) |le| {
+                const pre = self.scroll_pre_event_hashes.items;
+                if (sinceMs(now, le.ts) <= repair_partial_ms and
+                    (shift.rows > 0) != (le.rows > 0) and pre.len == cur.len)
+                {
+                    if (ScrollAnim.detectShift(cur, pre, n, cols, repaint_scroll_min_rows, repaint_scroll_min_ratio)) |whole| {
+                        if (whole.rows == le.rows) {
+                            if (self.config.scroll_trace) log.info(
+                                "repaintscroll partial shift={d} rows={d}..{d} cols={d}..{d} after rows={d} mono_us={d}",
+                                .{ shift.rows, shift.top, shift.bottom, shift.left, shift.right, le.rows, @divTrunc(now.nanoseconds, std.time.ns_per_us) },
+                            );
+                            return;
+                        }
+                    }
+                }
             }
 
             // The application's own scroll carried screen-fixed columns (the
@@ -2395,6 +2445,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (a.active()) @min(pp.left, f2u(a.left, pp.left)) else pp.left,
                         if (a.active()) @min(@max(pp.right, f2u(a.right, pp.right)), self.cells.size.columns - 1) else pp.right,
                     );
+                    ScrollAnim.markPinnedText(
+                        shaderpkg.CellBg,
+                        self.scroll_pin.items,
+                        self.scroll_row_hashes.items,
+                        self.scroll_hashes_before.items,
+                        self.cells.size.columns,
+                    );
                     self.scroll_pin_live = self.scroll_anim.active();
                     if (self.config.scroll_trace) {
                         const pc = self.cells.size.columns;
@@ -2405,7 +2462,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 if (first == null) first = c;
                                 cnt += 1;
                             };
-                            if (cnt > 0) log.info("scrollpin row={d} col={d} n={d} shift={d}", .{ r, first.?, cnt, pp.rows });
+                            if (cnt > 0) log.info("scrollpin row={d} col={d} n={d} text={} shift={d}", .{ r, first.?, cnt, self.scroll_pin.items[r * pc + first.?][1] != 0, pp.rows });
                         }
                     }
                 }

@@ -75,7 +75,8 @@ void main() {
     if (!ghost && scroll_anim.x != 0.0 && scroll_anim_cols.w > 0.0 &&
         grid_pos.x < grid_size.x && grid_pos.y < grid_size.y) {
         uint pidx = uint(scroll_anim_cols.w) + uint(grid_pos.y) * grid_size.x + uint(grid_pos.x);
-        pinned = (bg_colors[pidx] & 0xFFu) != 0u;
+        // Byte 1: the pin holds its text too (ScrollAnim.markPinnedText).
+        pinned = ((bg_colors[pidx] >> 8u) & 0xFFu) != 0u;
     }
     if (!pinned && scroll_anim.x != 0.0 &&
         (ghost || (gy >= scroll_anim.y && gy <= scroll_anim.z)) &&

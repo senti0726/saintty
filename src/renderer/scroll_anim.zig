@@ -678,6 +678,66 @@ pub fn computePins(
 /// code, a highlighted line, a table header, lost their colour for the
 /// length of a slide -- "the first 4-8 lines look like a filter
 /// unhighlights them", on every hard flick.
+/// Which pinned runs hold their TEXT still as well as their colour: byte 1 of
+/// the mask. A pin is an overlay the scroll passes under, and there are two
+/// kinds. Claude Code's "Jump to bottom" label is text that never moved, and
+/// must stay whole while the transcript slides under it. yazi's selection bar
+/// is only a COLOUR that stays: the names in it are the list, and the next
+/// name arrives there with every step. Holding that text too froze the
+/// hovered name while the number to its left and the size to its right slid
+/// on -- the row came apart ("starship" detached from "45" and "1").
+///
+/// A run's text is held when most of its glyphs are the same as last frame.
+/// `now`/`before` are the detector's cell hashes; without them (the gate was
+/// closed) every pinned run holds its text, as before this existed.
+pub fn markPinnedText(comptime T: type, pins: []T, now: []const u64, before: []const u64, cols: usize) void {
+    const have = now.len == pins.len and before.len == pins.len and cols > 0;
+    var i: usize = 0;
+    while (i < pins.len) {
+        if (pins[i][0] == 0) {
+            i += 1;
+            continue;
+        }
+        var e = i;
+        while (e < pins.len and pins[e][0] != 0 and (e == i or e % cols != 0)) e += 1;
+        var glyphs: usize = 0;
+        var same: usize = 0;
+        if (have) for (i..e) |k| {
+            const g = glyphOf(now[k]);
+            if (g == blank_glyph) continue;
+            glyphs += 1;
+            if (g == glyphOf(before[k])) same += 1;
+        };
+        const hold: u8 = if (!have or (glyphs > 0 and same * 5 >= glyphs * 4)) 255 else 0;
+        for (i..e) |k| pins[k][1] = hold;
+        i = e;
+    }
+}
+
+test "pins: a label's text is held, a bar's changing names are not" {
+    const T = [4]u8;
+    const cols = 10;
+    var pins: [2 * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var now: [2 * cols]u64 = undefined;
+    var before: [2 * cols]u64 = undefined;
+    for (0..2 * cols) |k| {
+        now[k] = cellKey(@intCast(100 + k), 0);
+        before[k] = now[k];
+    }
+    // Row 0: a label, same text as last frame. Row 1: a bar over a new name.
+    for (2..8) |c| {
+        pins[c][0] = 255;
+        pins[cols + c][0] = 255;
+        before[cols + c] = cellKey(@intCast(900 + c), 0);
+    }
+    markPinnedText(T, &pins, &now, &before, cols);
+    try std.testing.expectEqual(@as(u8, 255), pins[2][1]);
+    try std.testing.expectEqual(@as(u8, 0), pins[cols + 2][1]);
+    // Control: without the detector's hashes every pin holds its text.
+    markPinnedText(T, &pins, &.{}, &.{}, cols);
+    try std.testing.expectEqual(@as(u8, 255), pins[cols + 2][1]);
+}
+
 pub fn ghostBgLen(rows: usize, cols: usize) usize {
     return (rows + 2 * max_ghost_rows) * cols;
 }
@@ -852,6 +912,10 @@ const edge_bridge_cols: usize = 2;
 /// beside them ("58" and its icon detached from the rest of the row). A pane
 /// that really scrolls is wider than any gutter.
 const min_region_cols: usize = 6;
+
+/// A scroll starting this close to the left edge takes the edge with it: the
+/// strip is a line-number gutter. See `detectShift`.
+const gutter_cols: usize = 5;
 
 fn isVerticalRule(key: u64) bool {
     const g = glyphOf(key);
@@ -1071,15 +1135,38 @@ pub fn detectShift(
     // borders, an nvim split's separator, or a whole pane holding still.
     var verdicts: [max_detect_cols]Verdict = undefined;
     var divider: [max_detect_cols]bool = undefined;
+    // Columns that look the same whichever way you read them: unchanged, and
+    // ALSO what the shift would have put there -- the same glyph down every
+    // row. yazi draws one icon per row, and a folder of files of one type
+    // (all `.md`, all folders) is a column of identical icons. That column
+    // counted as a divider (unchanged, non-blank), so the scroll stopped at
+    // it and the icons stood still while their names slid past them. A pane
+    // border is the same shape, so it stays a divider only if it is DRAWN as
+    // one (`isVerticalRule`); anything else rides with the scroll it sits in.
+    var rides: [max_detect_cols]bool = undefined;
+    // Still columns DRAWN as a border (`isVerticalRule`), as opposed to text
+    // that merely held still -- see the gutter rule below.
+    var ruled: [max_detect_cols]bool = undefined;
     const judged = cols <= max_detect_cols;
     if (judged) for (0..cols) |c| {
         verdicts[c] = columnVerdict(Verdict, cur, prev, rows, cols, c, best_shift, min_rows, min_ratio);
         var still: usize = 0;
+        var same: usize = 0;
+        var rules: usize = 0;
         for (0..rows) |i_| {
             const k = cur[i_ * cols + c];
-            if (k == prev[i_ * cols + c] and glyphOf(k) != blank_glyph) still += 1;
+            if (k == prev[i_ * cols + c] and glyphOf(k) != blank_glyph) {
+                still += 1;
+                if (isVerticalRule(k)) rules += 1;
+                const j_ = @as(isize, @intCast(i_)) + best_shift;
+                if (j_ >= 0 and j_ < n and prev[@as(usize, @intCast(j_)) * cols + c] == k) same += 1;
+            }
         }
-        divider[c] = @as(f32, @floatFromInt(still)) >= divider_ratio * @as(f32, @floatFromInt(rows));
+        const is_still = @as(f32, @floatFromInt(still)) >= divider_ratio * @as(f32, @floatFromInt(rows));
+        rides[c] = is_still and rules * 2 < still and
+            @as(f32, @floatFromInt(same)) >= 0.8 * @as(f32, @floatFromInt(still));
+        divider[c] = is_still and !rides[c];
+        ruled[c] = is_still and rules * 2 >= still;
     };
     // Pass 2: a contradiction only splits the region across a DIVIDER. Within
     // one pane, columns that disagree with the shift are its own text having
@@ -1157,6 +1244,15 @@ pub fn detectShift(
     }
     var l = left orelse return null;
 
+    // The width test belongs HERE, on the run's own evidence, before thin
+    // evidence elsewhere in the pane widens it. yazi in a folder too short to
+    // scroll: `j` relabels the relative numbers (a 2-column strip that really
+    // does read as a row shift), and the two rows the cursor left and entered
+    // change too -- scraps of which agree with any shift. Pane-wide inclusion
+    // grew the strip to the whole pane (`cols=28..103`), and every `j` slid
+    // the list a row and back: the list "shook" on each press.
+    if (right - l + 1 < @min(min_region_cols, cols)) return null;
+
     // Within the pane that holds the run -- the columns between the dividers
     // around it -- thin evidence anywhere belongs to the same scroll. The
     // ragged right ends of long lines are weak columns, and a column with
@@ -1177,6 +1273,58 @@ pub fn detectShift(
             },
             else => {},
         };
+        // A run that starts within `gutter_cols` of the screen's left edge,
+        // with no divider before it, starts AT the edge. That strip is a
+        // line-number gutter: nvim's relative numbers are relabelled on
+        // every step, so what they testify changes from frame to frame, and
+        // the detected left edge wandered between columns 0, 2 and 5 on
+        // consecutive `j` presses (CSAPP ch. 2, 2800-2820). A real scroll
+        // event always moves the full width, gutter included, so on the
+        // steps that arrived as repaints the numbers held still and on the
+        // rest they slid: the gutter hopped. Now both kinds move it.
+        //
+        // Only a DRAWN border stops it. Relative numbers mostly keep their
+        // value on each screen row, so the gutter itself reads as a still,
+        // non-blank column -- a divider -- on frames where few lines wrap,
+        // and not on frames where many do. That is the wandering edge.
+        if (l <= gutter_cols) {
+            var clear = true;
+            for (0..l) |c| if (ruled[c]) {
+                clear = false;
+            };
+            if (clear) l = 0;
+        }
+        // A column that rides (see `rides`) goes with the scroll it touches,
+        // across up to `edge_bridge_cols` quiet columns (yazi puts a space
+        // between the icon and the name). Only a region wide enough on its
+        // own evidence (`min_region_cols`): names sharing a long prefix are
+        // riding columns too, and must not widen a relabelled gutter into a
+        // "scroll" (see "a selection bar moving is not the list scrolling").
+        if (right - l + 1 < @min(min_region_cols, cols)) return null;
+        outer: while (true) {
+            var g: usize = 1;
+            while (g <= edge_bridge_cols + 1 and l >= g) : (g += 1) {
+                const c = l - g;
+                if (rides[c]) {
+                    l = c;
+                    continue :outer;
+                }
+                if (verdicts[c] != .neutral or divider[c]) break;
+            }
+            break;
+        }
+        outer: while (true) {
+            var g: usize = 1;
+            while (g <= edge_bridge_cols + 1 and right + g < cols) : (g += 1) {
+                const c = right + g;
+                if (rides[c]) {
+                    right = c;
+                    continue :outer;
+                }
+                if (verdicts[c] != .neutral or divider[c]) break;
+            }
+            break;
+        }
     }
 
     // The rows that MOVED, within those columns only -- not every row that
@@ -1577,8 +1725,8 @@ test "detectShift: a lone coincidence across a pane border cannot widen the regi
                 prev[k] = 7_000_000 + i * cols + c;
                 cur[k] = 7_000_000 + (i + 1) * cols + c;
             } else if (c == 31) { // the border
-                prev[k] = 5;
-                cur[k] = 5;
+                prev[k] = cellKey(0x2502, 5);
+                cur[k] = cellKey(0x2502, 5);
             } else if (c < 33) { // padding
                 prev[k] = cellKey(blank_glyph, 0);
                 cur[k] = cellKey(blank_glyph, 0);
@@ -1898,6 +2046,85 @@ test "detectShift: a pane border appearing is a layout change, not a scroll" {
     // Control: the same frames with the border already present in both.
     for (0..rows) |i| prev[i * cols + 20] = cellKey(0x2502, 3);
     try testing.expect(detectShift(&cur, &prev, rows, cols, 6, 0.6) != null);
+}
+
+fn iconListKey(comptime cols: usize, icon: u32, i: usize, row: usize, col: usize) u64 {
+    // The list sits right of yazi's parent-directory pane, behind its border.
+    if (col < 10) return if (col == 9) cellKey(0x2502, 3) else cellKey(blank_glyph, 0);
+    const c = col - 10;
+    return switch (c) {
+        0, 1 => cellKey(@intCast('0' + (i % 10)), 1),
+        2, 4 => cellKey(blank_glyph, 0),
+        3 => cellKey(icon, 5),
+        else => cellKey(@intCast(5000 + row * cols + c), 2),
+    };
+}
+
+fn iconListFrames(comptime rows: usize, comptime cols: usize, icon: u32, prev: *[rows * cols]u64, cur: *[rows * cols]u64) void {
+    // yazi: relative numbers (cols 0-1, fixed to the screen), a blank, one
+    // icon per row (col 3), a blank, the name (cols 5..). The list scrolls
+    // up by one row; the numbers do not move.
+    for (0..rows) |i| for (0..cols) |c| {
+        prev[i * cols + c] = iconListKey(cols, icon, i, i, c);
+        cur[i * cols + c] = iconListKey(cols, icon, i, i + 1, c);
+    };
+}
+
+fn gutterFrames(comptime rows: usize, comptime cols: usize, border: bool, prev: *[rows * cols]u64, cur: *[rows * cols]u64) void {
+    // nvim: relative numbers in cols 0-3 (relabelled every step: the same
+    // number stays on each screen row), a blank, then prose moving up a row.
+    for (0..rows) |i| for (0..cols) |c| {
+        const k = i * cols + c;
+        if (border and c == 2) {
+            prev[k] = cellKey(0x2502, 3);
+            cur[k] = prev[k];
+        } else if (c < 4) {
+            prev[k] = cellKey(@intCast(600 + (i % 7) * 4 + c), 1);
+            cur[k] = prev[k];
+        } else if (c == 4) {
+            prev[k] = cellKey(blank_glyph, 0);
+            cur[k] = prev[k];
+        } else {
+            prev[k] = cellKey(@intCast(9000 + i * cols + c), 2);
+            cur[k] = cellKey(@intCast(9000 + (i + 1) * cols + c), 2);
+        }
+    };
+}
+
+test "detectShift: a scroll beside a line-number gutter takes the gutter" {
+    const rows = 20;
+    const cols = 40;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    gutterFrames(rows, cols, false, &prev, &cur);
+    const s = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(usize, 0), s.left);
+    // Control: a pane border in that strip keeps the scroll on its side.
+    gutterFrames(rows, cols, true, &prev, &cur);
+    const b = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expect(b.left > 2);
+}
+
+test "detectShift: a column of identical icons slides with its names" {
+    const rows = 20;
+    const cols = 40;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    iconListFrames(rows, cols, 0xF48A, &prev, &cur);
+    const s = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(isize, 1), s.rows);
+    try testing.expectEqual(@as(usize, 13), s.left);
+    try testing.expectEqual(@as(usize, cols - 1), s.right);
+}
+
+test "detectShift: control -- a drawn border in that column still divides" {
+    const rows = 20;
+    const cols = 40;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    iconListFrames(rows, cols, 0x2502, &prev, &cur);
+    const s = detectShift(&cur, &prev, rows, cols, 6, 0.6).?;
+    try testing.expectEqual(@as(usize, 15), s.left);
 }
 
 test "detectShift: a still screen is not a scroll" {
@@ -2524,4 +2751,36 @@ test "ghosts: rows beyond any possible lag are let go" {
     try ghosts.append(alloc, .{ .grid_pos = .{ 3, ghostYEncode(-1) } });
     shiftGhosts(TestGlyph, &ghosts, @intCast(max_ghost_rows + 1), 1, 40);
     try std.testing.expectEqual(@as(usize, 0), ghosts.items.len);
+}
+
+/// A captured screen (`tmux capture-pane -p`) as detector keys: glyph only.
+fn captureKeys(comptime rows: usize, comptime cols: usize, data: []const u8, out: *[rows * cols]u64) !void {
+    @memset(out, cellKey(blank_glyph, 0));
+    var it = std.mem.splitScalar(u8, data, '\n');
+    var r: usize = 0;
+    while (it.next()) |line| : (r += 1) {
+        if (r >= rows) break;
+        var view = try std.unicode.Utf8View.init(line);
+        var cps = view.iterator();
+        var c: usize = 0;
+        while (cps.nextCodepoint()) |cp| : (c += 1) {
+            if (c >= cols) break;
+            out[r * cols + c] = if (cp == ' ') cellKey(blank_glyph, 0) else cellKey(cp, 0);
+        }
+    }
+}
+
+test "detectShift: the cursor walking a list too short to scroll is not a scroll" {
+    // yazi, `j` in a 16-entry folder (captured 2026-09-29, 210x55): nothing
+    // scrolls, but the relative numbers relabel -- a 2-column strip that does
+    // read as `shift=-1` -- and the rows the cursor left and entered changed
+    // too. Pane-wide widening made that `cols=28..103`, and the list slid a
+    // row and back on every press.
+    const rows = 55;
+    const cols = 210;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    try captureKeys(rows, cols, @embedFile("testdata/yazi-short-list-0.txt"), &prev);
+    try captureKeys(rows, cols, @embedFile("testdata/yazi-short-list-1.txt"), &cur);
+    try testing.expectEqual(@as(?Shift, null), detectShift(&cur, &prev, rows, cols, 6, 0.6));
 }
