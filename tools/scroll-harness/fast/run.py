@@ -107,6 +107,13 @@ class Rig:
         Wake it, and remember to put it back: stop() does, via powerdevil's
         own "Turn Off Screen" action -- `kscreen-doctor --dpms off` was
         measured not to take."""
+        # Hold the screen on for the whole run: the user's power profile turns
+        # it off after 15 minutes idle, and virtual-device input does not
+        # always count as activity -- a long suite went dark part-way.
+        self.inhibit = subprocess.Popen(
+            ["kde-inhibit", "--power", "--screenSaver", "sleep", "7200"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
         state = sh("kscreen-doctor", "--dpms", "show", timeout=10).stdout
         self.woke = ": off" in state
         if self.woke:
@@ -124,6 +131,9 @@ class Rig:
             time.sleep(1)
 
     def sleep_screen(self):
+        inh = getattr(self, "inhibit", None)
+        if inh and inh.poll() is None:
+            os.killpg(inh.pid, signal.SIGTERM)
         if getattr(self, "woke", False):
             time.sleep(1)  # the devices closing counts as activity
             sh("qdbus-qt6", "org.kde.kglobalaccel", "/component/org_kde_powerdevil",
