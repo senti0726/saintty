@@ -2321,3 +2321,38 @@ From the user's OBS recordings (frame-exact):
    carried over on frames that did not scroll.
 
 Suite subset: hold_* 100, tp 100, ctrl_d 100, wheel fast 92-95; tmux zoom 0.
+
+## 2026-09-30 (round 8) — frames, not guesses
+
+1. **GHOSTTY_FRAME_DUMP** (OpenGL.zig `dumpFrame`): every presented frame,
+   shrunk to a third on the GPU, appended to a file (16-byte header +
+   RGBA). `frames.py DUMP --check` measures per frame how far the text and
+   each figure moved and flags disagreements and figures that VANISH;
+   `--png` exports frames. Screen recorders were not usable (OBS's PipeWire
+   capture opens a picker dialog on every start — it popped up on the user's
+   screen while they worked; killed). The read-back slows drawing, so smooth%
+   under a dump is not representative (64-73 vs 94-100 clean); use it for
+   what is drawn, not when. Gate GUI runs on the user being idle: tmux
+   `#{client_activity}` (KDE's idle query is unsupported here).
+2. **Regression from round 7: overlays on frames without a push.** The
+   per-frame pin recompute pinned every coloured run that "stayed put" on a
+   frame where nothing moved: inline code, code-block labels, `󰦪 text` held
+   still while the prose slid (317 pins in a held-j run; 0 after), and the
+   text check held every overlay's text. Frames without a push now keep last
+   frame's pins minus cells whose colour or text changed.
+3. **An event that undersells** (generic.zig `applyPendingScroll`). tmux
+   merges an application's updates, so one frame held a `rows=2` scroll
+   event AND a repaint that moved the content ~10 rows (one wheel notch:
+   nvim 2343 -> 2350 skipcol 752 in 8 steps / 26 ms); the event animated 2
+   and 8 snapped — with a figure on screen, the figure jumped. The event is
+   now animated after the frame is read, by the distance `detectShiftUpTo`
+   (up to 24 rows, same direction, >= 80% of the width) finds, when that is
+   further than the event said. Logged as `scroll event undersold`.
+4. Harness: pointer parking nudges until mid-screen (the display went to
+   scale 2.25 / 120 Hz / HDR and the fixed moves landed on the status line).
+
+Clean suite at 120 Hz / 2.25: hold_* 99.6-99.7, tp_fast 99.5, tp_fast_up 96.5,
+wheel_fast 94.2, wheel_fast_up 93.3, ctrl_d 98.3.
+
+The remaining figure jumps were nvim's (snacks.image closing and re-placing
+figures; dotfiles SETUP-LOG 2026-09-30).

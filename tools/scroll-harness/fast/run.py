@@ -269,22 +269,33 @@ for (var i = 0; i < w.length; i++)
             mouse.move(-200, -200)
             time.sleep(0.005)
         for _ in range(60):  # then slowly out, so acceleration stays small
-            mouse.move(12, 8)
+            mouse.move(12, 4)
             time.sleep(0.01)
         time.sleep(0.3)
-        # One wheel notch each way; nvim records where it happened.
-        for d in (1, -1):
-            for _ in range(8):
-                mouse.tick(d)
-                time.sleep(0.004)
-            time.sleep(0.3)
-        pos = self.nv('string(getmousepos())')
-        lines = int(self.nv("&lines") or 0)
         import ast
-        try:
-            row = ast.literal_eval(pos.replace(":", ":"))["screenrow"]
-        except Exception:
-            row = -1
+        lines = int(self.nv("&lines") or 0)
+        row, pos = -1, ""
+        # One wheel notch each way; nvim records where it happened. How far
+        # the moves above land depends on the display scale (2 -> 2.25 put
+        # the pointer on the status line), so nudge until it is mid-screen.
+        for _attempt in range(8):
+            for d in (1, -1):
+                for _ in range(8):
+                    mouse.tick(d)
+                    time.sleep(0.004)
+                time.sleep(0.3)
+            pos = self.nv('string(getmousepos())')
+            try:
+                row = ast.literal_eval(pos)["screenrow"]
+            except Exception:
+                row = -1
+            if 3 <= row <= lines - 4:
+                break
+            dy = -6 if row > lines // 2 or row < 0 else 6
+            for _ in range(30):
+                mouse.move(0, dy)
+                time.sleep(0.01)
+            time.sleep(0.2)
         if not (3 <= row <= lines - 4):
             raise SystemExit(f"pointer not over the text (getmousepos={pos}, lines={lines})")
         print(f"pointer parked at screen row {row}/{lines}")

@@ -326,8 +326,83 @@ pub fn present(self: *OpenGL, target: Target) !void {
         gl.c.GL_NEAREST,
     );
 
+    // Debugging aid: GHOSTTY_FRAME_DUMP=<file> appends every presented frame.
+    dumpFrame(target);
+
     // Keep track of this target in case we need to repeat it.
     self.last_target = target;
+}
+
+/// FRAME DUMP (debugging aid). With `GHOSTTY_FRAME_DUMP=<file>` in the
+/// environment, every presented frame is shrunk to a third on the GPU and
+/// appended to that file: a 16-byte header (u64 monotonic microseconds, u32
+/// width, u32 height) then RGBA rows, bottom row first. Screen recorders
+/// cannot be scripted here (OBS's PipeWire capture asks with a dialog every
+/// time) and sample at their own rate; this is exactly what Ghostty drew, one
+/// entry per frame, which is what visual scroll bugs needed (a figure torn for
+/// one frame). `tools/scroll-harness/fast/frames.py` unpacks it. Off unless
+/// set; the read-back stalls the GPU, so timing under it is not representative.
+const FrameDump = struct {
+    tried: bool = false,
+    fd: c_int = -1,
+    fbo: gl.c.GLuint = 0,
+    rbo: gl.c.GLuint = 0,
+    w: i32 = 0,
+    h: i32 = 0,
+    buf: []u8 = &.{},
+};
+var frame_dump: FrameDump = .{};
+
+fn dumpFrame(target: Target) void {
+    const d = &frame_dump;
+    if (!d.tried) {
+        d.tried = true;
+        const path = std.c.getenv("GHOSTTY_FRAME_DUMP") orelse return;
+        d.fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (d.fd < 0) log.warn("frame dump: cannot open {s}", .{path});
+    }
+    if (d.fd < 0) return;
+    const ctx = gl.glad.context;
+    const w: i32 = @intCast(@max(1, target.width / 3));
+    const h: i32 = @intCast(@max(1, target.height / 3));
+    var prev_draw: gl.c.GLint = 0;
+    var prev_read: gl.c.GLint = 0;
+    ctx.GetIntegerv.?(gl.c.GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+    ctx.GetIntegerv.?(gl.c.GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+    defer {
+        ctx.BindFramebuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, @intCast(prev_draw));
+        ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(prev_read));
+    }
+    if (d.fbo == 0) {
+        ctx.GenFramebuffers.?(1, &d.fbo);
+        ctx.GenRenderbuffers.?(1, &d.rbo);
+    }
+    if (d.w != w or d.h != h) {
+        ctx.BindRenderbuffer.?(gl.c.GL_RENDERBUFFER, d.rbo);
+        ctx.RenderbufferStorage.?(gl.c.GL_RENDERBUFFER, gl.c.GL_RGBA8, w, h);
+        ctx.BindFramebuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, d.fbo);
+        ctx.FramebufferRenderbuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, gl.c.GL_COLOR_ATTACHMENT0, gl.c.GL_RENDERBUFFER, d.rbo);
+        if (d.buf.len > 0) std.heap.page_allocator.free(d.buf);
+        d.buf = std.heap.page_allocator.alloc(u8, @as(usize, @intCast(w * h * 4)) + 16) catch {
+            d.buf = &.{};
+            return;
+        };
+        d.w = w;
+        d.h = h;
+    }
+    if (d.buf.len == 0) return;
+    // The target is bound for reading (see `present`).
+    ctx.BindFramebuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, d.fbo);
+    ctx.BlitFramebuffer.?(0, 0, @intCast(target.width), @intCast(target.height), 0, 0, w, h, gl.c.GL_COLOR_BUFFER_BIT, gl.c.GL_LINEAR);
+    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, d.fbo);
+    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, d.buf.ptr + 16);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    const us: u64 = @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1000;
+    std.mem.writeInt(u64, d.buf[0..8], us, .little);
+    std.mem.writeInt(u32, d.buf[8..12], @intCast(w), .little);
+    std.mem.writeInt(u32, d.buf[12..16], @intCast(h), .little);
+    _ = std.c.write(d.fd, d.buf.ptr, d.buf.len);
 }
 
 /// Present the last presented target again.

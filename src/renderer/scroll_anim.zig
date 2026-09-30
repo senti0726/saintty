@@ -1238,6 +1238,11 @@ fn movedWith(cur: u64, prev: u64, src: u64) bool {
 ///     restyled row equals the row above it in its new colour.
 ///
 /// A cell that *does* testify still has to match in full, glyph and style.
+/// The furthest shift `detectShiftUpTo` looks for when checking what a frame
+/// with a scroll event really did (see generic.zig "an event that
+/// undersells"). A plain repaint is still held to `max_animated_rows`.
+pub const max_detect_rows: isize = 24;
+
 pub fn detectShift(
     cur: []const u64,
     prev: []const u64,
@@ -1245,6 +1250,18 @@ pub fn detectShift(
     cols: usize,
     min_rows: usize,
     min_ratio: f32,
+) ?Shift {
+    return detectShiftUpTo(cur, prev, rows, cols, min_rows, min_ratio, max_animated_rows);
+}
+
+pub fn detectShiftUpTo(
+    cur: []const u64,
+    prev: []const u64,
+    rows: usize,
+    cols: usize,
+    min_rows: usize,
+    min_ratio: f32,
+    max_rows: isize,
 ) ?Shift {
     if (rows == 0 or cols == 0) return null;
     if (cur.len != rows * cols or prev.len != cur.len) return null;
@@ -1255,8 +1272,8 @@ pub fn detectShift(
     // The shift explaining the most changed cells.
     var best_shift: isize = 0;
     var best_score: usize = 0;
-    var s: isize = -max_animated_rows;
-    while (s <= max_animated_rows) : (s += 1) {
+    var s: isize = -max_rows;
+    while (s <= max_rows) : (s += 1) {
         if (s == 0) continue;
         var score: usize = 0;
         for (0..rows) |i| {

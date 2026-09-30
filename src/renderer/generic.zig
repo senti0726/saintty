@@ -259,8 +259,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// `scroll_ghost` as underlay glyphs. See `keepScrollGhosts`.
         scroll_pin_under: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
         scroll_pin_live: bool = false,
-        /// The mask before this frame's recomputation (frames without a push).
-        scroll_pin_prev: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
         /// The backgrounds as drawn before this frame's rebuild, for pins.
         scroll_bg_prev: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
         /// The last push this frame, for pins: set by `keepScrollGhosts`.
@@ -296,6 +294,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// just outside an event can be the app's own status line (nvim's,
         /// row 53: its position readout changes on every step).
         scroll_event_span: ?struct { top: usize, bottom: usize } = null,
+
+        /// This frame's scroll event, animated once the frame has been read.
+        /// See `applyPendingScroll`.
+        scroll_pending: ?struct { rows: isize, top: usize, bottom: usize, right: usize, limit: f32 } = null,
+        /// Set by `detectRepaintScroll` on an event frame: how far the
+        /// content really moved, when that is further than the event said.
+        scroll_event_total: ?isize = null,
 
         /// When the last frame was actually drawn, so the scroll animation
         /// can pace itself against every draw rather than adding its own on
@@ -1005,7 +1010,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.scroll_prev_images.deinit(self.alloc);
             self.scroll_pin.deinit(self.alloc);
             self.scroll_pin_under.deinit(self.alloc);
-            self.scroll_pin_prev.deinit(self.alloc);
             self.scroll_bg_prev.deinit(self.alloc);
             self.scroll_bg_view.deinit(self.alloc);
             self.scroll_ghost_view.deinit(self.alloc);
@@ -1563,6 +1567,43 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.input_activity_ts = .now(global.io(), .awake);
         }
 
+        /// Animate this frame's scroll event (stashed by the event handling in
+        /// `updateFrame`), by the distance the frame shows when that is
+        /// further than the event said (`scroll_event_total`).
+        fn applyPendingScroll(self: *Self) void {
+            const p = self.scroll_pending orelse return;
+            self.scroll_pending = null;
+            const rows = self.scroll_event_total orelse p.rows;
+            self.scroll_event_total = null;
+            if (rows != p.rows) {
+                self.scroll_trace_rows += rows - p.rows;
+                if (self.scroll_anim_last_event) |*le| le.rows = rows;
+                if (self.config.scroll_trace) log.info(
+                    "scroll event undersold rows={d} -> {d} region={d}..{d}",
+                    .{ p.rows, rows, p.top, p.bottom },
+                );
+            }
+            const cell_h: f32 = @floatFromInt(self.size.cell.height);
+            const was_idle = !self.scroll_anim.active();
+            self.keepScrollGhosts(rows, p.top, p.bottom, 0, p.right, null);
+            self.scroll_anim.push(
+                @as(f32, @floatFromInt(rows)) * cell_h,
+                @floatFromInt(p.top),
+                @floatFromInt(p.bottom),
+                0,
+                @floatFromInt(p.right),
+                p.limit,
+            );
+            if (was_idle) self.scroll_anim_last = null;
+            // Rows beside the event that moved with it (needs the push done).
+            const n = self.terminal_state.row_data.items(.cells).len;
+            const cols: usize = self.terminal_state.cols;
+            const cur = self.scroll_row_hashes.items;
+            const prev = self.scroll_hashes_before.items;
+            if (n > 0 and cur.len == n * cols and prev.len == cur.len)
+                self.extendEventRows(cur, prev, n, cols);
+        }
+
         /// An application's scroll may leave out rows that moved with it,
         /// repainting them instead. nvim scrolling up onto a figure hung above
         /// its top line (virtual lines, `topfill`) scrolls only the rows BELOW
@@ -1738,7 +1779,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (had_event) {
                 self.scroll_pre_event_hashes.clearRetainingCapacity();
                 self.scroll_pre_event_hashes.appendSlice(self.alloc, prev) catch {};
-                if (prev.len == cur.len) self.extendEventRows(cur, prev, n, cols);
+                // AN EVENT THAT UNDERSELLS. tmux merges an application's
+                // updates, so one frame can hold a scroll command AND a
+                // repaint that moved the content further: a wheel notch in
+                // nvim went 2343 -> 2350 (skipcol 752), about ten rows in 8
+                // steps over 26 ms, and arrived as `rows=2` plus a repaint.
+                // The event animated 2 and the other 8 rows snapped -- with a
+                // figure on screen, the figure jumped (captured frame by frame
+                // with GHOSTTY_FRAME_DUMP). The frame is compared with the one
+                // before it; if the content moved further the same way, the
+                // pending event is animated by that distance instead.
+                if (self.scroll_pending) |pend| if (prev.len == cur.len) {
+                    if (ScrollAnim.detectShiftUpTo(cur, prev, n, cols, repaint_scroll_min_rows, repaint_scroll_min_ratio, ScrollAnim.max_detect_rows)) |whole| {
+                        // The same direction, further, and across (nearly)
+                        // the event's whole width: a tmux pane beside it
+                        // moving on its own must not stretch this one.
+                        const wide = (whole.right - whole.left + 1) * 5 >= (pend.right + 1) * 4;
+                        if (wide and (whole.rows > 0) == (pend.rows > 0) and @abs(whole.rows) > @abs(pend.rows))
+                            self.scroll_event_total = whole.rows;
+                    }
+                };
                 return;
             }
             if (prev.len != cur.len) return;
@@ -2443,27 +2503,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .grid_rows = grid_rows,
                 };
 
-                const was_idle = !self.scroll_anim.active();
-                self.keepScrollGhosts(
-                    @intCast(ev.rows),
-                    ev.region_top,
-                    bottom,
-                    0,
-                    self.size.grid().columns -| 1,
-                    null,
-                );
-                self.scroll_anim.push(
-                    offset,
-                    @floatFromInt(ev.region_top),
-                    @floatFromInt(bottom),
+                // Applied after the frame is read (`applyPendingScroll`),
+                // not here: the frame may show the content moved FURTHER than
+                // this event says -- see "an event that undersells".
+                _ = offset;
+                self.scroll_pending = .{
+                    .rows = @intCast(ev.rows),
+                    .top = ev.region_top,
+                    .bottom = bottom,
                     // An application that says it scrolled a region means the
                     // whole width of it; only repaint detection can see a
                     // scroll narrower than the screen.
-                    0,
-                    @floatFromInt(self.size.grid().columns -| 1),
-                    limit,
-                );
-                if (was_idle) self.scroll_anim_last = null;
+                    .right = self.size.grid().columns -| 1,
+                    .limit = limit,
+                };
+                // (see applyPendingScroll)
             }
 
             // Outside the critical area, complete the update we began
@@ -2485,6 +2539,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.config.scroll_animation) {
                 self.detectRepaintScroll(critical.scroll_event != null);
             }
+            self.applyPendingScroll();
 
             // Outside the critical area we can update our links to contain
             // our regex results.
@@ -2614,53 +2669,67 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             return if (v >= 0) @intFromFloat(v) else dflt;
                         }
                     }.f;
-                    // A frame that did not scroll cannot find text that
-                    // stayed while the rest moved (`pinStillText`): carry
-                    // those pins over where the cell is unchanged.
+                    const lo_r = if (a.active()) @min(pp.top, f2u(a.top, pp.top)) else pp.top;
+                    const hi_r = if (a.active()) @min(@max(pp.bottom, f2u(a.bottom, pp.bottom)), self.cells.size.rows - 1) else pp.bottom;
+                    const lo_c = if (a.active()) @min(pp.left, f2u(a.left, pp.left)) else pp.left;
+                    const hi_c = if (a.active()) @min(@max(pp.right, f2u(a.right, pp.right)), self.cells.size.columns - 1) else pp.right;
                     if (!pushed) {
-                        self.scroll_pin_prev.clearRetainingCapacity();
-                        self.scroll_pin_prev.appendSlice(self.alloc, self.scroll_pin.items) catch {};
-                    }
-                    ScrollAnim.computePins(
-                        shaderpkg.CellBg,
-                        self.scroll_pin.items,
-                        self.scroll_bg_prev.items,
-                        self.cells.bg_cells,
-                        self.cells.size.columns,
-                        pp.rows,
-                        if (a.active()) @min(pp.top, f2u(a.top, pp.top)) else pp.top,
-                        if (a.active()) @min(@max(pp.bottom, f2u(a.bottom, pp.bottom)), self.cells.size.rows - 1) else pp.bottom,
-                        if (a.active()) @min(pp.left, f2u(a.left, pp.left)) else pp.left,
-                        if (a.active()) @min(@max(pp.right, f2u(a.right, pp.right)), self.cells.size.columns - 1) else pp.right,
-                    );
-                    if (!pushed) carry: {
+                        // A FRAME THAT DID NOT SCROLL finds no new overlays:
+                        // with nothing moving, every coloured run "stayed
+                        // where it was" and "was not carried there" -- inline
+                        // code, a code block's language label, all pinned
+                        // and held still while the text around them slid,
+                        // and the text check held every overlay's text (the
+                        // round-7 per-frame recompute did exactly that). It
+                        // keeps last frame's pins instead, dropping cells
+                        // whose colour or text changed since (yazi's bar
+                        // leaving a row without a scroll).
                         const now_h = self.scroll_row_hashes.items;
                         const bef_h = self.scroll_hashes_before.items;
-                        const old = self.scroll_pin_prev.items;
-                        if (old.len != n or now_h.len != n or bef_h.len != n) break :carry;
-                        for (0..n) |k| if (old[k][1] != 0 and now_h[k] == bef_h[k]) {
-                            self.scroll_pin.items[k][0] = 255;
-                            self.scroll_pin.items[k][1] = 255;
-                        };
-                    } else ScrollAnim.pinStillText(
-                        shaderpkg.CellBg,
-                        self.scroll_pin.items,
-                        self.scroll_row_hashes.items,
-                        self.scroll_hashes_before.items,
-                        self.cells.size.columns,
-                        pp.rows,
-                        if (a.active()) @min(pp.top, f2u(a.top, pp.top)) else pp.top,
-                        if (a.active()) @min(@max(pp.bottom, f2u(a.bottom, pp.bottom)), self.cells.size.rows - 1) else pp.bottom,
-                        if (a.active()) @min(pp.left, f2u(a.left, pp.left)) else pp.left,
-                        if (a.active()) @min(@max(pp.right, f2u(a.right, pp.right)), self.cells.size.columns - 1) else pp.right,
-                    );
-                    ScrollAnim.markPinnedText(
-                        shaderpkg.CellBg,
-                        self.scroll_pin.items,
-                        self.scroll_row_hashes.items,
-                        self.scroll_hashes_before.items,
-                        self.cells.size.columns,
-                    );
+                        const have_h = now_h.len == n and bef_h.len == n;
+                        const eq = std.meta.eql;
+                        for (0..n) |k| {
+                            const m = &self.scroll_pin.items[k];
+                            if (m[0] == 0) continue;
+                            if (!eq(self.cells.bg_cells[k], self.scroll_bg_prev.items[k])) {
+                                m.* = .{ 0, 0, 0, 0 };
+                            } else if (m[1] != 0 and have_h and now_h[k] != bef_h[k]) {
+                                m[1] = 0;
+                            }
+                        }
+                    } else {
+                        ScrollAnim.computePins(
+                            shaderpkg.CellBg,
+                            self.scroll_pin.items,
+                            self.scroll_bg_prev.items,
+                            self.cells.bg_cells,
+                            self.cells.size.columns,
+                            pp.rows,
+                            lo_r,
+                            hi_r,
+                            lo_c,
+                            hi_c,
+                        );
+                        ScrollAnim.pinStillText(
+                            shaderpkg.CellBg,
+                            self.scroll_pin.items,
+                            self.scroll_row_hashes.items,
+                            self.scroll_hashes_before.items,
+                            self.cells.size.columns,
+                            pp.rows,
+                            lo_r,
+                            hi_r,
+                            lo_c,
+                            hi_c,
+                        );
+                        ScrollAnim.markPinnedText(
+                            shaderpkg.CellBg,
+                            self.scroll_pin.items,
+                            self.scroll_row_hashes.items,
+                            self.scroll_hashes_before.items,
+                            self.cells.size.columns,
+                        );
+                    }
                     self.scroll_pin_live = self.scroll_anim.active();
                     if (self.config.scroll_trace) {
                         const pc = self.cells.size.columns;
