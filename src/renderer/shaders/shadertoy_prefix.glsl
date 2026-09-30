@@ -38,7 +38,16 @@ layout(binding = 1, std140) uniform Globals {
     uniform float iTimeCursorMove;
     uniform float iTimeCursorMode;
     uniform float iTimeCursorPulse;
+    // The last CURSOR_FX_EVENTS mode changes and pulses (a ring, oldest
+    // overwritten first) so effects can overlap. Per event: iCursorFxEvent =
+    // (start iTime, cursor style, kind 0=mode 1=pulse, 0); the cursor colour
+    // and rect when it happened. Unused slots have start -1000.
+    uniform vec4  iCursorFxEvent[6];
+    uniform vec4  iCursorFxEventColor[6];
+    uniform vec4  iCursorFxEventRect[6];
 };
+
+#define CURSOR_FX_EVENTS 6
 
 #define CURSORSTYLE_BLOCK        0
 #define CURSORSTYLE_BLOCK_HOLLOW 1

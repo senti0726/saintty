@@ -322,6 +322,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         cursor_fx_pulse_seen: u32 = 0,
         cursor_fx_pulse_pending: bool = false,
         cursor_fx_last_event: ?std.Io.Timestamp = null,
+        /// Next slot of the uniforms' cursor effect event ring.
+        cursor_fx_next: usize = 0,
 
         /// Timestamp we rendered out first frame.
         ///
@@ -960,6 +962,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .time_cursor_move = -1000,
                     .time_cursor_mode = -1000,
                     .time_cursor_pulse = -1000,
+                    .cursor_fx_event = @splat(.{ -1000, 0, 0, 0 }),
+                    .cursor_fx_event_color = @splat(@splat(0)),
+                    .cursor_fx_event_rect = @splat(@splat(0)),
                 },
                 .bg_image_buffer = undefined,
 
@@ -3558,6 +3563,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
         }
 
+        /// Record a mode change (kind 0) or pulse (kind 1) in the uniforms'
+        /// event ring, overwriting the oldest, so effects stack.
+        fn pushCursorFxEvent(
+            self: *Self,
+            kind: f32,
+            style: i32,
+            color: [4]f32,
+            rect: [4]f32,
+        ) void {
+            const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
+            const i = self.cursor_fx_next;
+            uniforms.cursor_fx_event[i] = .{ uniforms.time, @floatFromInt(style), kind, 0 };
+            uniforms.cursor_fx_event_color[i] = color;
+            uniforms.cursor_fx_event_rect[i] = rect;
+            self.cursor_fx_next = (i + 1) % shadertoy.cursor_fx_events;
+        }
+
         /// This fork's cursor-effect uniforms, from the cursor as drawn this
         /// frame. Unlike iTimeCursorChange, a MOVE is only the cell
         /// changing (a bar/block width change is not one) and a MODE change
@@ -3604,6 +3626,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (old.style != style or !std.meta.eql(old.color, color)) {
                     uniforms.time_cursor_mode = uniforms.time;
                     self.cursor_fx_last_event = now;
+                    self.pushCursorFxEvent(0, style, color, rect);
+                    if (self.config.scroll_trace) log.info(
+                        "cursorfx mode style {}->{} color {d:.3}->{d:.3} t={d:.3}",
+                        .{ old.style, style, old.color[0], color[0], uniforms.time },
+                    );
                 }
             }
             self.cursor_fx_mode = .{ .style = style, .color = color };
@@ -3730,6 +3757,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.cursor_fx_pulse_pending) {
                 self.cursor_fx_pulse_pending = false;
                 uniforms.time_cursor_pulse = uniforms.time;
+                self.pushCursorFxEvent(
+                    1,
+                    uniforms.current_cursor_style,
+                    uniforms.current_cursor_color,
+                    uniforms.current_cursor,
+                );
             }
 
             // Update focus uniforms
