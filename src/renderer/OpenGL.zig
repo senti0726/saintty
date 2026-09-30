@@ -350,6 +350,15 @@ const FrameDump = struct {
     w: i32 = 0,
     h: i32 = 0,
     buf: []u8 = &.{},
+    // Two pixel-pack buffers: this frame's read-back goes into one while the
+    // other (last frame's) is mapped and written out, so the GPU never has
+    // to finish a frame before the next is drawn. A synchronous read-back
+    // cost enough to change the animation it was recording (smooth% 94 ->
+    // 64 on a fast wheel spin).
+    pbo: [2]gl.c.GLuint = .{ 0, 0 },
+    pbo_us: [2]u64 = .{ 0, 0 },
+    pbo_full: [2]bool = .{ false, false },
+    next: usize = 0,
 };
 var frame_dump: FrameDump = .{};
 
@@ -376,6 +385,7 @@ fn dumpFrame(target: Target) void {
     if (d.fbo == 0) {
         ctx.GenFramebuffers.?(1, &d.fbo);
         ctx.GenRenderbuffers.?(1, &d.rbo);
+        ctx.GenBuffers.?(2, &d.pbo);
     }
     if (d.w != w or d.h != h) {
         ctx.BindRenderbuffer.?(gl.c.GL_RENDERBUFFER, d.rbo);
@@ -383,10 +393,16 @@ fn dumpFrame(target: Target) void {
         ctx.BindFramebuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, d.fbo);
         ctx.FramebufferRenderbuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, gl.c.GL_COLOR_ATTACHMENT0, gl.c.GL_RENDERBUFFER, d.rbo);
         if (d.buf.len > 0) std.heap.page_allocator.free(d.buf);
-        d.buf = std.heap.page_allocator.alloc(u8, @as(usize, @intCast(w * h * 4)) + 16) catch {
+        d.buf = std.heap.page_allocator.alloc(u8, 16) catch {
             d.buf = &.{};
             return;
         };
+        for (d.pbo) |pbo| {
+            ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, pbo);
+            ctx.BufferData.?(gl.c.GL_PIXEL_PACK_BUFFER, @intCast(w * h * 4), null, gl.c.GL_STREAM_READ);
+        }
+        ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, 0);
+        d.pbo_full = .{ false, false };
         d.w = w;
         d.h = h;
     }
@@ -395,14 +411,32 @@ fn dumpFrame(target: Target) void {
     ctx.BindFramebuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, d.fbo);
     ctx.BlitFramebuffer.?(0, 0, @intCast(target.width), @intCast(target.height), 0, 0, w, h, gl.c.GL_COLOR_BUFFER_BIT, gl.c.GL_LINEAR);
     ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, d.fbo);
-    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, d.buf.ptr + 16);
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     const us: u64 = @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1000;
-    std.mem.writeInt(u64, d.buf[0..8], us, .little);
-    std.mem.writeInt(u32, d.buf[8..12], @intCast(w), .little);
-    std.mem.writeInt(u32, d.buf[12..16], @intCast(h), .little);
-    _ = std.c.write(d.fd, d.buf.ptr, d.buf.len);
+    // Start this frame's read-back into one buffer (returns at once)...
+    const i = d.next;
+    ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, d.pbo[i]);
+    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, null);
+    d.pbo_us[i] = us;
+    d.pbo_full[i] = true;
+    // ...and write out the other, filled a frame ago and long since done.
+    const o = 1 - i;
+    if (d.pbo_full[o]) {
+        ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, d.pbo[o]);
+        const ptr = ctx.MapBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, gl.c.GL_READ_ONLY);
+        if (ptr) |p| {
+            std.mem.writeInt(u64, d.buf[0..8], d.pbo_us[o], .little);
+            std.mem.writeInt(u32, d.buf[8..12], @intCast(w), .little);
+            std.mem.writeInt(u32, d.buf[12..16], @intCast(h), .little);
+            _ = std.c.write(d.fd, d.buf.ptr, 16);
+            _ = std.c.write(d.fd, @ptrCast(p), @intCast(w * h * 4));
+            _ = ctx.UnmapBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER);
+        }
+        d.pbo_full[o] = false;
+    }
+    ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, 0);
+    d.next = o;
 }
 
 /// Present the last presented target again.
