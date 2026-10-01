@@ -31,6 +31,10 @@ pub const custom_shader_y_is_down = false;
 /// sync, we have no need for multi-buffering.
 pub const swap_chain_count = 1;
 
+/// `custom-shader-cache` needs scissored render passes and textures that
+/// persist between frames (a swap chain of one).
+pub const custom_shader_cache_supported = true;
+
 const log = std.log.scoped(.opengl);
 
 /// We require at least OpenGL 4.3
@@ -437,6 +441,23 @@ fn dumpFrame(target: Target) void {
     }
     ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, 0);
     d.next = o;
+}
+
+/// Read a target back as RGBA8, for `custom-shader-cache-debug = verify`.
+/// `buf` must hold width * height * 4 bytes.
+pub fn readTarget(self: *OpenGL, target: Target, buf: []u8) !void {
+    _ = self;
+    const fbobind = try target.framebuffer.bind(.read);
+    defer fbobind.unbind();
+    gl.glad.context.ReadPixels.?(
+        0,
+        0,
+        @intCast(target.width),
+        @intCast(target.height),
+        gl.c.GL_RGBA,
+        gl.c.GL_UNSIGNED_BYTE,
+        buf.ptr,
+    );
 }
 
 /// Present the last presented target again.

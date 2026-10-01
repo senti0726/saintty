@@ -1068,8 +1068,6 @@ palette: Palette = .{},
 /// could not reach. See tools/scroll-harness.
 @"scroll-input-script": ?[]const u8 = null,
 
-
-
 /// Rows at the bottom of the screen that a scroll animation never moves.
 ///
 /// Well-behaved full-screen applications reserve the rows they pin an
@@ -3334,6 +3332,40 @@ keybind: Keybinds = .{},
 /// `iTimeCursorPulse`.
 @"custom-shader-animation": CustomShaderAnimation = .true,
 
+/// (This fork.) Cache the output of the custom shaders and redo only what
+/// changed, instead of running every shader over the whole window for every
+/// frame.
+///
+/// With this on, every `custom-shader` except the LAST is treated as a
+/// static, local filter of the terminal image: its output at a pixel may
+/// depend only on the terminal image within `custom-shader-cache-margin`
+/// pixels of it, and not on time, the cursor or any other uniform. Those
+/// shaders then run only over the rows that changed (plus the margin). The
+/// last shader is the animated one: it runs over the whole window while
+/// `custom-shader-animation` says an animation is live, and otherwise only
+/// over the rows that changed.
+///
+/// A terminal that redraws one line (a spinner, a clock, typing) then costs
+/// a strip of the window rather than all of it. Anything that moves the
+/// whole screen - a scroll animation, a resize, a Kitty image - still
+/// redraws everything.
+///
+/// Only implemented for OpenGL. Ignored with a single shader's worth of
+/// nothing to cache (no custom shaders at all).
+@"custom-shader-cache": bool = false,
+
+/// How far, in pixels, a static custom shader reaches (see
+/// `custom-shader-cache`): the largest blur radius in the chain, plus a few
+/// pixels for glyphs that overhang their cell. Too small shows as stale
+/// strips above and below a line that changed.
+@"custom-shader-cache-margin": u32 = 48,
+
+/// Debugging aids for `custom-shader-cache`. `stats` logs, every two seconds
+/// that frames were drawn, how many were drawn and how much of the window
+/// each redid. `verify` additionally draws every frame a second time the
+/// uncached way and logs any pixel that differs - slow, for testing only.
+@"custom-shader-cache-debug": CustomShaderCacheDebug = .off,
+
 /// Bell features to enable if bell support is available in your runtime. Not
 /// all features are available on all runtimes. The format of this is a list of
 /// features to enable separated by commas. If you prefix a feature with `no-`
@@ -5585,6 +5617,13 @@ pub const ConfirmCloseSurface = enum(c_int) {
     false,
     true,
     always,
+};
+
+/// Valid values for custom-shader-cache-debug
+pub const CustomShaderCacheDebug = enum {
+    off,
+    stats,
+    verify,
 };
 
 /// Valid values for custom-shader-animation

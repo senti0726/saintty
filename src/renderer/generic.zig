@@ -160,6 +160,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
+        /// `custom-shader-cache`: what changed since the last frame drawn.
+        /// See `drawFrame` and SPEC.md "Shader cache". `full` means "no idea,
+        /// redo everything" and is the answer whenever in doubt.
+        cache_damage_full: bool = true,
+        /// Rows rebuilt since the last frame drawn, indexed by row.
+        cache_damage_rows: std.ArrayListUnmanaged(bool) = .empty,
+        /// Hovered links are drawn by rebuilding their rows, but leaving a
+        /// link does not mark its row dirty.
+        cache_had_links: bool = false,
+        /// What the last drawn frame was drawn from, to spot changes that no
+        /// dirty row announces.
+        cache_last_uniforms: ?shaderpkg.Uniforms = null,
+        cache_last_cursor: ?shaderpkg.CellText = null,
+        cache_last_post_uniforms: ?shadertoy.Uniforms = null,
+        /// The whole-screen state that forces a full redraw was present in
+        /// the last frame (so this one must be full too, to clean up).
+        cache_last_volatile: bool = true,
+        /// The target holds the last shader's output for a frame in which no
+        /// animation was live, drawn over the whole window.
+        cache_final_settled: bool = false,
+        cache_stats: CacheStats = .{},
+        cache_verify_buf: std.ArrayListUnmanaged(u8) = .empty,
+
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
@@ -484,6 +507,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reports that the frame is complete.
         ///
         /// This is used to implement double/triple buffering.
+        const CacheStats = struct {
+            since: ?std.Io.Timestamp = null,
+            frames: u32 = 0,
+            cells_none: u32 = 0,
+            cells_part: u32 = 0,
+            cells_full: u32 = 0,
+            final_none: u32 = 0,
+            final_part: u32 = 0,
+            final_full: u32 = 0,
+            /// Sum over frames of the share of the window the static chain redid.
+            share: f64 = 0,
+            verified: u32 = 0,
+            mismatched: u32 = 0,
+        };
+
+        /// One horizontal strip of the window, in pixels from the top.
+        const CacheBand = struct { top: u32, bottom: u32 };
+        const cache_max_bands = 8;
+        const CacheDamage = struct {
+            full: bool = false,
+            n: usize = 0,
+            bands: [cache_max_bands]CacheBand = undefined,
+
+            fn none(self: CacheDamage) bool {
+                return !self.full and self.n == 0;
+            }
+        };
+
         const FrameState = struct {
             uniforms: UniformBuffer,
             cells: CellTextBuffer,
@@ -628,7 +679,69 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             uniforms: UniformBuffer,
 
+            /// `custom-shader-cache`: `cache[0]` holds the terminal image and
+            /// `cache[i]` the output of shader `i - 1`, for every shader but
+            /// the last. Unlike front/back these are never swapped, so each
+            /// keeps its contents from frame to frame and a pass can redo a
+            /// strip of it. `verify` is the same chain drawn in full, for
+            /// `custom-shader-cache-debug = verify`.
+            cache: [max_cache]?Texture = @splat(null),
+            verify: [max_cache]?Texture = @splat(null),
+            verify_target: ?Target = null,
+            cache_width: usize = 0,
+            cache_height: usize = 0,
+
+            /// More shaders than this and the cache is simply not used.
+            const max_cache = 8;
+
             const UniformBuffer = Buffer(shadertoy.Uniforms);
+
+            fn freeCache(self: *CustomShaderState) void {
+                for (&self.cache) |*t| if (t.*) |tex| {
+                    tex.deinit();
+                    t.* = null;
+                };
+                for (&self.verify) |*t| if (t.*) |tex| {
+                    tex.deinit();
+                    t.* = null;
+                };
+                if (self.verify_target) |*t| {
+                    t.deinit();
+                    self.verify_target = null;
+                }
+                self.cache_width = 0;
+                self.cache_height = 0;
+            }
+
+            /// Make `n` cache textures of this size exist. Returns true if
+            /// any had to be created, in which case they hold nothing yet.
+            fn ensureCache(
+                self: *CustomShaderState,
+                api: GraphicsAPI,
+                n: usize,
+                width: usize,
+                height: usize,
+                with_verify: bool,
+            ) !bool {
+                var have: usize = 0;
+                for (self.cache) |t| {
+                    if (t != null) have += 1;
+                }
+                const verify_ok = !with_verify or
+                    (self.verify_target != null and self.verify[n - 1] != null);
+                if (have == n and verify_ok and
+                    self.cache_width == width and self.cache_height == height) return false;
+                self.freeCache();
+                errdefer self.freeCache();
+                for (0..n) |i| {
+                    self.cache[i] = try Texture.init(api.textureOptions(), @intCast(width), @intCast(height), null);
+                    if (with_verify) self.verify[i] = try Texture.init(api.textureOptions(), @intCast(width), @intCast(height), null);
+                }
+                if (with_verify) self.verify_target = try api.initTarget(width, height);
+                self.cache_width = width;
+                self.cache_height = height;
+                return true;
+            }
 
             /// Swap the front and back textures.
             pub fn swap(self: *CustomShaderState) void {
@@ -669,6 +782,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *CustomShaderState) void {
+                self.freeCache();
                 self.front_texture.deinit();
                 self.back_texture.deinit();
                 self.sampler.deinit();
@@ -750,6 +864,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background_blur: configpkg.Config.BackgroundBlur,
             scroll_to_bottom_on_output: bool,
             custom_shader_animation: configpkg.CustomShaderAnimation,
+            custom_shader_cache: bool,
+            custom_shader_cache_margin: u32,
+            custom_shader_cache_debug: configpkg.Config.CustomShaderCacheDebug,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -838,6 +955,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_blur = config.@"background-blur",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .custom_shader_animation = config.@"custom-shader-animation",
+                    .custom_shader_cache = config.@"custom-shader-cache",
+                    .custom_shader_cache_margin = config.@"custom-shader-cache-margin",
+                    .custom_shader_cache_debug = config.@"custom-shader-cache-debug",
                     .arena = arena,
                 };
             }
@@ -1014,6 +1134,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.scroll_ghost_bg.deinit(self.alloc);
             self.scroll_prev_images.deinit(self.alloc);
             self.scroll_pin.deinit(self.alloc);
+            self.cache_damage_rows.deinit(self.alloc);
+            self.cache_verify_buf.deinit(self.alloc);
             self.scroll_pin_under.deinit(self.alloc);
             self.scroll_bg_prev.deinit(self.alloc);
             self.scroll_bg_view.deinit(self.alloc);
@@ -2891,6 +3013,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.reinitialize_shaders = false;
                 self.shaders.deinit(self.alloc);
                 try self.initShaders();
+                self.cache_damage_full = true;
             }
 
             // Our shaders should not be defunct at this point.
@@ -2936,7 +3059,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.size.screen.height,
                 );
                 frame.target_config_modified = self.target_config_modified;
+                self.cache_damage_full = true;
             }
+            if (size_changed or swap_chain_rebuilt) self.cache_damage_full = true;
 
             // Upload images to the GPU as necessary.
             _ = self.images.upload(self.alloc, &self.api);
@@ -3024,12 +3149,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 try frame.bg_image_buffer.sync(&.{self.bg_image_buffer});
 
                 frame.bg_image_buffer_modified = self.bg_image_buffer_modified;
+                self.cache_damage_full = true;
             }
 
             // If our font atlas changed, sync the texture data
             texture: {
                 const modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
                 if (modified <= frame.grayscale_modified) break :texture;
+                self.cache_damage_full = true;
                 self.font_grid.lock.lockSharedUncancelable(global.io());
                 defer self.font_grid.lock.unlockShared(global.io());
                 frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
@@ -3038,6 +3165,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: {
                 const modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 if (modified <= frame.color_modified) break :texture;
+                self.cache_damage_full = true;
                 self.font_grid.lock.lockSharedUncancelable(global.io());
                 defer self.font_grid.lock.unlockShared(global.io());
                 frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
@@ -3048,6 +3176,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
 
+            // custom-shader-cache: the cached path replaces everything below.
+            if (comptime @hasDecl(GraphicsAPI, "custom_shader_cache_supported")) cached: {
+                const state = if (frame.custom_shader_state) |*st| st else break :cached;
+                const n = self.shaders.post_pipelines.len;
+                if (!self.config.custom_shader_cache or n == 0 or
+                    n > CustomShaderState.max_cache)
+                {
+                    // Leaving the cached path: nothing it tracked is valid
+                    // when it is next entered.
+                    self.cache_damage_full = true;
+                    self.cache_final_settled = false;
+                    break :cached;
+                }
+                try self.drawFrameCached(frame, state, &frame_ctx, fg_count);
+                return;
+            }
+
             {
                 var pass = frame_ctx.renderPass(&.{.{
                     .target = if (frame.custom_shader_state) |state|
@@ -3057,95 +3202,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
                 }});
                 defer pass.complete();
-
-                // First we draw our background image, if we have one.
-                // The bg image shader also draws the main bg color.
-                //
-                // Otherwise, if we don't have a background image, we
-                // draw the background color by itself in its own step.
-                //
-                // NOTE: We don't use the clear_color for this because that
-                //       would require us to do color space conversion on the
-                //       CPU-side. In the future when we have utilities for
-                //       that we should remove this step and use clear_color.
-                if (self.bg_image) |img| switch (img) {
-                    .ready => |texture| pass.step(.{
-                        .pipeline = self.shaders.pipelines.bg_image,
-                        .uniforms = frame.uniforms.buffer,
-                        .buffers = &.{frame.bg_image_buffer.buffer},
-                        .textures = &.{texture},
-                        .draw = .{ .type = .triangle, .vertex_count = 3 },
-                    }),
-                    else => {},
-                } else {
-                    pass.step(.{
-                        .pipeline = self.shaders.pipelines.bg_color,
-                        .uniforms = frame.uniforms.buffer,
-                        .buffers = &.{ null, frame.cells_bg.buffer },
-                        .draw = .{ .type = .triangle, .vertex_count = 3 },
-                    });
-                }
-
-                // Then we draw any kitty images that need
-                // to be behind text AND cell backgrounds.
-                self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .kitty_below_bg,
-                );
-
-                // Then we draw any opaque cell backgrounds.
-                pass.step(.{
-                    .pipeline = self.shaders.pipelines.cell_bg,
-                    .uniforms = frame.uniforms.buffer,
-                    .buffers = &.{ null, frame.cells_bg.buffer },
-                    .draw = .{ .type = .triangle, .vertex_count = 3 },
-                });
-
-                // Kitty images between cell backgrounds and text.
-                self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .kitty_below_text,
-                );
-
-                // Text.
-                pass.step(.{
-                    .pipeline = self.shaders.pipelines.cell_text,
-                    .uniforms = frame.uniforms.buffer,
-                    .buffers = &.{
-                        frame.cells.buffer,
-                        frame.cells_bg.buffer,
-                    },
-                    .textures = &.{
-                        frame.grayscale,
-                        frame.color,
-                    },
-                    .draw = .{
-                        .type = .triangle_strip,
-                        .vertex_count = 4,
-                        .instance_count = fg_count,
-                    },
-                });
-
-                // Kitty images in front of text.
-                self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .kitty_above_text,
-                );
-
-                // Debug overlay. We do this before any custom shader state
-                // because our debug overlay is aligned with the grid.
-                if (self.overlay != null) self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .overlay,
-                );
+                self.drawCellSteps(&pass, frame, fg_count);
             }
 
             // If we have custom shaders, then we render them.
@@ -3177,6 +3234,423 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     });
                 }
             }
+        }
+
+        /// The terminal image: backgrounds, images, text. Everything a frame
+        /// draws before any custom shader runs.
+        fn drawCellSteps(
+            self: *Self,
+            pass: *RenderPass,
+            frame: *FrameState,
+            fg_count: usize,
+        ) void {
+            // First we draw our background image, if we have one.
+            // The bg image shader also draws the main bg color.
+            //
+            // Otherwise, if we don't have a background image, we
+            // draw the background color by itself in its own step.
+            //
+            // NOTE: We don't use the clear_color for this because that
+            //       would require us to do color space conversion on the
+            //       CPU-side. In the future when we have utilities for
+            //       that we should remove this step and use clear_color.
+            if (self.bg_image) |img| switch (img) {
+                .ready => |texture| pass.step(.{
+                    .pipeline = self.shaders.pipelines.bg_image,
+                    .uniforms = frame.uniforms.buffer,
+                    .buffers = &.{frame.bg_image_buffer.buffer},
+                    .textures = &.{texture},
+                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                }),
+                else => {},
+            } else {
+                pass.step(.{
+                    .pipeline = self.shaders.pipelines.bg_color,
+                    .uniforms = frame.uniforms.buffer,
+                    .buffers = &.{ null, frame.cells_bg.buffer },
+                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                });
+            }
+
+            // Then we draw any kitty images that need
+            // to be behind text AND cell backgrounds.
+            self.images.draw(
+                &self.api,
+                self.shaders.pipelines.image,
+                pass,
+                .kitty_below_bg,
+            );
+
+            // Then we draw any opaque cell backgrounds.
+            pass.step(.{
+                .pipeline = self.shaders.pipelines.cell_bg,
+                .uniforms = frame.uniforms.buffer,
+                .buffers = &.{ null, frame.cells_bg.buffer },
+                .draw = .{ .type = .triangle, .vertex_count = 3 },
+            });
+
+            // Kitty images between cell backgrounds and text.
+            self.images.draw(
+                &self.api,
+                self.shaders.pipelines.image,
+                pass,
+                .kitty_below_text,
+            );
+
+            // Text.
+            pass.step(.{
+                .pipeline = self.shaders.pipelines.cell_text,
+                .uniforms = frame.uniforms.buffer,
+                .buffers = &.{
+                    frame.cells.buffer,
+                    frame.cells_bg.buffer,
+                },
+                .textures = &.{
+                    frame.grayscale,
+                    frame.color,
+                },
+                .draw = .{
+                    .type = .triangle_strip,
+                    .vertex_count = 4,
+                    .instance_count = fg_count,
+                },
+            });
+
+            // Kitty images in front of text.
+            self.images.draw(
+                &self.api,
+                self.shaders.pipelines.image,
+                pass,
+                .kitty_above_text,
+            );
+
+            // Debug overlay. We do this before any custom shader state
+            // because our debug overlay is aligned with the grid.
+            if (self.overlay != null) self.images.draw(
+                &self.api,
+                self.shaders.pipelines.image,
+                pass,
+                .overlay,
+            );
+        }
+
+        /// What part of the terminal image differs from the last frame
+        /// drawn, and consume the record of it. Anything this cannot name
+        /// as a set of rows is `full`.
+        fn takeCacheDamage(self: *Self) CacheDamage {
+            const rows = self.cache_damage_rows.items;
+            defer {
+                @memset(rows, false);
+                self.cache_damage_full = false;
+                self.cache_last_uniforms = self.uniforms;
+                self.cache_last_cursor = self.cells.getCursorGlyph();
+            }
+
+            // State that redraws the whole window, or that no dirty row
+            // announces. It forces `full` on the frame after it ends as well:
+            // that frame is what paints over what it left behind.
+            const volatile_now = self.scroll_anim.active() or
+                self.images.kitty_placements.items.len > 0 or
+                self.images.kitty_ghosts.items.len > 0 or
+                self.overlay != null or
+                self.bg_image != null;
+            const volatile_before = self.cache_last_volatile;
+            self.cache_last_volatile = volatile_now;
+            if (self.cache_damage_full or volatile_now or volatile_before) return .{ .full = true };
+
+            // The uniforms move the whole image (padding, colours, the
+            // scroll offset), except the cursor's: those recolour the text
+            // under a block cursor, on the cursor's own row.
+            const last_u = self.cache_last_uniforms orelse return .{ .full = true };
+            var cursor_rows: [4]?usize = @splat(null);
+            {
+                var cmp = self.uniforms;
+                cmp.cursor_pos = last_u.cursor_pos;
+                cmp.cursor_color = last_u.cursor_color;
+                cmp.bools.cursor_wide = last_u.bools.cursor_wide;
+                if (!std.meta.eql(cmp, last_u)) return .{ .full = true };
+                if (!std.meta.eql(self.uniforms, last_u)) {
+                    cursor_rows[0] = last_u.cursor_pos[1];
+                    cursor_rows[1] = self.uniforms.cursor_pos[1];
+                }
+            }
+            {
+                const now_c = self.cells.getCursorGlyph();
+                if (!std.meta.eql(now_c, self.cache_last_cursor)) {
+                    if (self.cache_last_cursor) |c| cursor_rows[2] = c.grid_pos[1];
+                    if (now_c) |c| cursor_rows[3] = c.grid_pos[1];
+                }
+            }
+            // An off-grid row (the uniform's "no cursor" value) is no row.
+            for (cursor_rows) |r| if (r) |y| {
+                if (y < rows.len) rows[y] = true;
+            };
+
+            // Rows to strips. Rows closer than two margins share a strip,
+            // because their strips would overlap anyway.
+            const cell_h: u32 = self.size.cell.height;
+            const pad_top: u32 = self.size.padding.top;
+            const screen_h: u32 = self.size.screen.height;
+            const margin: u32 = self.config.custom_shader_cache_margin;
+            if (cell_h == 0) return .{ .full = true };
+            const gap: usize = (2 * margin) / cell_h + 1;
+
+            var d: CacheDamage = .{};
+            var y: usize = 0;
+            while (y < rows.len) {
+                if (!rows[y]) {
+                    y += 1;
+                    continue;
+                }
+                var last = y;
+                var z = y + 1;
+                while (z < rows.len and z - last <= gap) : (z += 1) {
+                    if (rows[z]) last = z;
+                }
+                const top: u32 = if (y == 0) 0 else (pad_top + @as(u32, @intCast(y)) * cell_h) -| margin;
+                const bottom: u32 = if (last + 1 >= rows.len)
+                    screen_h
+                else
+                    @min(screen_h, pad_top + @as(u32, @intCast(last + 1)) * cell_h + margin);
+                if (d.n == cache_max_bands) {
+                    // Too many strips: one strip from the first to the last.
+                    d.bands[0].bottom = bottom;
+                    d.n = 1;
+                    var w = last + 1;
+                    while (w < rows.len) : (w += 1) if (rows[w]) {
+                        d.bands[0].bottom = if (w + 1 >= rows.len)
+                            screen_h
+                        else
+                            @min(screen_h, pad_top + @as(u32, @intCast(w + 1)) * cell_h + margin);
+                    };
+                    break;
+                }
+                d.bands[d.n] = .{ .top = @min(top, screen_h), .bottom = bottom };
+                d.n += 1;
+                y = last + 1;
+            }
+            // Nearly everything: the bookkeeping buys nothing.
+            var px: u64 = 0;
+            for (d.bands[0..d.n]) |b| px += b.bottom - b.top;
+            if (px * 10 >= @as(u64, screen_h) * 9) return .{ .full = true };
+            return d;
+        }
+
+        /// `custom-shader-cache`: draw a frame by redoing only what changed.
+        ///
+        /// Three layers, each kept from the last frame:
+        ///
+        ///   cache[0]        the terminal image
+        ///   cache[1..n-1]   the output of each static shader
+        ///   frame.target    the output of the last (animated) shader
+        ///
+        /// Every pass draws exactly what the uncached path draws, clipped to
+        /// the strips of the window that changed. That is correct as long as
+        /// nothing outside the strips would have come out different, which is
+        /// what `takeCacheDamage` and the margin are for.
+        fn drawFrameCached(
+            self: *Self,
+            frame: *FrameState,
+            state: *CustomShaderState,
+            frame_ctx: anytype,
+            fg_count: usize,
+        ) !void {
+            const pipelines = self.shaders.post_pipelines;
+            const n = pipelines.len;
+            const width: u32 = self.size.screen.width;
+            const height: u32 = self.size.screen.height;
+            const debug = self.config.custom_shader_cache_debug;
+
+            if (try state.ensureCache(self.api, n, width, height, debug == .verify)) {
+                self.cache_damage_full = true;
+                self.cache_final_settled = false;
+            }
+
+            const damage = self.takeCacheDamage();
+            try state.uniforms.sync(&.{self.custom_shader_uniforms});
+
+            // A strip as a GL scissor: origin bottom-left, and the image is
+            // upright (row 0 at the top of the window is the highest y).
+            const Scissor = struct {
+                fn of(b: CacheBand, w: u32, h: u32) [4]u32 {
+                    return .{ 0, h - b.bottom, w, b.bottom - b.top };
+                }
+            };
+            const whole: [1]CacheBand = .{.{ .top = 0, .bottom = height }};
+            const bands: []const CacheBand = if (damage.full) &whole else damage.bands[0..damage.n];
+
+            // 1. The terminal image and the static shaders, over the strips.
+            for (bands) |b| {
+                const scissor: ?[4]u32 = if (damage.full) null else Scissor.of(b, width, height);
+                {
+                    var pass = frame_ctx.renderPass(&.{.{
+                        .target = .{ .texture = state.cache[0].? },
+                        .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                        .scissor = scissor,
+                    }});
+                    defer pass.complete();
+                    self.drawCellSteps(&pass, frame, fg_count);
+                }
+                for (pipelines[0 .. n - 1], 0..) |pipeline, i| {
+                    var pass = frame_ctx.renderPass(&.{.{
+                        .target = .{ .texture = state.cache[i + 1].? },
+                        .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                        .scissor = scissor,
+                    }});
+                    defer pass.complete();
+                    pass.step(.{
+                        .pipeline = pipeline,
+                        .uniforms = state.uniforms.buffer,
+                        .textures = &.{state.cache[i].?},
+                        .samplers = &.{state.sampler},
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                    });
+                }
+            }
+
+            // 2. The last shader. Over the whole window while it animates,
+            // for one frame after it stops (to leave a clean, settled image),
+            // and whenever any uniform it can see changed other than the
+            // clock. Otherwise only over the strips.
+            const live = switch (self.config.custom_shader_animation) {
+                .cursor => self.cursorFxLive(),
+                .false => false,
+                .true, .always => true,
+            };
+            const uniforms_same = same: {
+                const last = self.cache_last_post_uniforms orelse break :same false;
+                var cmp = self.custom_shader_uniforms;
+                cmp.time = last.time;
+                cmp.time_delta = last.time_delta;
+                cmp.frame = last.frame;
+                cmp.frame_rate = last.frame_rate;
+                cmp.date = last.date;
+                break :same std.meta.eql(cmp, last);
+            };
+            self.cache_last_post_uniforms = self.custom_shader_uniforms;
+            const final_full = live or !self.cache_final_settled or !uniforms_same or damage.full;
+            const final_bands: []const CacheBand = if (final_full) &whole else damage.bands[0..damage.n];
+            for (final_bands) |b| {
+                var pass = frame_ctx.renderPass(&.{.{
+                    .target = .{ .target = frame.target },
+                    .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                    .scissor = if (final_full) null else Scissor.of(b, width, height),
+                }});
+                defer pass.complete();
+                pass.step(.{
+                    .pipeline = pipelines[n - 1],
+                    .uniforms = state.uniforms.buffer,
+                    .textures = &.{state.cache[n - 1].?},
+                    .samplers = &.{state.sampler},
+                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                });
+            }
+            if (final_full) self.cache_final_settled = !live;
+
+            if (debug == .off) return;
+
+            // Stats, and the uncached frame to compare against.
+            const st = &self.cache_stats;
+            st.frames += 1;
+            if (damage.full) st.cells_full += 1 else if (damage.n > 0) st.cells_part += 1 else st.cells_none += 1;
+            if (final_full) st.final_full += 1 else if (damage.n > 0) st.final_part += 1 else st.final_none += 1;
+            {
+                var px: u64 = 0;
+                for (bands) |b| px += b.bottom - b.top;
+                st.share += @as(f64, @floatFromInt(px)) / @as(f64, @floatFromInt(@max(height, 1)));
+            }
+
+            if (debug == .verify) verify: {
+                {
+                    var pass = frame_ctx.renderPass(&.{.{
+                        .target = .{ .texture = state.verify[0].? },
+                        .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                    }});
+                    defer pass.complete();
+                    self.drawCellSteps(&pass, frame, fg_count);
+                }
+                for (pipelines, 0..) |pipeline, i| {
+                    var pass = frame_ctx.renderPass(&.{.{
+                        .target = if (i < n - 1)
+                            .{ .texture = state.verify[i + 1].? }
+                        else
+                            .{ .target = state.verify_target.? },
+                        .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                    }});
+                    defer pass.complete();
+                    pass.step(.{
+                        .pipeline = pipeline,
+                        .uniforms = state.uniforms.buffer,
+                        .textures = &.{state.verify[i].?},
+                        .samplers = &.{state.sampler},
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                    });
+                }
+                const bytes: usize = @as(usize, width) * height * 4;
+                self.cache_verify_buf.resize(self.alloc, bytes * 2) catch break :verify;
+                const got = self.cache_verify_buf.items[0..bytes];
+                const want = self.cache_verify_buf.items[bytes..];
+                self.api.readTarget(frame.target, got) catch break :verify;
+                self.api.readTarget(state.verify_target.?, want) catch break :verify;
+                st.verified += 1;
+                if (std.mem.eql(u8, got, want)) break :verify;
+                st.mismatched += 1;
+                // Which rows of the window differ (readback is bottom-up).
+                var first: ?u32 = null;
+                var last_row: u32 = 0;
+                var diff_px: u64 = 0;
+                var max_delta: u32 = 0;
+                const stride: usize = @as(usize, width) * 4;
+                for (0..height) |gy| {
+                    const a = got[gy * stride ..][0..stride];
+                    const b = want[gy * stride ..][0..stride];
+                    if (std.mem.eql(u8, a, b)) continue;
+                    const from_top: u32 = height - 1 - @as(u32, @intCast(gy));
+                    if (first == null or from_top < first.?) first = from_top;
+                    last_row = @max(last_row, from_top);
+                    var x: usize = 0;
+                    while (x < stride) : (x += 4) {
+                        var differs = false;
+                        for (0..4) |c| {
+                            const dlt = @abs(@as(i32, a[x + c]) - @as(i32, b[x + c]));
+                            if (dlt > 0) differs = true;
+                            max_delta = @max(max_delta, dlt);
+                        }
+                        if (differs) diff_px += 1;
+                    }
+                }
+                log.warn(
+                    "shader-cache MISMATCH px={} max_delta={} rows_px={}..{} (cell rows {}..{}) damage full={} bands={} final_full={} live={}",
+                    .{
+                        diff_px,                                                                      max_delta,
+                        first orelse 0,                                                               last_row,
+                        ((first orelse 0) -| self.size.padding.top) / @max(self.size.cell.height, 1), (last_row -| self.size.padding.top) / @max(self.size.cell.height, 1),
+                        damage.full,                                                                  damage.n,
+                        final_full,                                                                   live,
+                    },
+                );
+                for (damage.bands[0..damage.n]) |b| log.warn("  band px {}..{}", .{ b.top, b.bottom });
+            }
+
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const since = st.since orelse {
+                st.since = now;
+                return;
+            };
+            const ms = @divTrunc(since.durationTo(now).nanoseconds, std.time.ns_per_ms);
+            if (ms < 2000) return;
+            log.info(
+                "shader-cache {}ms frames={} chain none/part/full={}/{}/{} final none/part/full={}/{}/{} mean_share={d:.3} verified={} mismatched={}",
+                .{
+                    ms,                                            st.frames,
+                    st.cells_none,                                 st.cells_part,
+                    st.cells_full,                                 st.final_none,
+                    st.final_part,                                 st.final_full,
+                    st.share / @as(f64, @floatFromInt(st.frames)), st.verified,
+                    st.mismatched,
+                },
+            );
+            st.* = .{ .since = now };
         }
 
         // Callback from the graphics API when a frame is completed.
@@ -3308,6 +3782,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn changeConfig(self: *Self, config: *DerivedConfig) !void {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
+
+            // custom-shader-cache: anything may look different now.
+            self.cache_damage_full = true;
+            self.cache_final_settled = false;
 
             // We always redo the font shaper in case font features changed. We
             // could check to see if there was an actual config change but this is
@@ -3877,6 +4355,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             const rebuild = state.dirty == .full or grid_size_diff;
+
+            // custom-shader-cache: note what is about to change.
+            if (self.cache_damage_rows.items.len != state.rows) {
+                try self.cache_damage_rows.resize(self.alloc, state.rows);
+                @memset(self.cache_damage_rows.items, false);
+                self.cache_damage_full = true;
+            }
+            if (rebuild) self.cache_damage_full = true;
+            {
+                const has_links = links.count() > 0;
+                if (has_links or self.cache_had_links) self.cache_damage_full = true;
+                self.cache_had_links = has_links;
+            }
+
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -3964,6 +4456,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Unmark the dirty state in our render state.
                 dirty.* = false;
+                self.cache_damage_rows.items[y] = true;
 
                 self.rebuildRow(
                     y,

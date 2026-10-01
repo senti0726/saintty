@@ -2356,3 +2356,65 @@ wheel_fast 94.2, wheel_fast_up 93.3, ctrl_d 98.3.
 
 The remaining figure jumps were nvim's (snacks.image closing and re-placing
 figures; dotfiles SETUP-LOG 2026-09-30).
+
+## 2026-10-02 — shader cache: redo only the rows that changed
+
+### Why
+
+Measured on the desktop (`~/playground/desktop-power`, SETUP-LOG 2026-10-02):
+one 12 fps text spinner in a corner cost 22-34% of the GPU with the `slab` glow
+and 10-13% with no glow, because every frame ran the terminal image and all
+three custom shaders over the whole 4K window. Six working Claude panes took
+Ghostty to 30-44% and +5..15 W of a 45 W package budget.
+
+### What
+
+`custom-shader-cache = true` (OpenGL only; `drawFrameCached` in
+`renderer/generic.zig`). Three layers, each kept from the last frame:
+
+    cache[0]        the terminal image
+    cache[1..n-1]   the output of each static shader (the glow passes)
+    frame.target    the output of the LAST shader (cursor-fx, the animated one)
+
+Every pass draws exactly what the uncached path draws, clipped by `glScissor`
+to horizontal strips: the rows `rebuildCells` rebuilt, the cursor's old and new
+row, each widened by `custom-shader-cache-margin` px (default 48; it must
+cover the widest blur, 18 px for slab, plus glyph overhang). The last shader
+runs over the whole window while `custom-shader-animation` says an effect is
+live, once more after it ends, and whenever a shadertoy uniform other than the
+clock changed; otherwise over the strips only.
+
+`takeCacheDamage` answers "full" whenever it cannot name rows: a full rebuild,
+resize, config or shader reload, font atlas change, any uniform change other
+than the cursor's, a scroll animation (and the frame after it), Kitty images,
+the overlay, a background image, hovered links.
+
+The contract this puts on shaders: all but the last must be static, local
+filters of the terminal image. A glow preset that read `iTime` or the cursor
+would go stale.
+
+### Verified
+
+`custom-shader-cache-debug = verify` draws every frame a second time the
+uncached way and compares the two targets byte for byte. It needs a
+TRANSPARENT window to mean anything - the glow passes only write alpha, so on
+`background-opacity = 1` every margin "passes" (that cost one false green).
+
+    margin 0   44 mismatches on text appearing on an empty screen (the check can fail)
+    margin 48  0 mismatches in 298 frames: spinner, seq scroll, typing, split,
+               pane switch, nvim (j, 20j, C-d/C-u, visual, insert, search),
+               btop, zoom, clear   (~/playground/desktop-power/gh/drive.sh)
+
+Release build, test window's own GPU time (fdinfo), cache off -> on, two runs each:
+
+    idle      0.7% -> 0.15%
+    spinner   5.0% -> 0.9%
+    typing    6.9% -> 2.5%     (every keystroke is a cursor move, so the last
+                                shader runs full-window for 1.3 s; that is now the cost)
+    output    4.8% -> 4.0%     (scrolling output is a scroll animation = full)
+
+### Not done
+
+- Scroll animations and typing still pay the last shader over the whole
+  window. Bounding cursor-fx to the box its effect can reach is the next step.
+- Metal: untouched; the path is compiled out there.

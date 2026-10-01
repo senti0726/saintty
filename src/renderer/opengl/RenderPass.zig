@@ -23,6 +23,10 @@ pub const Options = struct {
             target: Target,
         },
         clear_color: ?[4]f32 = null,
+        /// Restrict clearing and drawing to this rectangle (x, y, width,
+        /// height in GL window coordinates: origin bottom-left). Everything
+        /// outside it keeps what the attachment already held.
+        scissor: ?[4]u32 = null,
     };
 };
 
@@ -82,6 +86,16 @@ pub fn step(self: *Self, s: Step) void {
     defer fbobind.unbind();
 
     defer self.step_number += 1;
+
+    // The scissor must not outlive the step: the blit that presents the
+    // target is clipped by it too.
+    if (self.attachments[0].scissor) |r| {
+        gl.enable(gl.c.GL_SCISSOR_TEST) catch return;
+        gl.glad.context.Scissor.?(@intCast(r[0]), @intCast(r[1]), @intCast(r[2]), @intCast(r[3]));
+    }
+    defer if (self.attachments[0].scissor != null) {
+        gl.disable(gl.c.GL_SCISSOR_TEST) catch {};
+    };
 
     // If we have a clear color and this is the
     // first step in the pass, go ahead and clear.
