@@ -438,12 +438,9 @@ fn drainMailbox(self: *Thread) !void {
                 self.flags.has_inspector = v;
             },
 
-            .input_activity => {
+            .input_activity => |dir| {
                 self.renderer.noteInputActivity();
-            },
-
-            .wheel_activity => |dir| {
-                self.renderer.noteWheelActivity(dir);
+                if (dir != 0) self.renderer.noteWheelActivity(dir);
             },
 
             .macos_display_id => |v| {

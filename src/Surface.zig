@@ -2862,7 +2862,7 @@ pub fn keyCallback(
         // never correctness.
         _ = self.renderer_thread.mailbox.push(
             global.io(),
-            .input_activity,
+            .{ .input_activity = 0 },
             .{ .instant = {} },
         );
 
@@ -3562,16 +3562,11 @@ pub fn scrollCallback(
     // trusts a shift it can attribute to the user, and this is the wheel half
     // of that; `keyCallback` sends the same message for the keyboard.
     if (yoff != 0) {
+        // With the direction (see `renderer.Message.input_activity`): wheel
+        // up (yoff > 0) brings earlier output down the screen.
         _ = self.renderer_thread.mailbox.push(
             global.io(),
-            .input_activity,
-            .{ .instant = {} },
-        );
-        // And which way (see `renderer.Message.wheel_activity`): wheel up
-        // (yoff > 0) brings earlier output down the screen.
-        _ = self.renderer_thread.mailbox.push(
-            global.io(),
-            .{ .wheel_activity = if (yoff > 0) -1 else 1 },
+            .{ .input_activity = if (yoff > 0) -1 else 1 },
             .{ .instant = {} },
         );
 
