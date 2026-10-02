@@ -2418,3 +2418,40 @@ Release build, test window's own GPU time (fdinfo), cache off -> on, two runs ea
 - Scroll animations and typing still pay the last shader over the whole
   window. Bounding cursor-fx to the box its effect can reach is the next step.
 - Metal: untouched; the path is compiled out there.
+
+## 2026-10-02 (later) — shader cache: the cursor effect only costs the box it can reach
+
+Stats from the real window showed where the cost had moved: `chain none 63 /
+final full 66` in 2.4 s. With nothing changing on screen, every cursor event
+kept the LAST shader (cursor-fx) running over the whole window at the draw rate
+for 1.3 s - and Claude Code moves the cursor constantly.
+
+`custom-shader-cache-fx-reach = <cell heights>` (0 = off, the old behaviour;
+only with `custom-shader-animation = cursor`). While an effect is live the last
+shader runs over `cacheFxBox`: the cursor, both ends of its last move and the
+rect of every mode change / pulse of the last 2 s, grown by the reach - plus
+the box the previous frame drew in (to move or erase the effect), plus the
+damaged strips. The cursor's own uniforms no longer force a full pass in this
+mode; any other uniform change still does.
+
+Reach for cursor-fx.glsl, from its constants: railgun particles travel at most
+|v0|*2/|(-DAMP, CURL)| = 30.5cw*2/7.43 = 8.2 cell widths (4.1 cell heights)
+from a start point up to one cell off the path, the ripple reaches 3.5 cell
+heights, the boom 3. 5 passes; **7** is what the config uses.
+
+Verified (`debug = verify`, transparent window, drive.sh + jumps.sh):
+
+    reach 0.5   363 mismatches of 713 frames (the check can fail)
+    reach 7     0 of 1280 frames of long jumps and mode flips (jumps.sh)
+    reach 5/7   1 of ~860 per drive.sh run, about every other run: 2 px, one
+                frame. NOT the cache: the pixel is outside everything redrawn
+                that frame, and the frames before and after it pass with the
+                same cached pixel, so it is the uncached reference render that
+                has a one-frame hole (clear colour showing through). The
+                mismatch log now prints the column range, the box, the cursor
+                uniforms and the last 12 frames' damage for exactly this.
+
+Release build, typing at 10 keys/s, test window's own GPU time, alternating
+runs with the desktop in use (so noisy): cache off 50%; reach 0: 21, 38, 38,
+41, 21%; reach 7: 10, 18, 9, 5, 16%. The last shader's share of the window per
+frame went 1.000 -> 0.097.

@@ -3360,6 +3360,16 @@ keybind: Keybinds = .{},
 /// strips above and below a line that changed.
 @"custom-shader-cache-margin": u32 = 48,
 
+/// How far from the cursor the last (animated) custom shader can draw, in
+/// cell heights (see `custom-shader-cache`). Only used with
+/// `custom-shader-animation = cursor`: while a cursor effect is live the
+/// last shader then runs over a box around where the cursor was, went and
+/// last changed mode, grown by this much on every side, rather than over the
+/// whole window. Outside that box the shader must leave the image as it found
+/// it. 0 turns this off (the whole window, as before). Too small shows as
+/// effects clipped at the edge of a box.
+@"custom-shader-cache-fx-reach": f32 = 0,
+
 /// Debugging aids for `custom-shader-cache`. `stats` logs, every two seconds
 /// that frames were drawn, how many were drawn and how much of the window
 /// each redid. `verify` additionally draws every frame a second time the

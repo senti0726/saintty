@@ -180,6 +180,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The target holds the last shader's output for a frame in which no
         /// animation was live, drawn over the whole window.
         cache_final_settled: bool = false,
+        /// Where the last shader drew a cursor effect in the last frame, as
+        /// a GL scissor. The next frame has to redraw it: with the effect a
+        /// little further on, or without it once the effect is over.
+        cache_fx_box: ?[4]u32 = null,
+        /// The last few frames, for the verify log: what each one redid.
+        cache_history: [12]CacheFrameNote = @splat(.{}),
+        cache_history_i: usize = 0,
+        cache_note_volatile: [2]bool = .{ false, false },
         cache_stats: CacheStats = .{},
         cache_verify_buf: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -523,8 +531,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             final_full: u32 = 0,
             /// Sum over frames of the share of the window the static chain redid.
             share: f64 = 0,
+            /// The same for the last shader.
+            final_share: f64 = 0,
             verified: u32 = 0,
             mismatched: u32 = 0,
+        };
+
+        const CacheFrameNote = struct {
+            full: bool = false,
+            bands: u8 = 0,
+            first_top: u32 = 0,
+            last_bottom: u32 = 0,
+            volatile_now: bool = false,
+            volatile_before: bool = false,
+            scroll_off: f32 = 0,
+            live: bool = false,
+            final_full: bool = false,
+            final_n: u8 = 0,
+            uniforms_same: bool = false,
         };
 
         /// One horizontal strip of the window, in pixels from the top.
@@ -871,6 +895,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             custom_shader_animation: configpkg.CustomShaderAnimation,
             custom_shader_cache: bool,
             custom_shader_cache_margin: u32,
+            custom_shader_cache_fx_reach: f32,
             custom_shader_cache_debug: configpkg.Config.CustomShaderCacheDebug,
 
             pub fn init(
@@ -962,6 +987,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .custom_shader_animation = config.@"custom-shader-animation",
                     .custom_shader_cache = config.@"custom-shader-cache",
                     .custom_shader_cache_margin = config.@"custom-shader-cache-margin",
+                    .custom_shader_cache_fx_reach = config.@"custom-shader-cache-fx-reach",
                     .custom_shader_cache_debug = config.@"custom-shader-cache-debug",
                     .arena = arena,
                 };
@@ -3408,6 +3434,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.bg_image != null;
             const volatile_before = self.cache_last_volatile;
             self.cache_last_volatile = volatile_now;
+            self.cache_note_volatile = .{ volatile_now, volatile_before };
             if (self.cache_damage_full or volatile_now or volatile_before) return .{ .full = true };
 
             // The uniforms move the whole image (padding, colours, the
@@ -3488,6 +3515,53 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return d;
         }
 
+        /// The box a live cursor effect can draw in, as a GL scissor: the
+        /// cursor as it is, the ends of its last move, and where it was at
+        /// each recent mode change or pulse, grown by the configured reach.
+        /// Shader coordinates here are GL's (+y up, a rect is left, top, w, h).
+        fn cacheFxBox(self: *const Self, width: u32, height: u32) [4]u32 {
+            const u = &self.custom_shader_uniforms;
+            const w_f: f32 = @floatFromInt(width);
+            const h_f: f32 = @floatFromInt(height);
+            var x0: f32 = w_f;
+            var y0: f32 = h_f;
+            var x1: f32 = 0;
+            var y1: f32 = 0;
+            const Acc = struct {
+                fn add(r: [4]f32, ax0: *f32, ay0: *f32, ax1: *f32, ay1: *f32) void {
+                    if (r[2] <= 0 and r[3] <= 0) return; // never set
+                    ax0.* = @min(ax0.*, r[0]);
+                    ax1.* = @max(ax1.*, r[0] + r[2]);
+                    ay1.* = @max(ay1.*, r[1]);
+                    ay0.* = @min(ay0.*, r[1] - r[3]);
+                }
+            };
+            // Longer than any effect lasts; the live window is 1.3 s.
+            const recent: f32 = 2.0;
+            Acc.add(u.current_cursor, &x0, &y0, &x1, &y1);
+            if (u.time - u.time_cursor_move < recent) {
+                Acc.add(u.cursor_move_from, &x0, &y0, &x1, &y1);
+                Acc.add(u.cursor_move_to, &x0, &y0, &x1, &y1);
+            }
+            for (u.cursor_fx_event, u.cursor_fx_event_rect) |ev, rect| {
+                if (u.time - ev[0] < recent) Acc.add(rect, &x0, &y0, &x1, &y1);
+            }
+            if (x1 <= x0 or y1 <= y0) return .{ 0, 0, width, height };
+            const reach = self.config.custom_shader_cache_fx_reach *
+                @as(f32, @floatFromInt(self.size.cell.height));
+            x0 = std.math.clamp(@floor(x0 - reach), 0, w_f);
+            y0 = std.math.clamp(@floor(y0 - reach), 0, h_f);
+            x1 = std.math.clamp(@ceil(x1 + reach), 0, w_f);
+            y1 = std.math.clamp(@ceil(y1 + reach), 0, h_f);
+            if (x1 <= x0 or y1 <= y0) return .{ 0, 0, width, height };
+            return .{
+                @intFromFloat(x0),
+                @intFromFloat(y0),
+                @intFromFloat(x1 - x0),
+                @intFromFloat(y1 - y0),
+            };
+        }
+
         /// `custom-shader-cache`: draw a frame by redoing only what changed.
         ///
         /// Three layers, each kept from the last frame:
@@ -3560,10 +3634,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // 2. The last shader. Over the whole window while it animates,
-            // for one frame after it stops (to leave a clean, settled image),
-            // and whenever any uniform it can see changed other than the
-            // clock. Otherwise only over the strips.
+            // 2. The last shader.
+            //
+            // Without a reach (or outside `cursor` animation): over the whole
+            // window while it animates and for one frame after it stops.
+            //
+            // With `custom-shader-cache-fx-reach` in `cursor` animation: over
+            // a box around the cursor's recent events instead, plus the box
+            // the last frame drew in, plus the strips. A cursor effect then
+            // costs a few cells per frame, not the window.
+            //
+            // Either way the whole window whenever a uniform the shader can
+            // see changed that is not the clock or the cursor's.
+            const boxed = self.config.custom_shader_animation == .cursor and
+                self.config.custom_shader_cache_fx_reach > 0;
             const live = switch (self.config.custom_shader_animation) {
                 .cursor => self.cursorFxLive(),
                 .false => false,
@@ -3577,16 +3661,57 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 cmp.frame = last.frame;
                 cmp.frame_rate = last.frame_rate;
                 cmp.date = last.date;
+                if (boxed) {
+                    // The cursor's own uniforms only matter inside the box.
+                    cmp.current_cursor = last.current_cursor;
+                    cmp.previous_cursor = last.previous_cursor;
+                    cmp.current_cursor_color = last.current_cursor_color;
+                    cmp.previous_cursor_color = last.previous_cursor_color;
+                    cmp.current_cursor_style = last.current_cursor_style;
+                    cmp.previous_cursor_style = last.previous_cursor_style;
+                    cmp.cursor_visible = last.cursor_visible;
+                    cmp.cursor_change_time = last.cursor_change_time;
+                    cmp.cursor_move_from = last.cursor_move_from;
+                    cmp.cursor_move_to = last.cursor_move_to;
+                    cmp.time_cursor_move = last.time_cursor_move;
+                    cmp.time_cursor_mode = last.time_cursor_mode;
+                    cmp.time_cursor_pulse = last.time_cursor_pulse;
+                    cmp.cursor_fx_event = last.cursor_fx_event;
+                    cmp.cursor_fx_event_color = last.cursor_fx_event_color;
+                    cmp.cursor_fx_event_rect = last.cursor_fx_event_rect;
+                }
                 break :same std.meta.eql(cmp, last);
             };
             self.cache_last_post_uniforms = self.custom_shader_uniforms;
-            const final_full = live or !self.cache_final_settled or !uniforms_same or damage.full;
-            const final_bands: []const CacheBand = if (final_full) &whole else damage.bands[0..damage.n];
-            for (final_bands) |b| {
+
+            const box_now: ?[4]u32 = if (boxed and live) self.cacheFxBox(width, height) else null;
+            const box_prev = self.cache_fx_box;
+            const final_full = !self.cache_final_settled or !uniforms_same or damage.full or
+                (live and !boxed);
+
+            var final_rects: [cache_max_bands + 2]?[4]u32 = @splat(null);
+            var final_n: usize = 0;
+            if (final_full) {
+                final_n = 1; // one pass, no scissor
+            } else {
+                for (damage.bands[0..damage.n]) |b| {
+                    final_rects[final_n] = Scissor.of(b, width, height);
+                    final_n += 1;
+                }
+                if (box_now) |r| {
+                    final_rects[final_n] = r;
+                    final_n += 1;
+                }
+                if (box_prev) |r| if (box_now == null or !std.meta.eql(r, box_now.?)) {
+                    final_rects[final_n] = r;
+                    final_n += 1;
+                };
+            }
+            for (final_rects[0..final_n]) |scissor| {
                 var pass = frame_ctx.renderPass(&.{.{
                     .target = .{ .target = frame.target },
                     .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
-                    .scissor = if (final_full) null else Scissor.of(b, width, height),
+                    .scissor = scissor,
                 }});
                 defer pass.complete();
                 pass.step(.{
@@ -3597,15 +3722,46 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .draw = .{ .type = .triangle, .vertex_count = 3 },
                 });
             }
-            if (final_full) self.cache_final_settled = !live;
+            if (boxed) {
+                // After any frame the target is right everywhere except
+                // (possibly) inside the box an effect was just drawn in.
+                self.cache_final_settled = true;
+                self.cache_fx_box = box_now;
+            } else {
+                if (final_full) self.cache_final_settled = !live;
+                self.cache_fx_box = null;
+            }
 
             if (debug == .off) return;
+
+            self.cache_history[self.cache_history_i % self.cache_history.len] = .{
+                .full = damage.full,
+                .bands = @intCast(damage.n),
+                .first_top = if (damage.n > 0) damage.bands[0].top else 0,
+                .last_bottom = if (damage.n > 0) damage.bands[damage.n - 1].bottom else 0,
+                .volatile_now = self.cache_note_volatile[0],
+                .volatile_before = self.cache_note_volatile[1],
+                .scroll_off = self.uniforms.scroll_anim[0],
+                .live = live,
+                .final_full = final_full,
+                .final_n = @intCast(final_n),
+                .uniforms_same = uniforms_same,
+            };
+            self.cache_history_i += 1;
 
             // Stats, and the uncached frame to compare against.
             const st = &self.cache_stats;
             st.frames += 1;
             if (damage.full) st.cells_full += 1 else if (damage.n > 0) st.cells_part += 1 else st.cells_none += 1;
-            if (final_full) st.final_full += 1 else if (damage.n > 0) st.final_part += 1 else st.final_none += 1;
+            if (final_full) st.final_full += 1 else if (final_n > 0) st.final_part += 1 else st.final_none += 1;
+            if (final_full) {
+                st.final_share += 1;
+            } else {
+                var fpx: u64 = 0;
+                for (final_rects[0..final_n]) |r| fpx += @as(u64, r.?[2]) * r.?[3];
+                st.final_share += @min(1.0, @as(f64, @floatFromInt(fpx)) /
+                    @as(f64, @floatFromInt(@max(@as(u64, width) * height, 1))));
+            }
             {
                 var px: u64 = 0;
                 for (bands) |b| px += b.bottom - b.top;
@@ -3682,6 +3838,46 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     },
                 );
                 for (damage.bands[0..damage.n]) |b| log.warn("  band px {}..{}", .{ b.top, b.bottom });
+                {
+                    // Where across, and what the last shader was given.
+                    var min_x: usize = width;
+                    var max_x: usize = 0;
+                    for (0..height) |gy| {
+                        const ra = got[gy * stride ..][0..stride];
+                        const rb = want[gy * stride ..][0..stride];
+                        if (std.mem.eql(u8, ra, rb)) continue;
+                        var x: usize = 0;
+                        while (x < stride) : (x += 4) {
+                            if (!std.mem.eql(u8, ra[x..][0..4], rb[x..][0..4])) {
+                                min_x = @min(min_x, x / 4);
+                                max_x = @max(max_x, x / 4);
+                            }
+                        }
+                    }
+                    for (0..self.cache_history.len) |back| {
+                        if (back >= self.cache_history_i) break;
+                        const h = self.cache_history[(self.cache_history_i - 1 - back) % self.cache_history.len];
+                        log.warn("  frame -{}: full={} bands={} px {}..{} vol={}/{} scroll_off={d:.1} live={} final_full={} final_n={} uni_same={}", .{
+                            back,           h.full,            h.bands,      h.first_top, h.last_bottom,
+                            h.volatile_now, h.volatile_before, h.scroll_off, h.live,      h.final_full,
+                            h.final_n,      h.uniforms_same,
+                        });
+                    }
+                    if (max_x >= min_x and first != null) {
+                        const gy: usize = height - 1 - first.?;
+                        const o = gy * stride + min_x * 4;
+                        log.warn("  first px got={any} want={any} cursor_uniform={any} cursor_glyph_row={any}", .{
+                            got[o..][0..4].*,         want[o..][0..4].*,
+                            self.uniforms.cursor_pos, if (self.cells.getCursorGlyph()) |c| c.grid_pos else null,
+                        });
+                    }
+                    const u = &self.custom_shader_uniforms;
+                    log.warn("  cols_px {}..{} box_now={any} box_prev={any} t={d:.3} move_t={d:.3} cur={any} from={any} to={any}", .{
+                        min_x,            max_x,              box_now,          box_prev,
+                        u.time,           u.time_cursor_move, u.current_cursor, u.cursor_move_from,
+                        u.cursor_move_to,
+                    });
+                }
             }
 
             const now: std.Io.Timestamp = .now(global.io(), .awake);
@@ -3692,14 +3888,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const ms = @divTrunc(since.durationTo(now).nanoseconds, std.time.ns_per_ms);
             if (ms < 2000) return;
             log.info(
-                "shader-cache {}ms frames={} chain none/part/full={}/{}/{} final none/part/full={}/{}/{} mean_share={d:.3} verified={} mismatched={}",
+                "shader-cache {}ms frames={} chain none/part/full={}/{}/{} final none/part/full={}/{}/{} mean_share={d:.3} final_share={d:.3} verified={} mismatched={}",
                 .{
                     ms,                                            st.frames,
                     st.cells_none,                                 st.cells_part,
                     st.cells_full,                                 st.final_none,
                     st.final_part,                                 st.final_full,
-                    st.share / @as(f64, @floatFromInt(st.frames)), st.verified,
-                    st.mismatched,
+                    st.share / @as(f64, @floatFromInt(st.frames)), st.final_share / @as(f64, @floatFromInt(st.frames)),
+                    st.verified,                                   st.mismatched,
                 },
             );
             st.* = .{ .since = now };
@@ -3838,6 +4034,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // custom-shader-cache: anything may look different now.
             self.cache_damage_full = true;
             self.cache_final_settled = false;
+            self.cache_fx_box = null;
 
             // We always redo the font shaper in case font features changed. We
             // could check to see if there was an actual config change but this is
