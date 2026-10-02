@@ -26,6 +26,7 @@ const ApprtSurface = @import("../Surface.zig");
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Config = @import("config.zig").Config;
+const DamageGLArea = @import("damage_gl_area.zig").DamageGLArea;
 const ResizeOverlay = @import("resize_overlay.zig").ResizeOverlay;
 const SearchOverlay = @import("search_overlay.zig").SearchOverlay;
 const KeyStateOverlay = @import("key_state_overlay.zig").KeyStateOverlay;
@@ -846,6 +847,17 @@ pub const Surface = extern struct {
                 }
             }
         }
+    }
+
+    /// gtk-damage-tracking: the GL area keeps its last frame and redraws
+    /// only what changed. Only once the core surface exists, because the
+    /// widget then draws with the GL functions the renderer loaded.
+    fn syncDamageTracking(self: *Self) void {
+        const priv = self.private();
+        const area = gobject.ext.cast(DamageGLArea, priv.gl_area) orelse return;
+        const want = priv.core_surface != null and
+            if (priv.config) |c| c.get().@"gtk-damage-tracking" else false;
+        area.setDamageTracking(want);
     }
 
     /// Force the surface to redraw itself. Ghostty often will only redraw
@@ -2390,6 +2402,8 @@ pub const Surface = extern struct {
         const priv = self.private();
         const config = if (priv.config) |c| c.get() else return;
 
+        self.syncDamageTracking();
+
         // resize-overlay-duration
         {
             const ms = config.@"resize-overlay-duration".asMilliseconds();
@@ -3642,6 +3656,7 @@ pub const Surface = extern struct {
                 break :realize;
             };
 
+            self.syncDamageTracking();
             self.redraw();
         }
 
@@ -3734,10 +3749,23 @@ pub const Surface = extern struct {
         const priv = self.private();
         const surface = priv.core_surface orelse return 1;
 
+        // gtk-damage-tracking: if the widget kept the last frame, the
+        // renderer presents only what changed and we pass on what that was.
+        const area = gobject.ext.cast(DamageGLArea, priv.gl_area);
+        if (comptime @hasField(@TypeOf(surface.renderer.api), "present_persistent")) {
+            surface.renderer.api.present_persistent =
+                if (area) |a| a.framePersistent() else false;
+            _ = surface.renderer.api.takePresented();
+        }
+
         surface.renderer.drawFrame(true) catch |err| {
             log.warn("failed to draw frame err={}", .{err});
             return 0;
         };
+
+        if (comptime @hasField(@TypeOf(surface.renderer.api), "present_persistent")) {
+            if (area) |a| a.noteDamage(surface.renderer.api.takePresented());
+        }
 
         return 1;
     }
@@ -3877,6 +3905,7 @@ pub const Surface = extern struct {
 
         // Store it!
         priv.core_surface = surface;
+        self.syncDamageTracking();
 
         self.startScrollReplay();
 
@@ -4166,6 +4195,7 @@ pub const Surface = extern struct {
         pub const Instance = Self;
 
         fn init(class: *Class) callconv(.c) void {
+            gobject.ext.ensureType(DamageGLArea);
             gobject.ext.ensureType(ResizeOverlay);
             gobject.ext.ensureType(SearchOverlay);
             gobject.ext.ensureType(KeyStateOverlay);

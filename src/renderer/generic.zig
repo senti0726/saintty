@@ -3722,6 +3722,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .draw = .{ .type = .triangle, .vertex_count = 3 },
                 });
             }
+            // The target changed inside those rectangles and nowhere else,
+            // which is all a framebuffer that kept the last frame needs
+            // (`gtk-damage-tracking`).
+            if (comptime @hasDecl(GraphicsAPI, "setFrameDamage")) {
+                if (!final_full) self.api.setFrameDamage(final_rects[0..final_n]);
+                self.api.present_verify = debug == .verify;
+            }
             if (boxed) {
                 // After any frame the target is right everywhere except
                 // (possibly) inside the box an effect was just drawn in.

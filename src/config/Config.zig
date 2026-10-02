@@ -3876,6 +3876,18 @@ else
 /// surfaces.
 @"linux-cgroup-hard-fail": bool = false,
 
+/// Tell GTK which part of the terminal changed in each frame, so that it
+/// repaints, and hands the compositor, only that part instead of the whole
+/// window. Without it every frame costs a full-window copy in Ghostty and a
+/// full-window composite in the compositor, however little changed.
+///
+/// What "the part that changed" is comes from `custom-shader-cache`, so this
+/// only narrows frames drawn through it (that is, with at least one custom
+/// shader and the cache on); every other frame is the whole window, as before.
+///
+/// GTK only.
+@"gtk-damage-tracking": bool = false,
+
 /// Enable or disable GTK's OpenGL debugging logs. The default is `true` for
 /// debug builds, `false` for all others.
 ///

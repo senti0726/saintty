@@ -49,6 +49,57 @@ blending: configpkg.Config.AlphaBlending,
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
 
+/// PARTIAL PRESENT (`gtk-damage-tracking`). Normally the apprt hands us a
+/// framebuffer whose contents are undefined, so `present` copies the whole
+/// target into it and the apprt shows (and the compositor repaints) the whole
+/// window, however little of it changed.
+///
+/// An apprt whose framebuffer still holds the frame presented before sets
+/// `present_persistent` for the draw. `present` then copies only
+/// `frame_damage` -- the rectangles the renderer says differ from the last
+/// frame -- and records what it wrote in `presented`, which the apprt takes
+/// afterwards to tell the toolkit how little there is to repaint.
+present_persistent: bool = false,
+/// What the frame being drawn changes in its target. The renderer narrows it
+/// (`setFrameDamage`); anything that does not is the whole frame.
+frame_damage: Damage = .everything,
+/// What `present` has written since the apprt last took it.
+presented: Damage = .nothing,
+/// A frame was drawn but not presented (GL error): the framebuffer is behind
+/// the target by more than the next frame's damage.
+present_stale: bool = false,
+/// `custom-shader-cache-debug = verify`: after every present, read back the
+/// framebuffer and the target and compare them. Partial presents that leave
+/// the framebuffer different from the target are counted and logged.
+present_verify: bool = false,
+present_verify_stats: struct { checked: u64 = 0, partial: u64 = 0, mismatched: u64 = 0 } = .{},
+
+/// A set of rectangles (x, y, width, height; GL coordinates, origin
+/// bottom-left), or the whole frame.
+pub const Damage = struct {
+    pub const max_rects = 12;
+    pub const everything: Damage = .{ .full = true };
+    pub const nothing: Damage = .{ .full = false };
+
+    full: bool,
+    n: usize = 0,
+    rects: [max_rects][4]u32 = undefined,
+
+    pub fn add(self: *Damage, r: [4]u32) void {
+        if (self.full or r[2] == 0 or r[3] == 0) return;
+        if (self.n == max_rects) {
+            self.* = .everything;
+            return;
+        }
+        self.rects[self.n] = r;
+        self.n += 1;
+    }
+
+    pub fn slice(self: *const Damage) []const [4]u32 {
+        return self.rects[0..self.n];
+    }
+};
+
 /// NOTE: This is an error{}!OpenGL instead of just OpenGL for parity with
 ///       Metal, since it needs to be fallible so does this, even though it
 ///       can't actually fail.
@@ -257,7 +308,31 @@ pub fn displayRealized(self: *const OpenGL) void {
 ///
 /// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameStart(self: *OpenGL) void {
-    _ = self;
+    // Until the renderer says otherwise the frame changes everything.
+    self.frame_damage = .everything;
+}
+
+/// The frame being drawn differs from the one before only inside `rects`
+/// (GL scissor rectangles). Only meaningful when every frame since the last
+/// full one went through here or was whole.
+pub fn setFrameDamage(self: *OpenGL, rects: []const ?[4]u32) void {
+    var d: Damage = .nothing;
+    for (rects) |r| d.add(r orelse {
+        self.frame_damage = .everything;
+        return;
+    });
+    self.frame_damage = d;
+}
+
+/// What has been presented since the last call, for the apprt.
+pub fn takePresented(self: *OpenGL) Damage {
+    defer self.presented = .nothing;
+    return self.presented;
+}
+
+/// A drawn frame was not presented.
+pub fn presentSkipped(self: *OpenGL) void {
+    self.present_stale = true;
 }
 
 /// Actions taken after `drawFrame` is done.
@@ -316,19 +391,59 @@ pub fn present(self: *OpenGL, target: Target) !void {
     const fbobind = try target.framebuffer.bind(.read);
     defer fbobind.unbind();
 
-    // Blit
-    gl.glad.context.BlitFramebuffer.?(
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
-        gl.c.GL_COLOR_BUFFER_BIT,
-        gl.c.GL_NEAREST,
-    );
+    // Blit: the rectangles that changed if the framebuffer still holds the
+    // last frame, everything otherwise.
+    const partial = self.present_persistent and !self.present_stale and
+        !self.frame_damage.full and self.last_target != null and
+        self.last_target.?.framebuffer.id == target.framebuffer.id;
+    if (partial) {
+        // GHOSTTY_PRESENT_BREAK=1 drops the first rectangle of every partial
+        // present, to show that `present_verify` can fail.
+        const skip: usize = if (self.present_verify and
+            std.c.getenv("GHOSTTY_PRESENT_BREAK") != null) 1 else 0;
+        for (self.frame_damage.slice(), 0..) |r, i| {
+            if (i < skip) continue;
+            const x0: gl.c.GLint = @intCast(@min(r[0], target.width));
+            const y0: gl.c.GLint = @intCast(@min(r[1], target.height));
+            const x1: gl.c.GLint = @intCast(@min(r[0] + r[2], target.width));
+            const y1: gl.c.GLint = @intCast(@min(r[1] + r[3], target.height));
+            if (x1 <= x0 or y1 <= y0) continue;
+            gl.glad.context.BlitFramebuffer.?(
+                x0,
+                y0,
+                x1,
+                y1,
+                x0,
+                y0,
+                x1,
+                y1,
+                gl.c.GL_COLOR_BUFFER_BIT,
+                gl.c.GL_NEAREST,
+            );
+            self.presented.add(.{
+                @intCast(x0),
+                @intCast(y0),
+                @intCast(x1 - x0),
+                @intCast(y1 - y0),
+            });
+        }
+    } else {
+        gl.glad.context.BlitFramebuffer.?(
+            0,
+            0,
+            @intCast(target.width),
+            @intCast(target.height),
+            0,
+            0,
+            @intCast(target.width),
+            @intCast(target.height),
+            gl.c.GL_COLOR_BUFFER_BIT,
+            gl.c.GL_NEAREST,
+        );
+        self.presented = .everything;
+        self.present_stale = false;
+    }
+    if (self.present_verify) self.verifyPresent(target, partial);
 
     // Debugging aid: GHOSTTY_FRAME_DUMP=<file> appends every presented frame.
     dumpFrame(target);
@@ -460,8 +575,50 @@ pub fn readTarget(self: *OpenGL, target: Target, buf: []u8) !void {
     );
 }
 
+/// `present_verify`: the framebuffer just presented into must equal the
+/// target, pixel for pixel. The target is still bound for reading.
+fn verifyPresent(self: *OpenGL, target: Target, partial: bool) void {
+    const alloc = std.heap.c_allocator;
+    const bytes = target.width * target.height * 4;
+    const want = alloc.alloc(u8, bytes * 2) catch return;
+    defer alloc.free(want);
+    const got = want[bytes..];
+    const ctx = &gl.glad.context;
+    const w: gl.c.GLsizei = @intCast(target.width);
+    const h: gl.c.GLsizei = @intCast(target.height);
+    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, want.ptr);
+    var draw: gl.c.GLint = 0;
+    var read: gl.c.GLint = 0;
+    ctx.GetIntegerv.?(gl.c.GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+    ctx.GetIntegerv.?(gl.c.GL_READ_FRAMEBUFFER_BINDING, &read);
+    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(draw));
+    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, got.ptr);
+    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(read));
+
+    const st = &self.present_verify_stats;
+    st.checked += 1;
+    if (partial) st.partial += 1;
+    if (!std.mem.eql(u8, want[0..bytes], got)) {
+        st.mismatched += 1;
+        var px: u64 = 0;
+        var i: usize = 0;
+        while (i < bytes) : (i += 4) {
+            if (!std.mem.eql(u8, want[i..][0..4], got[i..][0..4])) px += 1;
+        }
+        log.warn("present MISMATCH px={} partial={} rects={}", .{ px, partial, self.frame_damage.n });
+    }
+    if (st.checked % 200 == 0) log.info(
+        "present-verify checked={} partial={} mismatched={}",
+        .{ st.checked, st.partial, st.mismatched },
+    );
+}
+
 /// Present the last presented target again.
 pub fn presentLastTarget(self: *OpenGL) !void {
+    // A framebuffer that kept the last frame already shows it.
+    if (self.present_persistent and !self.present_stale and
+        self.last_target != null) return;
+    self.frame_damage = .everything;
     if (self.last_target) |target| try self.present(target);
 }
 

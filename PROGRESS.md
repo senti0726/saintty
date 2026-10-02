@@ -2455,3 +2455,73 @@ Release build, typing at 10 keys/s, test window's own GPU time, alternating
 runs with the desktop in use (so noisy): cache off 50%; reach 0: 21, 38, 38,
 41, 21%; reach 7: 10, 18, 9, 5, 16%. The last shader's share of the window per
 frame went 1.000 -> 0.097.
+
+## 2026-10-03 — damage tracking: a small change is a small frame for GTK and KWin too
+
+### Why
+
+Typing with the cursor effects on: Ghostty 21-33% of the GPU and KWin up to
+38% (transparent window), though `final_share` said the last shader touched 4%
+of the window. `WAYLAND_DEBUG=1` showed why: every frame was committed with
+`damage_buffer(0, 0, INT_MAX, INT_MAX)`. `GtkGLArea` renders each frame into a
+fresh texture, so our present blit copied the whole target, GSK re-drew the
+whole widget, and KWin recomposited the whole window - 120 times a second for
+the 1.3 s after every cursor event.
+
+### What
+
+`gtk-damage-tracking = true` (GTK, OpenGL; default off).
+
+- `apprt/gtk/class/damage_gl_area.zig`: `GhosttyGLArea`, a `GtkGLArea`
+  subclass that overrides `snapshot`. In damage mode it owns ONE texture + FBO
+  for as long as the size holds, binds it, emits `resize`/`render` itself, and
+  hands GTK a `GdkGLTexture` built with `set_update_texture(previous)` +
+  `set_update_region(rects)`. GSK's node diff then repaints only that region
+  and `eglSwapBuffersWithDamage` passes it on. Nothing changed = the same
+  texture object again = no damage at all. Anything it cannot do (no context,
+  FBO incomplete, tracking off) goes to the parent's stock snapshot.
+- `renderer/OpenGL.zig`: `present_persistent` (set by the apprt per draw),
+  `frame_damage` (set by the renderer, reset to "everything" in
+  `drawFrameStart`), `presented` (taken by the apprt). `present` blits only the
+  damage rectangles when the framebuffer kept the last frame;
+  `presentLastTarget` is then a no-op. A frame that was drawn but not presented
+  marks the framebuffer stale and the next present is whole.
+- `renderer/generic.zig`: `drawFrameCached` reports `final_rects` (the strips
+  plus the fx boxes) unless the final pass was full. So only frames through
+  `custom-shader-cache` are narrowed; the uncached path stays whole-window.
+- Tracking is only switched on once the core surface exists: the widget uses
+  the renderer's glad context, which is `undefined` (not null) before that.
+- The update region is in texture rows = GL rows, so GL scissor rects go in
+  unflipped; the flip is the snapshot transform, as in GtkGLArea.
+
+### Verified
+
+- Protocol: typing now commits `damage_buffer(867, 0, 470, 386)`-sized boxes
+  and one-line strips; full damage only on full frames.
+- `custom-shader-cache-debug = verify` now also reads back the framebuffer
+  after every present and compares it with the target (`present MISMATCH`,
+  `present-verify checked=`): 0 over drive2.sh and jumps2.sh; with
+  `GHOSTTY_PRESENT_BREAK=1` (drops the first rect) 158 - the check can fail.
+- On screen (`~/playground/desktop-power/gh/e2e.sh`): after a run of jumps and
+  mode flips, a screenshot is pixel-identical to one taken after a forced full
+  frame (SIGUSR2), twice.
+- GPU, own fdinfo, 12 s, alternating pairs, old `1974d867c` -> this:
+
+      typing, solid            ghostty 32.4 -> 5.6 %   kwin  3.6 -> 0.5 %
+      i/Esc flips, solid       ghostty 36.7 -> 10.7 %  kwin  3.6 -> 2.2 %
+      typing, transparent+slab ghostty 32.8 -> 5.5 %   kwin 38.1 -> 3.0 %
+
+### Traps
+
+- A game on screen (YARG) holds the display at 120 fps and KWin at ~12%:
+  KWin deltas measured beside it mean nothing. Check `vblank/s` at idle first.
+- `pkill -f '[e]2e.sh'` inside a command line that also runs `./e2e.sh` kills
+  the caller.
+- A bare `wait` in a driver script waits for the Ghostty under test as well.
+
+### Not done
+
+- Frames outside the shader cache (no custom shader, scroll animations, Kitty
+  images) are still whole-window.
+- The shader cache's own verify still shows the 2 px one-frame hole, including
+  on full frames, where neither cache nor damage tracking does anything.
