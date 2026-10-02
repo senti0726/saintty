@@ -442,6 +442,10 @@ fn drainMailbox(self: *Thread) !void {
                 self.renderer.noteInputActivity();
             },
 
+            .wheel_activity => |dir| {
+                self.renderer.noteWheelActivity(dir);
+            },
+
             .macos_display_id => |v| {
                 if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
                     try self.renderer.setMacOSDisplayID(v, &self.draw_now);

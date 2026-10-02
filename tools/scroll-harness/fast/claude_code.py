@@ -83,6 +83,24 @@ for (var i = 0; i < w.length; i++)
                 time.sleep(float(opts.get("wait", "4.5")))
                 (out / f"{name}-pane.txt").write_text(tmux("capture-pane", "-p", "-t", "h"))
                 shot(out / f"{name}-after.png")
+        elif mode == "notches":
+            # An ordinary wheel mouse: whole notches, one at a time, at the
+            # pace of a hand (--gap seconds apart). Each should SLIDE; the
+            # analysis is `notches.txt`: per notch, the scroll the renderer
+            # animated (or none: it snapped).
+            gap = float(opts.get("gap", "0.4"))
+            k = 0
+            for d in (-1, 1):
+                for _ in range(int(opts.get("count", "10"))):
+                    # --burst=N: N notches --burst-gap apart, as a hand
+                    # flicks the wheel, then the pause.
+                    for b in range(int(opts.get("burst", "1"))):
+                        if b: time.sleep(float(opts.get("burst-gap", "0.03")))
+                        mouse.notch(d)
+                    time.sleep(gap)
+                    k += 1
+                    (out / f"n{k:02d}-pane.txt").write_text(tmux("capture-pane", "-p", "-t", "h"))
+                time.sleep(1.0)
         else:
             for name, d in (("up", -1), ("down", 1)):
                 times = [time.monotonic() + 0.05 + i / 160 for i in range(8 * 12)]  # 20 notches/s

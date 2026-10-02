@@ -3567,6 +3567,13 @@ pub fn scrollCallback(
             .input_activity,
             .{ .instant = {} },
         );
+        // And which way (see `renderer.Message.wheel_activity`): wheel up
+        // (yoff > 0) brings earlier output down the screen.
+        _ = self.renderer_thread.mailbox.push(
+            global.io(),
+            .{ .wheel_activity = if (yoff > 0) -1 else 1 },
+            .{ .instant = {} },
+        );
 
         // Wake the renderer, or the message sits in the mailbox until
         // something else happens to wake the thread and the frame that should

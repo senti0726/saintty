@@ -26,7 +26,6 @@ pub const Message = union(enum) {
     /// restarting the timer.
     reset_cursor_blink,
 
-
     /// A key was pressed that produced input for the program.
     ///
     /// The repaint-scroll detector only trusts a shift it can attribute to
@@ -35,6 +34,13 @@ pub const Message = union(enum) {
     /// but reaches none of the scroll plumbing. Without this the detector is
     /// blind to every keyboard-driven scroll.
     input_activity,
+
+    /// The wheel (or touchpad) scrolled, and which way: +1 when the content
+    /// should move up (towards later output), -1 for down. The repaint
+    /// detector uses it for applications that answer the wheel by redrawing
+    /// (Claude Code): a recovered shift has to go the way the wheel went, and
+    /// a flick of several notches may move further than a key ever does.
+    wheel_activity: i8,
 
     /// Change the font grid. This can happen for any number of reasons
     /// including a font size change, family change, etc.

@@ -648,12 +648,30 @@ pub fn computePins(
             // The previous frame's run of that colour starting at the SAME
             // column: [c, pe). yazi's bar is as wide as the hovered name, so
             // its right end moves; its left end and colour do not.
-            const starts_here = eq(bg_prev[r * cols + c], v) and
-                (c == 0 or !eq(bg_prev[r * cols + c - 1], v));
+            //
+            // The colour itself may change: yazi's bar takes the hovered
+            // file's colour (orange on one folder, purple on the next), and
+            // asking for the same colour let the bar slide off with the list
+            // on every such step -- its caps on one row, the bar on another.
+            // Any coloured run that started at this column counts, except on
+            // a row the scroll is bringing IN: there, a heading arriving
+            // where another heading stood is content, not an overlay.
+            const pv = bg_prev[r * cols + c];
+            const arriving = if (shift > 0)
+                r + @as(usize, @intCast(shift)) > bottom
+            else
+                r < top + @as(usize, @intCast(-shift));
+            // And only where the text that scrolled into this row was BARE
+            // before: a table whose cells are coloured at the same column
+            // row after row (nvim) is one colour replacing another too, and
+            // pinning those held table rows still on a fast wheel scroll.
+            const src_bare = if (src_row) |sr| eq(bg_prev[sr * cols + c], zero) else false;
+            const starts_here = !eq(pv, zero) and (eq(pv, v) or (!arriving and src_bare)) and
+                (c == 0 or !eq(bg_prev[r * cols + c - 1], pv));
             var pe = c;
             if (starts_here) {
                 pe = c + 1;
-                while (pe <= right and eq(bg_prev[r * cols + pe], v)) pe += 1;
+                while (pe <= right and eq(bg_prev[r * cols + pe], pv)) pe += 1;
             }
             // ...and not simply what the shift carried there.
             const carried = if (src_row) |sr| eq(bg_prev[sr * cols + c], v) and
@@ -666,7 +684,11 @@ pub fn computePins(
             const above = r > 0 and eq(bg_now[(r - 1) * cols + c], v);
             const below = r + 1 < rows and eq(bg_now[(r + 1) * cols + c], v);
             const len = @max(e, pe) - c;
-            const joins = pinned_end != null and pinned_end.? == c;
+            // Any later coloured run on a row that holds an overlay is part
+            // of it, touching or not: the shade over the target starts a
+            // cell after the name, and left unpinned it slid in from the row
+            // below -- a piece of the bar on the wrong row.
+            const joins = pinned_end != null;
             if ((starts_here or joins) and !carried and !above and !below and (joins or len >= pin_min_cells)) {
                 @memset(pins[r * cols + c .. r * cols + @max(e, pe)], mark);
                 pinned_end = @max(e, pe);
@@ -751,7 +773,9 @@ pub fn pinStillText(
             others += 1;
             if (now[k] != before[k]) changed += 1;
         }
-        if (changed * 2 < others) continue;
+        // (Beside a held bar one changed glyph is enough: "video-use" to
+        // "Videos" keeps most of its letters, and the caps slid off.)
+        if (if (bar_row) changed == 0 else changed * 2 < others) continue;
         const min_run: usize = if (bar_row) 1 else pin_text_min;
         var run_start: ?usize = null;
         var run_end: usize = 0; // one past the last still glyph
@@ -759,8 +783,14 @@ pub fn pinStillText(
         var c = left;
         while (c <= right + 1) : (c += 1) {
             const k = r * cols + c;
+            // A bar's cap is drawn in the bar's colour, which changes with
+            // the hovered file: for symbol glyphs (private use and up, where
+            // the caps live) on a bar's row the same GLYPH is enough.
+            const cap = c <= right and bar_row and glyphOf(now[k]) >= 0xE000 and
+                glyphOf(now[k]) == glyphOf(before[k]) and
+                glyphOf(now[k]) != glyphOf(before[sr * cols + c]);
             const still = c <= right and glyphOf(now[k]) != blank_glyph and
-                now[k] == before[k] and now[k] != before[sr * cols + c] and
+                ((now[k] == before[k] and now[k] != before[sr * cols + c]) or cap) and
                 !(bar_row and pins[k][0] != 0 and pins[k][1] == 0);
             if (still) {
                 if (run_start == null) run_start = c;
@@ -832,6 +862,8 @@ test "pins: a held bar's end caps are held with it, the names inside are not" {
     }
     before[1 * cols + 5] = cellKey('.', 8);
     now[1 * cols + 5] = cellKey('.', 8);
+    // The right cap also changed colour with the bar (style 7 to 6).
+    now[1 * cols + 15] = cellKey(0xE0B6, 6);
     pinStillText(T, &pins, &now, &before, cols, 1, 0, 1, 0, cols - 1);
     try std.testing.expectEqual(@as(u8, 255), pins[1 * cols + 4][1]);
     try std.testing.expectEqual(@as(u8, 255), pins[1 * cols + 15][1]);
@@ -1243,6 +1275,10 @@ fn movedWith(cur: u64, prev: u64, src: u64) bool {
 /// undersells"). A plain repaint is still held to `max_animated_rows`.
 pub const max_detect_rows: isize = 24;
 
+/// And for a repaint the wheel caused: a flick of several notches in Claude
+/// Code (16 rows a notch here) is most of a screen in one frame.
+pub const max_wheel_rows: isize = 48;
+
 pub fn detectShift(
     cur: []const u64,
     prev: []const u64,
@@ -1263,6 +1299,24 @@ pub fn detectShiftUpTo(
     min_ratio: f32,
     max_rows: isize,
 ) ?Shift {
+    return detectShiftDir(cur, prev, rows, cols, min_rows, min_ratio, max_rows, 0);
+}
+
+/// `dir` restricts the search to one direction: +1 only shifts > 0 (content
+/// moving up), -1 only shifts < 0, 0 both. The caller knows the direction
+/// when the wheel caused the repaint; a transcript of bullets and blank lines
+/// can match better the other way, and animating that slid the text
+/// backwards before it landed.
+pub fn detectShiftDir(
+    cur: []const u64,
+    prev: []const u64,
+    rows: usize,
+    cols: usize,
+    min_rows: usize,
+    min_ratio: f32,
+    max_rows: isize,
+    dir: i8,
+) ?Shift {
     if (rows == 0 or cols == 0) return null;
     if (cur.len != rows * cols or prev.len != cur.len) return null;
     const n: isize = @intCast(rows);
@@ -1275,6 +1329,7 @@ pub fn detectShiftUpTo(
     var s: isize = -max_rows;
     while (s <= max_rows) : (s += 1) {
         if (s == 0) continue;
+        if ((dir > 0 and s < 0) or (dir < 0 and s > 0)) continue;
         var score: usize = 0;
         for (0..rows) |i| {
             const j = @as(isize, @intCast(i)) + s;
@@ -2402,6 +2457,22 @@ test "detectShift: too few matching rows is refused" {
     try testing.expect(detectShift(&cur, &prev, cur.len, 1, 6, 0.6) == null);
 }
 
+test "detectShift: with the wheel's direction, a shift the other way is not found" {
+    // Rows of two alternating kinds: moving up 3 looks the same as down 1.
+    const rows = 12;
+    const cols = 12;
+    var prev: [rows * cols]u64 = undefined;
+    var cur: [rows * cols]u64 = undefined;
+    for (0..rows) |i| for (0..cols) |c| {
+        prev[i * cols + c] = cellKey(@intCast(100 + (i % 4) * 16 + c), 0);
+        cur[i * cols + c] = cellKey(@intCast(100 + ((i + 3) % 4) * 16 + c), 0);
+    };
+    const any = detectShiftDir(&cur, &prev, rows, cols, 6, 0.6, 8, 0).?;
+    try testing.expectEqual(@as(isize, -1), any.rows);
+    const up = detectShiftDir(&cur, &prev, rows, cols, 6, 0.6, 8, 1).?;
+    try testing.expectEqual(@as(isize, 3), up.rows);
+}
+
 test "detectShift: a shift larger than we animate is not reported" {
     var prev: [40]u64 = undefined;
     for (&prev, 0..) |*v, i| v.* = 1000 + i;
@@ -2884,6 +2955,36 @@ test "pins: a bar as wide as the hovered name keeps its left end" {
     var pins = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
     computePins([4]u8, &pins, &prev, &now, cols, 1, 0, rows - 1, 0, cols - 1);
     for (0..cols) |c| try testing.expectEqual(@as(u8, if (c >= 3 and c < 12) 255 else 0), pins[4 * cols + c][0]);
+}
+
+test "pins: a bar that changes colour with the file under it is still held" {
+    const T = [4]u8;
+    const cols = 16;
+    const rows = 6;
+    const blue: T = .{ 10, 20, 200, 255 };
+    const orange: T = .{ 250, 150, 20, 255 };
+    var prev: [rows * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var now: [rows * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var pins: [rows * cols]T = undefined;
+    // The bar sits on row 2 in both frames, blue then orange, a little wider.
+    for (3..9) |c| prev[2 * cols + c] = blue;
+    for (3..11) |c| now[2 * cols + c] = orange;
+    computePins(T, &pins, &prev, &now, cols, 1, 0, rows - 1, 0, cols - 1);
+    try std.testing.expectEqual(@as(u8, 255), pins[2 * cols + 3][0]);
+    try std.testing.expectEqual(@as(u8, 255), pins[2 * cols + 10][0]);
+    // Control: the row that scrolled in was coloured there already (a table
+    // with a coloured cell in that column on every row): content, not a bar.
+    for (3..9) |c| prev[3 * cols + c] = .{ 9, 9, 9, 255 };
+    computePins(T, &pins, &prev, &now, cols, 1, 0, rows - 1, 0, cols - 1);
+    try std.testing.expectEqual(@as(u8, 0), pins[2 * cols + 3][0]);
+    // Control: the same pair on the row the scroll brings in (the last one)
+    // is new content -- a heading arriving where a heading stood.
+    @memset(&prev, .{ 0, 0, 0, 0 });
+    @memset(&now, .{ 0, 0, 0, 0 });
+    for (3..9) |c| prev[(rows - 1) * cols + c] = blue;
+    for (3..11) |c| now[(rows - 1) * cols + c] = orange;
+    computePins(T, &pins, &prev, &now, cols, 1, 0, rows - 1, 0, cols - 1);
+    try std.testing.expectEqual(@as(u8, 0), pins[(rows - 1) * cols + 3][0]);
 }
 
 test "pins: a selection bar that stays while the list scrolls under it" {

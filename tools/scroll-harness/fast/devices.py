@@ -84,6 +84,14 @@ class Mouse:
         self.ui.syn()
         self.rec.mark("wheel", direction / 8)
 
+    def notch(self, direction: int):
+        """One WHOLE notch in a single report, as an ordinary (not hi-res)
+        wheel mouse sends it: 120 hi-res units and one REL_WHEEL together."""
+        self.ui.write(e.EV_REL, e.REL_WHEEL_HI_RES, -direction * 120)
+        self.ui.write(e.EV_REL, e.REL_WHEEL, -direction)
+        self.ui.syn()
+        self.rec.mark("wheel", direction)
+
     def notches(self, schedule, direction=1):
         """schedule: iterable of absolute monotonic times (s), one 1/8 step each.
         direction -1 scrolls back up."""

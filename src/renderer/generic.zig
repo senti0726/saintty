@@ -204,6 +204,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// plumbing, so without this the repaint detector never runs for it.
         input_activity_ts: ?std.Io.Timestamp = null,
 
+        /// The wheel's last movement and its direction (+1 = content up).
+        /// See `noteWheelActivity`.
+        wheel_ts: ?std.Io.Timestamp = null,
+        wheel_dir: i8 = 0,
+
         /// When a scroll last arrived inside an open gate: a real scroll
         /// event, or a shift the repaint detector recovered.
         ///
@@ -1694,6 +1699,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.input_activity_ts = .now(global.io(), .awake);
         }
 
+        /// Record a wheel or touchpad scroll and its direction.
+        ///
+        /// Claude Code answers the wheel by redrawing, four rows a notch. A
+        /// hand flicks several notches at once, and two things went wrong
+        /// (8 scrolls in 10 "jump directly", 2026-10-02): the redraws merge
+        /// into one frame that moved 12 or 16 rows, past what a recovered
+        /// shift was allowed to be, so it was dropped and the screen snapped;
+        /// and a transcript full of bullets and blank lines sometimes matched
+        /// better the WRONG way (wheel up read as `shift=6`), which slid the
+        /// text backwards before it landed. While the wheel is the cause, the
+        /// detector looks as far as `max_wheel_rows` and only the wheel's way.
+        ///
+        /// Called from the render thread's mailbox.
+        pub fn noteWheelActivity(self: *Self, dir: i8) void {
+            self.wheel_ts = .now(global.io(), .awake);
+            self.wheel_dir = dir;
+        }
+
+        /// How long after a wheel movement a repaint is taken to be its doing.
+        pub const wheel_repaint_ms: i64 = 300;
+
         /// Animate this frame's scroll event (stashed by the event handling in
         /// `updateFrame`), by the distance the frame shows when that is
         /// further than the event said (`scroll_event_total`).
@@ -1939,13 +1965,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.extendEventRows(cur, pre, n, cols);
             }
 
-            const shift = ScrollAnim.detectShift(
+            // Only for an application that answers the wheel by redrawing
+            // alone. nvim sends scroll commands for the wheel; recovering
+            // its large repaints as well took fast wheel scrolling there
+            // from 94% smooth to 86%.
+            const by_wheel = self.wheel_dir != 0 and sinceMs(now, self.wheel_ts) <= wheel_repaint_ms and
+                (self.scroll_anim_last_event == null or sinceMs(now, self.scroll_anim_last_event.?.ts) > 1000);
+            const shift = ScrollAnim.detectShiftDir(
                 cur,
                 prev,
                 n,
                 cols,
                 repaint_scroll_min_rows,
                 repaint_scroll_min_ratio,
+                if (by_wheel) ScrollAnim.max_wheel_rows else ScrollAnim.max_animated_rows,
+                if (by_wheel) self.wheel_dir else 0,
             ) orelse return;
 
             // Hold the detected rows inside the application's own scrolling
@@ -2867,7 +2901,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 if (first == null) first = c;
                                 cnt += 1;
                             };
-                            if (cnt > 0) log.info("scrollpin row={d} col={d} n={d} text={} shift={d}", .{ r, first.?, cnt, self.scroll_pin.items[r * pc + first.?][1] != 0, pp.rows });
+                            if (cnt > 0) {
+                                // The pinned run's text now and last frame,
+                                // and which cells hold their text (T).
+                                var nb: [48]u8 = @splat(' ');
+                                var bb: [48]u8 = @splat(' ');
+                                var tb: [48]u8 = @splat(' ');
+                                const nh = self.scroll_row_hashes.items;
+                                const bh = self.scroll_hashes_before.items;
+                                if (nh.len == n and bh.len == n) for (0..@min(48, pc - first.?)) |j| {
+                                    const k = r * pc + first.? + j;
+                                    const g1 = ScrollAnim.glyphOf(nh[k]);
+                                    const g2 = ScrollAnim.glyphOf(bh[k]);
+                                    nb[j] = if (g1 == 0) ' ' else if (g1 < 127 and g1 > 32) @intCast(g1) else '#';
+                                    bb[j] = if (g2 == 0) ' ' else if (g2 < 127 and g2 > 32) @intCast(g2) else '#';
+                                    const m = self.scroll_pin.items[k];
+                                    tb[j] = if (m[0] == 0) '.' else if (m[1] != 0) 'T' else 'c';
+                                };
+                                log.info("scrollpin row={d} col={d} n={d} text={} shift={d} pushed={} now=[{s}] before=[{s}] mask=[{s}]", .{ r, first.?, cnt, self.scroll_pin.items[r * pc + first.?][1] != 0, pp.rows, pushed, nb, bb, tb });
+                            }
                         }
                     }
                 }
