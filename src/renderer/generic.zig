@@ -1723,6 +1723,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Called from the render thread's mailbox.
         pub fn noteInputActivity(self: *Self) void {
             self.input_activity_ts = .now(global.io(), .awake);
+            // A wheel movement arrives as this AND `noteWheelActivity`,
+            // which clears it again.
+            self.scroll_anim.key_paced = true;
         }
 
         /// Record a wheel or touchpad scroll and its direction.
@@ -1741,6 +1744,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn noteWheelActivity(self: *Self, dir: i8) void {
             self.wheel_ts = .now(global.io(), .awake);
             self.wheel_dir = dir;
+            self.scroll_anim.key_paced = false;
         }
 
         /// How long after a wheel movement a repaint is taken to be its doing.

@@ -54,6 +54,12 @@ from_rest: bool = false,
 /// against as the offset approaches it.
 limit_px: f32 = 0,
 
+/// The latest input was a key, not the wheel or touchpad. Set by the
+/// renderer before each `advance`. A spring held to a burst of key repeats
+/// keeps pace with them (`pace_ms`) instead of trailing by V x duration / 3.
+/// See `advanceSpring`.
+key_paced: bool = false,
+
 /// Below this many pixels there is nothing left to see. Holding a sub-pixel
 /// offset would keep requesting frames forever for no visible benefit.
 pub const min_offset_px: f32 = 0.5;
@@ -401,12 +407,25 @@ pub fn advance(
 /// up against the cap and being clipped -- which would snap.
 fn advanceSpring(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
     if (!(dt_ms > 0)) return;
+    // Not part of the motion; it is what `push` measures the input's
+    // interval by, for `pace_ms`.
+    self.elapsed_ms += dt_ms;
     if (!(duration_ms > 0)) {
         self.offset_px = 0;
         self.vel_px_ms = 0;
         return;
     }
     var w = spring_k / duration_ms;
+    // A held key. At the user's 580 ms and 40 Hz repeat the spring trailed
+    // the model by ~7.5 rows, which an application with a screen-fixed
+    // cursor shows as a lie: yazi's hover bar holds still while the names
+    // under it run 7 files behind, and when the list stops at its end they
+    // catch up in half a second -- "skips 4 or 5 files" (2026-10-12). Kept
+    // to the input's own pace the lag is 2V x pace / k, ~1.3 rows at 40 Hz.
+    // `pace_ms` is only set while pushes land on a live animation, so a
+    // single press still takes the configured duration, and the wheel --
+    // whose deep lag is deliberate, see `ghost_lag_rows` -- never gets here.
+    if (self.key_paced and self.pace_ms > 0) w = @max(w, spring_k / self.pace_ms);
     // Stiffen only past the cap itself. Starting at half of it made one big
     // batch -- nvim catching up 24 rows at once -- read as a flood, and it
     // was retired in about a frame: a snap by another name (measured, 400 px
@@ -2874,6 +2893,67 @@ test "spring: a flood stiffens instead of piling against the cap" {
         worst = @max(worst, @abs(a.offset_px));
     }
     try std.testing.expect(worst < limit);
+}
+
+/// Hold a key: a 20 px row every `interval_ms` for 1.5 s at the user's
+/// 580 ms duration, and return the deepest lag (px) over the last half.
+fn heldLag(key_paced: bool, interval_ms: f32) f32 {
+    var a: ScrollAnim = .{};
+    const dt: f32 = 1000.0 / 60.0;
+    var next_push: f32 = 0;
+    var t: f32 = 0;
+    var worst: f32 = 0;
+    while (t < 1500) : (t += dt) {
+        while (next_push <= t) : (next_push += interval_ms)
+            a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+        a.key_paced = key_paced;
+        a.advance(dt, 580, .spring);
+        if (t >= 750) worst = @max(worst, @abs(a.offset_px));
+    }
+    return worst;
+}
+
+test "spring: a held key keeps pace instead of trailing rows behind" {
+    // 40 Hz repeat. Unpaced the spring trails by ~7.7 rows (V x 580 / 3),
+    // which yazi showed as its hover bar sitting on the wrong file.
+    try std.testing.expect(heldLag(false, 25) > 6 * 20);
+    try std.testing.expect(heldLag(true, 25) < 2 * 20);
+}
+
+test "spring: key pacing keeps a held key steady" {
+    var a: ScrollAnim = .{};
+    const dt: f32 = 1000.0 / 60.0;
+    var model: f32 = 0;
+    var next_push: f32 = 0;
+    var t: f32 = 0;
+    var prev: ?f32 = null;
+    var lo: f32 = std.math.inf(f32);
+    var hi: f32 = 0;
+    while (t < 1500) : (t += dt) {
+        while (next_push <= t) : (next_push += 25) {
+            a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+            model += 20;
+        }
+        a.key_paced = true;
+        a.advance(dt, 580, .spring);
+        const drawn = model - a.offset_px;
+        if (prev) |p| if (t >= 500) {
+            lo = @min(lo, drawn - p);
+            hi = @max(hi, drawn - p);
+        };
+        prev = drawn;
+    }
+    // 13.3 px a frame on average; 40 Hz input against 60 Hz frames lands
+    // one or two rows per frame, and the spring must smooth that out.
+    try std.testing.expect(lo > 6.0);
+    try std.testing.expect(hi < 22.0);
+}
+
+test "spring: a single keypress is not paced" {
+    var a: ScrollAnim = .{};
+    a.key_paced = true;
+    a.push(20, 0, 50, 0, 200, 240);
+    try std.testing.expect(a.pace_ms == 0);
 }
 
 const TestGlyph = struct { grid_pos: [2]u16, id: u32 = 0 };
