@@ -40,7 +40,7 @@ def main():
     if wheel == "up":
         key = "k"
     stub = out / "stub"; stub.mkdir(exist_ok=True)
-    (stub / "ghostty-font").write_text("#!/bin/sh\necho stub\n"); (stub / "ghostty-font").chmod(0o755)
+    (stub / "gt").write_text("#!/bin/sh\necho stub\n"); (stub / "gt").chmod(0o755)   # stubs every gt subcommand, gt font among them
     tm("kill-server")
     if SOCK.exists():
         SOCK.unlink()

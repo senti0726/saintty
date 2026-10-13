@@ -20,7 +20,7 @@ Blast radius, all paid for before:
   * TPM is stripped from the tmux config: tmux-continuum on a second server
     would restore the user's saved sessions into it, or autosave the test
     session over the user's snapshot.
-  * reading mode shells out to ghostty-font, which reloads every Ghostty; a
+  * reading mode shells out to gt font, which reloads every Ghostty; a
     stub is put first in nvim's PATH.
   * Everything is cleaned up by PID or by the private tmux socket, never by
     `pkill -f`.
@@ -73,7 +73,7 @@ class Rig:
     def _stub(self) -> Path:
         d = self.work / "stub"
         d.mkdir(exist_ok=True)
-        f = d / "ghostty-font"
+        f = d / "gt"
         f.write_text('#!/bin/sh\necho "stub $*"\n')
         f.chmod(0o755)
         return d

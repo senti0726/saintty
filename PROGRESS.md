@@ -1854,7 +1854,7 @@ Reported against `26e099f78`, all measured before changing anything:
   Test: 220px clipped -> 0. Live, nvim in tmux: median 6.2px/frame at both 300
   and 1000.
   Also: an edit of `scroll-animation-duration` in `config` is overridden by
-  the `scroll-state.conf` include; `ghostty-scroll-speed` is the way to set it.
+  the `scroll-state.conf` include; `gt scroll` is the way to set it.
 - **nvim, `j` held at the bottom, "just jumps".** Not the fork (the previous
   binary is identical). The remaining whole-row steps are rows arriving
   several at a time — tmux coalescing (+3, +5 rows, over the 2-row cap) and
