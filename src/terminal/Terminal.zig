@@ -109,6 +109,11 @@ mouse_shape: mouse.Shape = .text,
 /// change and stamps iTimeCursorPulse for custom shaders; wraps harmlessly.
 cursor_pulse: u32 = 0,
 
+/// Bumped by OSC 777;cursor-boom (this fork), with the last one's
+/// arguments beside it. Only the newest boom per frame plays.
+cursor_boom: u32 = 0,
+cursor_boom_last: @import("osc.zig").Command.CursorBoom = .{},
+
 /// Per-session Glyph Protocol registrations.
 glyph_glossary: glyph.Glossary = .empty,
 

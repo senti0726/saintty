@@ -191,6 +191,10 @@ pub const RenderState = struct {
         /// Terminal.cursor_pulse at the last update (this fork).
         pulse: u32 = 0,
 
+        /// Terminal.cursor_boom and its arguments at the last update.
+        boom: u32 = 0,
+        boom_last: @import("osc.zig").Command.CursorBoom = .{},
+
         pub const Viewport = struct {
             /// The x/y position of the cursor within the viewport.
             x: size.CellCountInt,
@@ -428,6 +432,8 @@ pub const RenderState = struct {
         self.cursor.visible = t.modes.get(.cursor_visible);
         self.cursor.blinking = t.modes.get(.cursor_blinking);
         self.cursor.pulse = t.cursor_pulse;
+        self.cursor.boom = t.cursor_boom;
+        self.cursor.boom_last = t.cursor_boom_last;
 
         // Always reset the cursor viewport position. In the future we can
         // probably cache this by comparing the cursor pin and viewport pin

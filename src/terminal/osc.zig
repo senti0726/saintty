@@ -172,6 +172,33 @@ pub const Command = union(Key) {
     /// when a pane gains focus.
     cursor_pulse,
 
+    /// OSC 777;cursor-boom[;power[;col;row]] (this fork). Asks custom
+    /// shaders to play an explosion: at the cursor, or at the given cell
+    /// (0-based, in the terminal's own grid). The shell's `rm` and yazi's
+    /// `D` send it.
+    cursor_boom: CursorBoom,
+
+    pub const CursorBoom = struct {
+        /// 1 = a small pop, 2 = a big blast.
+        power: u8 = 1,
+        col: ?u16 = null,
+        row: ?u16 = null,
+
+        pub const C = extern struct {
+            power: u8,
+            col: i32,
+            row: i32,
+        };
+
+        pub fn cval(self: CursorBoom) C {
+            return .{
+                .power = self.power,
+                .col = if (self.col) |v| v else -1,
+                .row = if (self.row) |v| v else -1,
+            };
+        }
+    };
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const KittyClipboardProtocol = parsers.kitty_clipboard_protocol.OSC;
@@ -212,6 +239,7 @@ pub const Command = union(Key) {
             "context_signal",
             "kitty_desktop_notification",
             "cursor_pulse",
+            "cursor_boom",
         },
     );
 
@@ -461,6 +489,7 @@ pub const Parser = struct {
             .kitty_desktop_notification,
             .context_signal,
             .cursor_pulse,
+            .cursor_boom,
             => {},
         }
 

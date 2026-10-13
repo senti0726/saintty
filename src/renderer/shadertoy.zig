@@ -47,8 +47,8 @@ pub const Uniforms = extern struct {
     time_cursor_pulse: f32 align(4),
     // The last `cursor_fx_events` mode changes and pulses, oldest overwritten
     // first, so a shader can draw every effect still running instead of only
-    // the newest. Per event: (start time, cursor style, kind 0=mode 1=pulse,
-    // 0), the cursor colour, and the cursor rect at that moment.
+    // the newest. Per event: (start time, cursor style, kind 0=mode 1=pulse
+    // 2=boom, boom power), the cursor colour, and the cursor rect at that moment.
     cursor_fx_event: [cursor_fx_events][4]f32 align(16),
     cursor_fx_event_color: [cursor_fx_events][4]f32 align(16),
     cursor_fx_event_rect: [cursor_fx_events][4]f32 align(16),

@@ -357,6 +357,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         cursor_fx_mode: ?struct { style: i32, color: [4]f32 } = null,
         cursor_fx_pulse_seen: u32 = 0,
         cursor_fx_pulse_pending: bool = false,
+        /// OSC 777;cursor-boom (this fork): the last count seen, and the
+        /// boom waiting for the next frame's uniforms.
+        cursor_fx_boom_seen: u32 = 0,
+        cursor_fx_boom_pending: ?terminal.osc.Command.CursorBoom = null,
         cursor_fx_last_event: ?std.Io.Timestamp = null,
         /// Next slot of the uniforms' cursor effect event ring.
         cursor_fx_next: usize = 0,
@@ -2723,6 +2727,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.cursor_fx_pulse_pending = true;
                 self.cursor_fx_last_event = .now(global.io(), .awake);
             }
+            if (self.terminal_state.cursor.boom != self.cursor_fx_boom_seen) {
+                self.cursor_fx_boom_seen = self.terminal_state.cursor.boom;
+                self.cursor_fx_boom_pending = self.terminal_state.cursor.boom_last;
+                self.cursor_fx_last_event = .now(global.io(), .awake);
+            }
 
             // Now the render state is readable, look for movement no event
             // described. Must come after endUpdate: row_data is not valid
@@ -4301,18 +4310,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
         }
 
-        /// Record a mode change (kind 0) or pulse (kind 1) in the uniforms'
-        /// event ring, overwriting the oldest, so effects stack.
+        /// Record a mode change (kind 0), pulse (kind 1) or boom (kind 2,
+        /// `arg` = its power) in the uniforms' event ring, overwriting the
+        /// oldest, so effects stack.
         fn pushCursorFxEvent(
             self: *Self,
             kind: f32,
+            arg: f32,
             style: i32,
             color: [4]f32,
             rect: [4]f32,
         ) void {
             const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
             const i = self.cursor_fx_next;
-            uniforms.cursor_fx_event[i] = .{ uniforms.time, @floatFromInt(style), kind, 0 };
+            uniforms.cursor_fx_event[i] = .{ uniforms.time, @floatFromInt(style), kind, arg };
             uniforms.cursor_fx_event_color[i] = color;
             uniforms.cursor_fx_event_rect[i] = rect;
             self.cursor_fx_next = (i + 1) % shadertoy.cursor_fx_events;
@@ -4364,7 +4375,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (old.style != style or !std.meta.eql(old.color, color)) {
                     uniforms.time_cursor_mode = uniforms.time;
                     self.cursor_fx_last_event = now;
-                    self.pushCursorFxEvent(0, style, color, rect);
+                    self.pushCursorFxEvent(0, 0, style, color, rect);
                     if (self.config.scroll_trace) log.info(
                         "cursorfx mode style {}->{} color {d:.3}->{d:.3} t={d:.3}",
                         .{ old.style, style, old.color[0], color[0], uniforms.time },
@@ -4497,9 +4508,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 uniforms.time_cursor_pulse = uniforms.time;
                 self.pushCursorFxEvent(
                     1,
+                    0,
                     uniforms.current_cursor_style,
                     uniforms.current_cursor_color,
                     uniforms.current_cursor,
+                );
+            }
+
+            if (self.cursor_fx_boom_pending) |boom| {
+                self.cursor_fx_boom_pending = null;
+                // At the named cell, as a cell-sized rect in the same
+                // convention as the cursor's (left, +Y edge, w, h); else at
+                // the cursor.
+                const rect: [4]f32 = if (boom.col != null and boom.row != null) r: {
+                    const x: f32 = @floatFromInt(@as(u32, boom.col.?) * cell.width + padding.left);
+                    var y: f32 = @floatFromInt(@as(u32, boom.row.?) * cell.height + padding.top);
+                    if (GraphicsAPI.custom_shader_y_is_down) {
+                        y += @floatFromInt(cell.height);
+                    } else {
+                        y = @as(f32, @floatFromInt(screen.height)) - y;
+                    }
+                    break :r .{ x, y, @floatFromInt(cell.width), @floatFromInt(cell.height) };
+                } else uniforms.current_cursor;
+                self.pushCursorFxEvent(
+                    2,
+                    @floatFromInt(@max(boom.power, 1)),
+                    uniforms.current_cursor_style,
+                    uniforms.current_cursor_color,
+                    rect,
                 );
             }
 
