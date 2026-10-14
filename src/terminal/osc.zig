@@ -178,6 +178,14 @@ pub const Command = union(Key) {
     /// `D` send it.
     cursor_boom: CursorBoom,
 
+    /// OSC 777;wheel-ack;N (this fork). The application has finished
+    /// handling N more of the wheel events it was sent. Lets the terminal
+    /// stop queueing wheel events faster than they are drawn -- see
+    /// `Surface.wheelBudget`.
+    wheel_ack: WheelAck,
+
+    pub const WheelAck = struct { n: u32 };
+
     pub const CursorBoom = struct {
         /// 1 = a small pop, 2 = a big blast.
         power: u8 = 1,
@@ -240,6 +248,7 @@ pub const Command = union(Key) {
             "kitty_desktop_notification",
             "cursor_pulse",
             "cursor_boom",
+            "wheel_ack",
         },
     );
 
@@ -490,6 +499,7 @@ pub const Parser = struct {
             .context_signal,
             .cursor_pulse,
             .cursor_boom,
+            .wheel_ack,
             => {},
         }
 

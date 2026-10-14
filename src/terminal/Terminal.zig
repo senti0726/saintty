@@ -114,6 +114,10 @@ cursor_pulse: u32 = 0,
 cursor_boom: u32 = 0,
 cursor_boom_last: @import("osc.zig").Command.CursorBoom = .{},
 
+/// Wheel events the application says it has handled, summed over every
+/// OSC 777;wheel-ack (this fork). Wraps. Read by `Surface.wheelBudget`.
+wheel_acked: u32 = 0,
+
 /// Per-session Glyph Protocol registrations.
 glyph_glossary: glyph.Glossary = .empty,
 

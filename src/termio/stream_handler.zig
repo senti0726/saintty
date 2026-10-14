@@ -338,6 +338,7 @@ pub const StreamHandler = struct {
                 self.terminal.cursor_boom +%= 1;
                 self.terminal.cursor_boom_last = value;
             },
+            .wheel_ack => self.terminal.wheel_acked +%= value,
             .window_title => try self.windowTitle(value.title),
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),

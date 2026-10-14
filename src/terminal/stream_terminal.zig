@@ -455,6 +455,7 @@ pub const Handler = struct {
                 self.terminal.cursor_boom +%= 1;
                 self.terminal.cursor_boom_last = value;
             },
+            .wheel_ack => self.terminal.wheel_acked +%= value,
             .full_reset => {
                 self.terminal.fullReset();
 

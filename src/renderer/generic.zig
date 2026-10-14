@@ -216,6 +216,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// See `noteWheelActivity`.
         wheel_ts: ?std.Io.Timestamp = null,
         wheel_dir: i8 = 0,
+        /// The last wheel movement past `scroll-animation-wheel-snap`.
+        wheel_fast_ts: ?std.Io.Timestamp = null,
 
         /// When a scroll last arrived inside an open gate: a real scroll
         /// event, or a shift the repaint detector recovered.
@@ -1745,10 +1747,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// detector looks as far as `max_wheel_rows` and only the wheel's way.
         ///
         /// Called from the render thread's mailbox.
-        pub fn noteWheelActivity(self: *Self, dir: i8) void {
+        pub fn noteWheelActivity(self: *Self, dir: i8, fast: bool) void {
             self.wheel_ts = .now(global.io(), .awake);
+            if (fast) self.wheel_fast_ts = self.wheel_ts;
             self.wheel_dir = dir;
             self.scroll_anim.key_paced = false;
+        }
+
+        /// The wheel is spinning too fast to animate (`scroll-animation-wheel-snap`):
+        /// a scroll arriving now is drawn as a plain jump. Holds for a short
+        /// while after the last fast movement, which is how long the
+        /// application takes to answer it.
+        fn wheelSnapping(self: *const Self, now: std.Io.Timestamp) bool {
+            const t = self.wheel_fast_ts orelse return false;
+            return t.durationTo(now).nanoseconds <= 80 * std.time.ns_per_ms;
         }
 
         /// How long after a wheel movement a repaint is taken to be its doing.
@@ -1781,6 +1793,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(p.right),
                 p.limit,
             );
+            if (self.wheelSnapping(.now(global.io(), .awake))) self.scroll_anim.stop();
             if (was_idle) self.scroll_anim_last = null;
             // Rows beside the event that moved with it (needs the push done).
             const n = self.terminal_state.row_data.items(.cells).len;
@@ -2095,6 +2108,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(shift.right),
                 cell_h * ScrollAnim.ghost_lag_rows,
             );
+            if (self.wheelSnapping(now)) self.scroll_anim.stop();
             if (was_idle) self.scroll_anim_last = null;
             self.scroll_chain_ts = now;
 

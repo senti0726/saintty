@@ -134,6 +134,8 @@ pub const Action = union(Key) {
     cursor_pulse,
     /// OSC 777;cursor-boom (this fork): see osc.Command.cursor_boom.
     cursor_boom: osc.Command.CursorBoom,
+    /// OSC 777;wheel-ack (this fork): see osc.Command.wheel_ack.
+    wheel_ack: u32,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -237,6 +239,7 @@ pub const Action = union(Key) {
             "kitty_dnd",
             "cursor_pulse",
             "cursor_boom",
+            "wheel_ack",
         },
     );
 
@@ -2659,6 +2662,7 @@ pub fn Stream(comptime H: type) type {
 
                 .cursor_pulse => self.handler.vt(.cursor_pulse, {}),
                 .cursor_boom => |v| self.handler.vt(.cursor_boom, v),
+                .wheel_ack => |v| self.handler.vt(.wheel_ack, v.n),
 
                 .show_desktop_notification => |v| {
                     self.handler.vt(.show_desktop_notification, .{

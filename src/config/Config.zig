@@ -1098,6 +1098,25 @@ palette: Palette = .{},
 /// Debug builds only; it is very noisy.
 @"scroll-trace": bool = false,
 
+/// Most wheel events waiting on an application that acknowledges them
+/// (OSC 777;wheel-ack, this fork -- the user's nvim does). Past this many,
+/// further wheel events are dropped instead of queued.
+///
+/// A free-spinning wheel sends several times more scroll than nvim can draw
+/// on a long markdown file; the rest waited in the pty and tmux, and the
+/// text went on scrolling for seconds after the wheel stopped (10.5 s and
+/// 2800 rows, measured). Applications that never acknowledge are not
+/// affected. 0 turns it off.
+@"mouse-wheel-in-flight": u32 = 6,
+
+/// Above this many wheel notches a second, scroll without animating: plain
+/// row jumps, as stock Ghostty draws them, until the wheel slows again
+/// (this fork). For a free-spinning wheel, whose flick runs at hundreds of
+/// notches a second -- the MX Anywhere 3S peaks at 280-520 -- where nothing
+/// can be read anyway. A deliberate fast spin is ~20. Touchpads are never
+/// affected. 0 (the default) never snaps.
+@"scroll-animation-wheel-snap": f32 = 0,
+
 /// How long an application scroll takes to settle, in milliseconds.
 ///
 /// The motion is eased, not constant speed: most of the travel happens in the

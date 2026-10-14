@@ -42,6 +42,14 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
         parser.command = .{ .cursor_boom = boom };
         return &parser.command;
     }
+    if (std.mem.startsWith(u8, data, "wheel-ack;")) {
+        const n = std.fmt.parseInt(u32, data["wheel-ack;".len .. data.len - 1], 10) catch {
+            parser.state = .invalid;
+            return null;
+        };
+        parser.command = .{ .wheel_ack = .{ .n = n } };
+        return &parser.command;
+    }
     const k = std.mem.indexOfScalar(u8, data, ';') orelse {
         parser.state = .invalid;
         return null;
@@ -112,4 +120,18 @@ test "OSC: OSC 777 cursor boom" {
         try testing.expectEqual(c.col, cmd.cursor_boom.col);
         try testing.expectEqual(c.row, cmd.cursor_boom.row);
     }
+}
+
+test "OSC: OSC 777 wheel ack" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+    for ("777;wheel-ack;12") |ch| p.next(ch);
+    const cmd = p.end('\x07').?.*;
+    try testing.expect(cmd == .wheel_ack);
+    try testing.expectEqual(@as(u32, 12), cmd.wheel_ack.n);
+
+    var bad: Parser = .init(null);
+    for ("777;wheel-ack;x") |ch| bad.next(ch);
+    try testing.expect(bad.end('\x07') == null);
 }

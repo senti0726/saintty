@@ -40,7 +40,8 @@ pub const Message = union(enum) {
     /// wheel by redrawing (Claude Code): a recovered shift has to go the way
     /// the wheel went, and a flick of several notches may move further than a
     /// key ever does. (One message, not a second one beside it: a wheel sends
-    /// these at 160 a second.)
+    /// these at 160 a second.) +2/-2: the same, with the wheel turning
+    /// faster than `scroll-animation-wheel-snap`.
     input_activity: i8,
 
     /// Change the font grid. This can happen for any number of reasons
