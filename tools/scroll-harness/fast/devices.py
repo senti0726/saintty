@@ -84,6 +84,19 @@ class Mouse:
         self.ui.syn()
         self.rec.mark("wheel", direction / 8)
 
+    def raw(self, hires: int):
+        """One report of a recorded real wheel: `hires` kernel units
+        (120 = a notch, negative = content moves down), REL_WHEEL as the
+        whole notches accumulate -- as the MX's own reports carry them."""
+        self.ui.write(e.EV_REL, e.REL_WHEEL_HI_RES, hires)
+        self.acc += hires
+        whole = int(self.acc / 120)
+        if whole:
+            self.ui.write(e.EV_REL, e.REL_WHEEL, whole)
+            self.acc -= whole * 120
+        self.ui.syn()
+        self.rec.mark("wheel", -hires / 120)
+
     def notch(self, direction: int):
         """One WHOLE notch in a single report, as an ordinary (not hi-res)
         wheel mouse sends it: 120 hi-res units and one REL_WHEEL together."""

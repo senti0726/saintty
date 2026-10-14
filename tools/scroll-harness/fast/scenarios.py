@@ -127,6 +127,22 @@ def _wheel(mouse, rate_of_t, duration, direction=1):
     mouse.notches(times, direction)
 
 
+def replay(name):
+    """A recorded real wheel (manual.py -> recordings/NAME.txt: `dt_us hires`),
+    played back with its own timing through the virtual mouse."""
+    from pathlib import Path
+
+    rows = [tuple(int(x) for x in l.split()) for l in (Path(__file__).parent / "recordings" / f"{name}.txt").read_text().splitlines()]
+
+    def fn(mouse, **_):
+        start = time.monotonic() + 0.05
+        for dt, v in rows:
+            sleep_until(start + dt / 1e6)
+            mouse.raw(v)
+
+    return fn
+
+
 def wheel_slow(mouse, **_):
     """4 notches/s ratcheting for 3 s -- baseline."""
     _wheel(mouse, lambda t: 4, 3.0)
@@ -194,6 +210,12 @@ ALL = {
     "tp_fast_up": Scenario(tp_fast_up, line=900, settle=3.0),
     "tp_slow_up": Scenario(tp_slow_up, line=900),
     "wheel_slow": Scenario(wheel_slow),
+    # The MX Anywhere 3S's free spin, recorded 2026-10-14 (manual.py): 1 and 3
+    # down (they reach the end of the chapter), 2 and 4 up from near the end.
+    "mx_down1": Scenario(replay("mx-flick1"), line=1, settle=15.0),
+    "mx_up2": Scenario(replay("mx-flick2"), line=4200, settle=15.0),
+    "mx_down3": Scenario(replay("mx-flick3"), line=1, settle=15.0),
+    "mx_up4": Scenario(replay("mx-flick4"), line=4200, settle=15.0),
     "wheel_fast": Scenario(wheel_fast),
     "wheel_flick": Scenario(wheel_flick, settle=3.0),
     "tp_slow": Scenario(tp_slow),
