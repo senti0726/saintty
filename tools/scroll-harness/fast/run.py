@@ -42,6 +42,10 @@ REPO = HERE.parents[2]
 FILE = Path.home() / "notes/obsidian-cpp/Study Resources/booksInMarkdown/CSAPP/Chapter 2 Representing and Manipulating Information.md"
 TITLE = "scroll-harness-fast"
 SOCK_NAME = "smoothharness"
+CLASS = "com.claude.scrollharness"
+# Hyprland or KWin: the window is placed, focused and the screen woken through
+# whichever compositor is running.
+HYPR = bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"))
 YDO = {"YDOTOOL_SOCKET": "/run/ydotoold/socket"}
 
 
@@ -101,7 +105,27 @@ class Rig:
         p.write_text("\n".join(out) + "\n")
         return p
 
+    def _hypr_dpms(self) -> bool:
+        import json
+        mons = json.loads(sh("hyprctl", "monitors", "-j").stdout or "[]")
+        return all(m.get("dpmsStatus", True) for m in mons)
+
     def wake_screen(self):
+        if HYPR:
+            # hypridle honours systemd idle inhibitors.
+            self.inhibit = subprocess.Popen(
+                ["systemd-inhibit", "--what=idle", "--who=scroll-harness", "--why=test run", "sleep", "7200"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+            self.woke = not self._hypr_dpms()
+            if self.woke:
+                print("screen was asleep: waking it for the run")
+                sh("hyprctl", "dispatch", 'hl.dsp.dpms({ action = "on" })')
+                time.sleep(2)
+            return
+        self._wake_screen_kde()
+
+    def _wake_screen_kde(self):
         """A screen that has gone to sleep stops Ghostty drawing at all (no
         frame callbacks), and every run then fails as "nvim never came up".
         Wake it, and remember to put it back: stop() does, via powerdevil's
@@ -134,6 +158,10 @@ class Rig:
         inh = getattr(self, "inhibit", None)
         if inh and inh.poll() is None:
             os.killpg(inh.pid, signal.SIGTERM)
+        if getattr(self, "woke", False) and HYPR:
+            sh("hyprctl", "dispatch", 'hl.dsp.dpms({ action = "off" })')
+            print("screen put back to sleep")
+            return
         if getattr(self, "woke", False):
             time.sleep(1)  # the devices closing counts as activity
             sh("qdbus-qt6", "org.kde.kglobalaccel", "/component/org_kde_powerdevil",
@@ -151,6 +179,13 @@ class Rig:
 
     def start(self):
         self.wake_screen()
+        if HYPR:
+            import json
+            self.prev_ws = json.loads(sh("hyprctl", "activeworkspace", "-j").stdout)["id"]
+            # Its own workspace, fullscreen, so the user's windows are left
+            # where they are and come back with one focus on stop().
+            cls = CLASS.replace(".", "\\\\.")
+            sh("hyprctl", "eval", f'hl.window_rule({{ name = "scroll-harness", match = {{ class = "^{cls}$" }}, workspace = "9", fullscreen = true }})')
         if self.sock.exists():
             self.sock.unlink()
         sh("tmux", "-L", SOCK_NAME, "kill-server")
@@ -158,7 +193,7 @@ class Rig:
         inner = f"env PATH={stub}:{os.environ['PATH']} nvim --listen {self.sock} '{FILE}'"
         cmd = [
             str(self.bin), "--gtk-single-instance=false", "--scroll-trace=true",
-            f"--title={TITLE}",
+            f"--title={TITLE}", f"--class={CLASS}",
             *self.ghostty_flags(),
             "-e", "tmux", "-L", SOCK_NAME, "-f", str(conf), "new-session", "-A", "-s", "h", inner,
         ]
@@ -173,7 +208,10 @@ class Rig:
                 break
         else:
             raise SystemExit("nvim never came up")
-        self.kwin(f"""
+        if HYPR:
+            self.focus()
+        else:
+            self.kwin(f"""
 var w = workspace.windowList();
 for (var i = 0; i < w.length; i++)
   if (String(w[i].caption).indexOf("{TITLE}") >= 0) {{ workspace.activeWindow = w[i]; w[i].fullScreen = true; }}
@@ -204,6 +242,8 @@ return 1
         return flags
 
     def kwin(self, js: str):
+        if HYPR:
+            return
         f = self.work / "kwin.js"
         f.write_text(js)
         sh("qdbus-qt6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "harness")
@@ -211,6 +251,11 @@ return 1
         sh("qdbus-qt6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.start")
 
     def focus(self):
+        if HYPR:
+            cls = CLASS.replace(".", "\\\\.")
+            sh("hyprctl", "dispatch", f'hl.dsp.focus({{ window = "class:^{cls}$" }})')
+            time.sleep(0.4)
+            return
         self.kwin(f"""
 var w = workspace.windowList();
 for (var i = 0; i < w.length; i++)
@@ -309,7 +354,11 @@ for (var i = 0; i < w.length; i++)
                 self.proc.wait(5)
             except subprocess.TimeoutExpired:
                 os.killpg(self.proc.pid, signal.SIGKILL)
-        sh("qdbus-qt6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "harness")
+        if HYPR:
+            if getattr(self, "prev_ws", None) is not None:
+                sh("hyprctl", "dispatch", f"hl.dsp.focus({{ workspace = {self.prev_ws} }})")
+        else:
+            sh("qdbus-qt6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "harness")
         self.sleep_screen()
 
 
