@@ -41,6 +41,8 @@ elapsed_ms: f32 = 0,
 /// A shorter ease for this burst, when rows are arriving faster than the
 /// configured duration can retire them; 0 when there is none. See `push`.
 pace_ms: f32 = 0,
+/// How many intervals `pace_ms` has averaged since the burst began.
+pace_samples: u8 = 0,
 
 /// Rate of change of `offset_px`, px per ms. Only the `spring` easing keeps
 /// it: it is what makes that motion velocity-continuous. See `advanceSpring`.
@@ -228,13 +230,26 @@ pub fn push(
     // fast, fast, slow, slow, slow, slow ten times a second (steps of 7 to
     // 31 px against a mean of 13; smooth% 85, 2026-10-14 under Hyprland).
     // Two pushes inside one frame measure 0, which the average needs too.
+    //
+    // Except the first interval, when the second is under half of it: held
+    // j's first repeat comes 300 ms after the press and every one after it
+    // 25 ms apart, and averaged, the 1200 ms that delay seeded took ~12 keys
+    // to wash out -- for the first half second of every hold the spring was
+    // soft enough to fall 8 rows behind (165 px, the user's "held j lags",
+    // 2026-10-14). Only the first: taking every 2x speed-up at once also
+    // caught nvim resuming after a 170 ms pause at a table, which went soft
+    // then stiff around every one (hold_j_tables smooth% 95 -> 88).
     if (!overlaps) {
         self.pace_ms = 0;
+        self.pace_samples = 0;
     } else {
         const measured = self.elapsed_ms * pace_intervals;
-        self.pace_ms = if (self.pace_ms > 0)
+        const repeat_delay = self.pace_samples == 1 and measured > 0 and
+            2 * measured < self.pace_ms;
+        self.pace_ms = if (self.pace_ms > 0 and !repeat_delay)
             self.pace_ms + (measured - self.pace_ms) * pace_smoothing
         else if (measured > 0) measured else 0;
+        if (self.pace_ms > 0) self.pace_samples +|= 1;
     }
 
     self.start_px = self.offset_px;
@@ -2994,6 +3009,29 @@ test "spring: held key pace does not beat against the frame rate" {
     try std.testing.expect(hi < 17.0);
     // ...and still keeps pace, for yazi's sake.
     try std.testing.expect(heldLag(true, 25) < 2 * 20);
+}
+
+test "spring: a hold keeps pace from its first repeat" {
+    // Press, the 300 ms repeat delay, then 40 Hz repeat. The delay must not
+    // linger in the pace: half a second in, the drawn text may trail the
+    // model by no more than the steady held-key lag (~1.3 rows).
+    var a: ScrollAnim = .{};
+    a.key_paced = true;
+    const dt: f32 = 1000.0 / 60.0;
+    var model: f32 = 0;
+    var next_push: f32 = 0;
+    var t: f32 = 0;
+    var worst: f32 = 0;
+    while (t < 1500) : (t += dt) {
+        while (next_push <= t) {
+            a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+            model += 20;
+            next_push += if (next_push == 0) 300 else 25;
+        }
+        a.advance(dt, 600, .spring);
+        if (t >= 450) worst = @max(worst, @abs(a.offset_px));
+    }
+    try std.testing.expect(worst < 2 * 20);
 }
 
 test "spring: a single keypress is not paced" {
