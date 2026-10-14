@@ -86,6 +86,10 @@ pub const max_lag_rows: f32 = 2;
 /// How many input intervals a burst of pushes is given to settle. See `push`.
 pub const pace_intervals: f32 = 4;
 
+/// How much of each new interval measurement `pace_ms` takes in (an
+/// exponential average, ~4 pushes deep). See `push`.
+pub const pace_smoothing: f32 = 0.25;
+
 /// How many rows that scrolled OUT of the region the renderer keeps, so it
 /// can go on drawing them in the band a lagging offset uncovers. See
 /// `shiftGhosts`. This is what makes a lag of more than a row or two
@@ -216,10 +220,21 @@ pub fn push(
     // `duration / pace_intervals` is left at the configured duration, and a
     // push onto an idle animation clears the pace, so an isolated scroll
     // always takes exactly what was configured.
+    //
+    // The interval is averaged, not taken from the last push alone.
+    // `elapsed_ms` only grows a frame at a time, so 40 Hz key repeat on a
+    // 60 Hz display measures 17, 33, 17, 33 ms -- and with `key_paced` the
+    // spring's stiffness doubled and halved on every key: held j in nvim went
+    // fast, fast, slow, slow, slow, slow ten times a second (steps of 7 to
+    // 31 px against a mean of 13; smooth% 85, 2026-10-14 under Hyprland).
+    // Two pushes inside one frame measure 0, which the average needs too.
     if (!overlaps) {
         self.pace_ms = 0;
-    } else if (self.elapsed_ms > 0) {
-        self.pace_ms = self.elapsed_ms * pace_intervals;
+    } else {
+        const measured = self.elapsed_ms * pace_intervals;
+        self.pace_ms = if (self.pace_ms > 0)
+            self.pace_ms + (measured - self.pace_ms) * pace_smoothing
+        else if (measured > 0) measured else 0;
     }
 
     self.start_px = self.offset_px;
@@ -2947,6 +2962,38 @@ test "spring: key pacing keeps a held key steady" {
     // one or two rows per frame, and the spring must smooth that out.
     try std.testing.expect(lo > 6.0);
     try std.testing.expect(hi < 22.0);
+}
+
+test "spring: held key pace does not beat against the frame rate" {
+    // Pushes land between frames, as real ones do: 40 Hz against 60 Hz is
+    // one frame, two frames, one, two... apart. Taking each interval as
+    // the pace swung the spring's stiffness 2x per key (steps 7..31 px).
+    var a: ScrollAnim = .{};
+    const dt: f32 = 1000.0 / 60.0;
+    var model: f32 = 0;
+    var next_push: f32 = 5;
+    var t: f32 = 0;
+    var prev: ?f32 = null;
+    var lo: f32 = std.math.inf(f32);
+    var hi: f32 = 0;
+    while (t < 2000) : (t += dt) {
+        while (next_push <= t) : (next_push += 25) {
+            a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+            model += 20;
+        }
+        a.key_paced = true;
+        a.advance(dt, 580, .spring);
+        const drawn = model - a.offset_px;
+        if (prev) |p| if (t >= 800) {
+            lo = @min(lo, drawn - p);
+            hi = @max(hi, drawn - p);
+        };
+        prev = drawn;
+    }
+    try std.testing.expect(lo > 10.0);
+    try std.testing.expect(hi < 17.0);
+    // ...and still keeps pace, for yazi's sake.
+    try std.testing.expect(heldLag(true, 25) < 2 * 20);
 }
 
 test "spring: a single keypress is not paced" {
