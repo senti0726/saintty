@@ -32,6 +32,8 @@ import scenarios  # noqa: E402
 
 GT = Path.home() / ".local/bin/gt"
 X, W, Y, H = 0, 1000, 60, 960  # text rows 3..50 of the left half
+if any(a == "--narrow" for a in sys.argv):  # long gestures: ~200 KB a frame
+    W = 200
 
 
 class Film:
@@ -140,7 +142,8 @@ def main():
     binary = Path(opts.get("bin", Path.home() / "tools/ghostty/bin/ghostty"))
     out = Path(opts.get("out", Path.home() / "playground/fast-scroll" / time.strftime("%Y%m%d-%H%M%S-blink")))
     arms = [int(x) for x in opts.get("arms", "0,600").split(",")]
-    lines = [int(x) for x in opts.get("lines", "1500,560,1210,2520").split(",")]
+    # `own`: each scenario's own start line (the mx_* replays need theirs).
+    lines = [None if x == "own" else int(x) for x in opts.get("lines", "1500,560,1210,2520").split(",")]
     tests = opts.get("tests", "hold_j,hold_k,wheel_fast_up").split(",")
     before = json.loads(subprocess.run([GT, "scroll", "--json"], capture_output=True, text=True).stdout)["value"]
 
@@ -159,7 +162,7 @@ def main():
             for line in lines:
                 for name in tests:
                     sc = scenarios.ALL[name]
-                    start = line + (150 if sc.top else 0)  # k / up: room above
+                    start = sc.line if line is None else line + (150 if sc.top else 0)  # k / up: room above
                     if sc.keys:
                         rig.reset(start, bottom=not sc.top)
                         if not rig.probe_keys():
@@ -174,7 +177,7 @@ def main():
                     rec.mark("start")
                     sc.run(mouse=mouse, pad=pad, rec=rec)
                     rec.mark("end")
-                    time.sleep(1.5)
+                    time.sleep(min(max(sc.settle, 1.5), 6.0))
                     film.stop()
                     nv = [int(l.split()[0]) for l in run.slice_file(rig.nvlog, n0).splitlines() if l.strip()]
                     tag = f"{arm}-{line}-{name}"
