@@ -4365,7 +4365,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (self.cursor_fx_cell) |old| {
                 if (old[0] != cell_pos[0] or old[1] != cell_pos[1]) {
-                    const riding = self.scroll_anim.active();
+                    // Or the wheel is turning: between an application's
+                    // scroll batches the animation can be idle, and with
+                    // `scroll-animation-wheel-snap` it never runs at all, so
+                    // a flick smeared the cursor all over the screen
+                    // (2026-10-14).
+                    const wheel_recent = if (self.wheel_ts) |t|
+                        t.durationTo(now).nanoseconds <= wheel_repaint_ms * std.time.ns_per_ms
+                    else
+                        false;
+                    const riding = self.scroll_anim.active() or wheel_recent;
                     if (riding) {
                         uniforms.cursor_move_from = rect;
                         uniforms.time_cursor_move = -1000;
