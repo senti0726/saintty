@@ -195,7 +195,7 @@ class Rig:
             str(self.bin), "--gtk-single-instance=false", "--scroll-trace=true",
             f"--title={TITLE}", f"--class={CLASS}",
             *self.ghostty_flags(),
-            *(["-e", "tmux", "-L", SOCK_NAME, "-f", str(conf), "new-session", "-A", "-s", "h", inner] if getattr(self, "use_tmux", True) else ["-e", *getattr(self, "exec_prefix", []), "sh", "-c", inner]),
+            *(["-e", *getattr(self, "exec_prefix", []), "tmux", "-L", SOCK_NAME, "-f", str(conf), "new-session", "-A", "-s", "h", inner] if getattr(self, "use_tmux", True) else ["-e", *getattr(self, "exec_prefix", []), "sh", "-c", inner]),
         ]
         self.logf = open(self.log, "w")
         # This harness is usually driven from inside the user's tmux; a

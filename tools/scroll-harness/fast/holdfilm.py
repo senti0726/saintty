@@ -2,7 +2,7 @@
 """Film a held key / a steady wheel FULL-WIDTH and score it per display refresh.
 
     python3 holdfilm.py OUT [--bin=PATH] [--tests=hold_j@1,wheel_down@1] [--hold=4]
-        [--wheel-rate=N] [--reps=1] [--load=PIDFILE] [--nvim-config=DIR] [--tmux=no] [--conf-KEY=VAL ...]
+        [--wheel-rate=N] [--reps=1] [--load=PIDFILE] [--nvim-config=DIR] [--tmux=no] [--warm=S] [--conf-KEY=VAL ...]
 
 What the eye calls stutter is uneven motion from one refresh to the next, and a
 jump is one refresh that moves much further than its neighbours. lat.py follows
@@ -172,6 +172,7 @@ def analyse(frames, events, nv_us, name, png_dir=None, tag=""):
         frozen_pct=round(float((step == 0).mean() * 100), 1),
         over_1row_pct=round(float((step > 1.0).mean() * 100), 1),
         over_2row=int((step > 2.0).sum()),
+        max_step_rows=round(float(step.max()), 2),
         reflows=sum(1 for o in scan if "REFLOW" in o["flags"]),
         film_skipped_refreshes=int(np.clip(np.round(dt) - 1, 0, None).sum()),
     )
@@ -219,8 +220,9 @@ class HoldRig(run.Rig):
         super().__init__(binary, out, extra)
         self.nvim_config = nvim_config
         self.use_tmux = tmux
-        if not tmux and os.environ.get("HOLDFILM_PTYREC"):
-            # log what nvim writes (no tmux in between), see ptyrec.py
+        if os.environ.get("HOLDFILM_PTYREC"):
+            # log what the terminal receives -- nvim's bytes, or with tmux
+            # tmux's -- see ptyrec.py
             self.exec_prefix = ["python3", str(HERE / "ptyrec.py"), os.environ["HOLDFILM_PTYREC"], "--"]
 
     def start(self):
@@ -249,6 +251,9 @@ def main():
     report = []
     try:
         rig.start()
+        # A fresh nvim blocks 150-250 ms on each formula its latex warm-up
+        # has not reached yet; let it finish before anything is timed.
+        time.sleep(float(opts.get("warm", 0)))
         if any(n.startswith("wheel") for n, _ in tests):
             mouse = devices.Mouse(rec)
             time.sleep(0.5)
