@@ -190,12 +190,12 @@ class Rig:
             self.sock.unlink()
         sh("tmux", "-L", SOCK_NAME, "kill-server")
         conf, stub = self._tmux_conf(), self._stub()
-        inner = f"env PATH={stub}:{os.environ['PATH']} nvim --listen {self.sock} '{FILE}'"
+        inner = f"env {getattr(self, 'nvim_env', '')}PATH={stub}:{os.environ['PATH']} nvim --listen {self.sock} '{FILE}'"
         cmd = [
             str(self.bin), "--gtk-single-instance=false", "--scroll-trace=true",
             f"--title={TITLE}", f"--class={CLASS}",
             *self.ghostty_flags(),
-            "-e", "tmux", "-L", SOCK_NAME, "-f", str(conf), "new-session", "-A", "-s", "h", inner,
+            *(["-e", "tmux", "-L", SOCK_NAME, "-f", str(conf), "new-session", "-A", "-s", "h", inner] if getattr(self, "use_tmux", True) else ["-e", *getattr(self, "exec_prefix", []), "sh", "-c", inner]),
         ]
         self.logf = open(self.log, "w")
         # This harness is usually driven from inside the user's tmux; a

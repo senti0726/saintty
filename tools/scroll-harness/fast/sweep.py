@@ -5,7 +5,10 @@ pane after each press, and flag every press that moved more than one row or
 changed rows in place. Uses the user's live nvim config.
 
     python3 tools/scroll-harness/fast/sweep.py OUT [--from=1] [--to=END] [--gap=0.12] [--key=j]
-        [--wheel=down|up] [--burst=1]
+        [--wheel=down|up] [--burst=1] [--size=210x55] [--config=DIR]
+
+`--size`: the pane, COLSxROWS. `--config`: an nvim config directory to use
+instead of ~/.config/nvim (plugins stay the installed ones), for bisecting.
 
 `--wheel`: instead of a key, `--burst` wheel events per step through
 nvim_input_mouse (the user's mousescroll and scroll.lua apply). A wheel step
@@ -46,7 +49,15 @@ def main():
         SOCK.unlink()
     env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
     env["SNACKS_GHOSTTY"] = "true"
-    subprocess.run(["tmux", "-L", S, "-f", "/dev/null", "new-session", "-d", "-x", "210", "-y", "55", "-s", "h",
+    cols, rows = opts.get("size", "210x55").split("x")
+    if "config" in opts:
+        xdg = out / "xdg"; xdg.mkdir(exist_ok=True)
+        link = xdg / "nvim"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(Path(opts["config"]).resolve())
+        env["XDG_CONFIG_HOME"] = str(xdg)
+    subprocess.run(["tmux", "-L", S, "-f", "/dev/null", "new-session", "-d", "-x", cols, "-y", rows, "-s", "h",
                     f"env PATH={stub}:{os.environ['PATH']} nvim --listen {SOCK} '{run.FILE}'"], env=env)
     for _ in range(60):
         time.sleep(0.25)
