@@ -2590,3 +2590,53 @@ reproduces the filmed spring within a few points and its outliers.
 - The user's drum-transcription job (7 cores, swap full) roughly doubles held-j
   spread and brings the >2-row leaps; pause it (holdfilm `--load=PIDFILE`)
   or A/B in alternating order.
+
+## 2026-10-22 (later) — the figure tear was tmux; a stall's backlog lingers into the glide
+
+### Why
+
+With the glide and nvim sync3 in, the user still saw figures tear (a band of
+Figure 2.21 a row out of step with the rest, cursor inside it) and freezes
+followed by leaps (~130 ms frozen, then 1.2/2.7/3.2/1.6 rows a frame).
+
+### The tear: tmux leaks combining marks out of a pane's synchronized update
+
+- Reproduced only THROUGH tmux (no-tmux: 0 torn frames; tmux: 2-23 per 6 s
+  hold through CH2 1930-2050), on the 10-14 build as much as the glide build.
+- tmux's sync blocks were clean (`syncframes.py`: every update a whole +1/+0
+  shift, figure and text together). Ghostty's repaint detector said the
+  figure rows were UNCHANGED while the text moved (a debug trace in
+  detectRepaintScroll: `changed=0`, the marks of the first placeholder cell
+  identical to the previous frame's) -- a state no tmux sync block ever had.
+- Because tmux wrote 1.6 MB per hold OUTSIDE its sync blocks, 86 stretches,
+  all image placeholders: `screen_write_combine()` (tmux 3.7c) draws a cell
+  as soon as a combining mark joins it, without the `MODE_SYNC` check
+  `screen_write_cell()` has -- and every Kitty placeholder carries row and
+  column marks (`U+10EEEE U+0305 BS U+10EEEE U+0305 U+030D`). Ghostty drew
+  figure rows ahead of their text.
+- Fixed in tmux, not here: dotfiles `install/tmux-sync-combine` (Fedora RPM
+  rebuilt with a 2-line patch, `.sync1`). Verified: 0 placeholder stretches
+  outside sync blocks, 0 torn frames in two runs.
+
+### The linger
+
+`glide_linger_max_ms` (300): a held key whose rows stop hands back to the
+spring, which lands -- and landing ended the animation and threw the glide's
+averages away, so the backlog nvim sent after its stall started a stiff paced
+spring from rest. Now the landed animation stays alive at an offset under
+half a pixel (drawn as zero) while the key is held and the glide had taken
+over, so the backlog resumes the glide and is spread over `glide_catch_ms`.
+Unit test `glide: rows queued behind a stall resume the glide` (fails with
+the linger at 0). Filmed under a 7-core nice-10 load, alternating: worst
+single-frame step 2.6 -> 1.1 rows, >2-row frames 1 -> 0.
+
+### Traps
+
+- `pyte` cannot answer tmux's private queries (`CSI ? n`): stub
+  `report_device_status` / `report_device_attributes` or it raises.
+- A dup-row "tear" detector fires on big tables (rows that really look alike);
+  the banded REFLOW check is the reliable one.
+- `holdfilm.py --warm=25`: a fresh nvim needs ~5 s to warm CH2's 469
+  formulas; before that every new one blocks 150-250 ms.
+- Upstream re-cut the tmux 3.7c release tarball (789 KB vs the 1.1 MB Fedora
+  built): rebuild scripts must take `sources` files from Fedora's lookaside.

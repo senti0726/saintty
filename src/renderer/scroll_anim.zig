@@ -80,6 +80,9 @@ glide_sum_ms: f32 = 0,
 /// The glide's own speed, px per ms, and whether it is driving the offset.
 glide_v: f32 = 0,
 gliding: bool = false,
+/// How long a finished held-key animation has been kept alive, invisibly,
+/// waiting for the rows after a stall. See `glide_linger_max_ms`.
+glide_linger_ms: f32 = 0,
 
 /// Below this many pixels there is nothing left to see. Holding a sub-pixel
 /// offset would keep requesting frames forever for no visible benefit.
@@ -173,6 +176,17 @@ pub const glide_warm_samples: u8 = 8;
 pub const glide_min_interval_ms: f32 = 15;
 pub const glide_release_intervals: f32 = 2;
 pub const glide_release_min_ms: f32 = 45;
+/// A held key whose rows STOP for a moment -- nvim busy 100-130 ms on a big
+/// table or a figure line -- hands back to the spring, which lands, and
+/// landing ended the animation and threw the glide's averages away. The
+/// backlog that came next (4-7 rows at once) then started a stiff paced
+/// spring from rest: a freeze and then a leap of up to 3.2 rows in one frame
+/// (the user's recording, 2026-10-22). So for this long after landing, under
+/// a held key, the animation stays alive at an offset nobody can see, and the
+/// backlog resumes the glide, which spreads it over `glide_catch_ms`
+/// (modelled: peak 1.5 -> 0.95 rows a frame). A real release just idles
+/// invisibly this long.
+pub const glide_linger_max_ms: f32 = 300;
 
 /// The stiffness of the `spring` easing, as a multiple of 1/duration. At 6 a
 /// single one-row push from rest is inside half a pixel in ~0.6 x duration,
@@ -315,6 +329,7 @@ pub fn push(
         self.gliding = false;
     }
     self.glide_pending_px += @abs(offset_px);
+    self.glide_linger_ms = 0;
     if (overlaps) {
         // Union, per the note above. This only ever grows over regions that
         // were actually pushed -- rows and columns something told us really
@@ -534,6 +549,17 @@ fn advanceSpring(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
     const x = (x0 + b * dt_ms) * e;
     const v = (v0 - w * b * dt_ms) * e;
     if (@abs(x) < min_offset_px and @abs(v) * 16 < min_offset_px) {
+        // Landed. Under a held key that was gliding, linger: see
+        // `glide_linger_max_ms`. Drawn offsets under half a pixel are
+        // drawn as zero, so this is invisible.
+        if (self.key_paced and self.glide_samples >= glide_min_samples and
+            self.glide_linger_ms < glide_linger_max_ms)
+        {
+            self.glide_linger_ms += dt_ms;
+            self.offset_px = std.math.copysign(min_offset_px * 0.01, x0);
+            self.vel_px_ms = 0;
+            return;
+        }
         self.offset_px = 0;
         self.vel_px_ms = 0;
         return;
@@ -3263,6 +3289,49 @@ test "glide: a held key whose rows land unevenly still moves evenly" {
     try std.testing.expect(worst < 2 * 20);
 }
 
+test "glide: rows queued behind a stall resume the glide" {
+    // 40 Hz rows, nvim stalls 130 ms, then delivers the 5 rows it owed at
+    // once and carries on. Without the linger the glide had landed and been
+    // forgotten, and the backlog leapt in on a stiff spring.
+    var a: ScrollAnim = .{};
+    const dt: f32 = 1000.0 / 60.0;
+    var model: f32 = 0;
+    var t: f32 = 0;
+    var next: f32 = 0;
+    var prev: ?f32 = null;
+    var worst_after: f32 = 0;
+    var backlog_sent = false;
+    while (t < 3000) : (t += dt) {
+        if (t < 1500) {
+            while (next <= t) : (next += 25) {
+                a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+                model += 20;
+            }
+        } else if (t >= 1630 and !backlog_sent) {
+            for (0..5) |_| {
+                a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+                model += 20;
+            }
+            backlog_sent = true;
+            next = t + 25;
+        } else if (backlog_sent) {
+            while (next <= t) : (next += 25) {
+                a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+                model += 20;
+            }
+        }
+        a.key_paced = true;
+        a.advance(dt, 580, .spring);
+        const drawn = model - a.offset_px;
+        if (prev) |p| if (t >= 1630 and t < 2100) {
+            worst_after = @max(worst_after, drawn - p);
+        };
+        prev = drawn;
+    }
+    // A row a frame at most, against 30 px with the glide forgotten.
+    try std.testing.expect(worst_after < 22);
+}
+
 test "glide: a Ctrl-D burst is left to the spring" {
     // nvim's own half-page glide: a row every 6 ms, several a frame.
     var a: ScrollAnim = .{};
@@ -3310,7 +3379,9 @@ test "glide: letting go lands without stopping dead or going back" {
             }
         }
         prev = drawn;
-        if (landed_at == null and !a.active()) landed_at = t;
+        // Landed = nothing left to see; under a held key it then lingers
+        // invisibly (`glide_linger_max_ms`).
+        if (landed_at == null and @abs(a.offset_px) < min_offset_px) landed_at = t;
     }
     try std.testing.expect(was_gliding);
     try std.testing.expect(landed_at != null and landed_at.? < 1000 + 300);
