@@ -62,6 +62,25 @@ limit_px: f32 = 0,
 /// See `advanceSpring`.
 key_paced: bool = false,
 
+/// The held-key glide (see `advanceGlide`): the model's speed under a held
+/// key, px per ms, averaged over the frames that brought rows, and the
+/// averaged time between those frames.
+glide_rate: f32 = 0,
+glide_iv_ms: f32 = 0,
+/// Rows pushed since the last frame, px, and the time since the last frame
+/// that brought any.
+glide_pending_px: f32 = 0,
+glide_since_ms: f32 = 0,
+glide_samples: u8 = 0,
+/// Px and ms summed over the first `glide_warm_samples` (their quotient is
+/// the rate until the average has enough to go on), then averaged per
+/// sample (`glide_alpha`), the rate being their quotient still.
+glide_sum_px: f32 = 0,
+glide_sum_ms: f32 = 0,
+/// The glide's own speed, px per ms, and whether it is driving the offset.
+glide_v: f32 = 0,
+gliding: bool = false,
+
 /// Below this many pixels there is nothing left to see. Holding a sub-pixel
 /// offset would keep requesting frames forever for no visible benefit.
 pub const min_offset_px: f32 = 0.5;
@@ -130,6 +149,30 @@ pub const ghost_lag_rows: f32 = 48;
 /// for the 42-row batches measured in a wheel flick.
 /// 48 -> 64 with the lag cap, for those 57-row batches.
 pub const max_ghost_animated_rows: isize = 64;
+
+/// The held-key glide. How much of the input's own travel it keeps in hand
+/// (ms of it), how long it takes to close any gap beyond that, how quickly
+/// its speed follows, and how much of each new rate sample it takes in. See
+/// `advanceGlide`.
+pub const glide_lead_ms: f32 = 40;
+pub const glide_catch_ms: f32 = 150;
+pub const glide_smooth_ms: f32 = 60;
+pub const glide_alpha: f32 = 0.15;
+/// It takes over once this many frames have brought rows at no faster than
+/// one a `glide_min_interval_ms` -- key repeat, not a Ctrl-D burst -- and
+/// hands back to the spring when none has come for `glide_release_intervals`
+/// of the averaged interval (and at least `glide_release_min_ms`): a release
+/// or a stall.
+pub const glide_min_samples: u8 = 5;
+/// For this many samples the rate is the plain mean since the hold's rows
+/// began, then `glide_alpha`'s average. Begun as an average, its first
+/// frame-quantised samples (20 px over 33 ms = 0.6 px/ms against a true
+/// 0.8) held it low for ~200 ms, and the drawn text fell 2.3 rows behind
+/// just after the repeat began.
+pub const glide_warm_samples: u8 = 8;
+pub const glide_min_interval_ms: f32 = 15;
+pub const glide_release_intervals: f32 = 2;
+pub const glide_release_min_ms: f32 = 45;
 
 /// The stiffness of the `spring` easing, as a multiple of 1/duration. At 6 a
 /// single one-row push from rest is inside half a pixel in ~0.6 x duration,
@@ -259,6 +302,19 @@ pub fn push(
         self.vel_px_ms = 0;
         self.from_rest = true;
     }
+    // A new burst, or the other way: the glide's averages describe some
+    // other motion.
+    if (!overlaps or (base != 0 and (base > 0) != (offset_px > 0))) {
+        self.glide_rate = 0;
+        self.glide_iv_ms = 0;
+        self.glide_pending_px = 0;
+        self.glide_since_ms = 0;
+        self.glide_samples = 0;
+        self.glide_sum_px = 0;
+        self.glide_sum_ms = 0;
+        self.gliding = false;
+    }
+    self.glide_pending_px += @abs(offset_px);
     if (overlaps) {
         // Union, per the note above. This only ever grows over regions that
         // were actually pushed -- rows and columns something told us really
@@ -445,6 +501,7 @@ fn advanceSpring(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
         self.vel_px_ms = 0;
         return;
     }
+    if (self.advanceGlide(dt_ms)) return;
     var w = spring_k / duration_ms;
     // A held key. At the user's 580 ms and 40 Hz repeat the spring trailed
     // the model by ~7.5 rows, which an application with a screen-fixed
@@ -486,6 +543,111 @@ fn advanceSpring(self: *ScrollAnim, dt_ms: f32, duration_ms: f32) void {
     // An offset of exactly zero ends the animation (`active`), so a spring
     // passing through zero mid-motion must not land on it.
     if (self.offset_px == 0) self.offset_px = std.math.copysign(min_offset_px * 0.01, v);
+}
+
+/// A held key, gliding: move at the input's own averaged speed instead of
+/// springing after each row. Returns false, leaving the frame to the spring,
+/// until the hold is steady, and again once the rows stop coming.
+///
+/// Why (2026-10-22). Held j looked like it stuttered and jumped. Filmed per
+/// refresh, the text moved 0.4-1.1 rows a refresh around a mean of 0.67
+/// (sd 18-24 %; the wheel at the same speed: 5-7 %), and the build before
+/// key pacing (2026-10-12) did 9-14 %. Pacing made the spring stiff enough
+/// to follow within 1.3 rows -- time constant ~17 ms at 40 Hz -- and a
+/// spring that stiff passes nvim's timing straight through: rows land 17 to
+/// 35 ms apart, not 25, and a stiff spring speeds up and slows down with
+/// every one. A soft spring smooths it but trails V x duration / 3 behind,
+/// which is the lag pacing removed. A spring cannot do both: its lag under
+/// steady scrolling is what its softness costs.
+///
+/// So under a steady hold the speed is not a spring's response to each row
+/// but the input's own rate, averaged over many (`glide_alpha`), and the
+/// offset only steers it: `glide_lead_ms` of travel is kept in hand to
+/// absorb a late row, anything beyond it is closed over `glide_catch_ms`,
+/// and inside it the glide slows in proportion. The lag stays where pacing
+/// put it (~1 row at 40 Hz). Replayed through a Python copy of this file
+/// with the nvim timing of 24 filmed holds (~/playground/fast-scroll/
+/// glide-sim): sd of rows per refresh, median 15.6 % -> 5.2 % (mean 19.4 ->
+/// 9.9; holds where nvim itself stalled 170 ms stay bad either way); median
+/// lag 1.05 -> 1.10 rows; landing after the last row 76 -> 73 ms. The rate
+/// warms up as a plain mean and is then averaged as distance over time,
+/// see `glide_warm_samples`. A single press, a Ctrl-D glide (rows faster than one a
+/// `glide_min_interval_ms`) and the wheel never glide; a release or a stall
+/// hands the remaining offset back to the spring, velocity and all.
+fn advanceGlide(self: *ScrollAnim, dt_ms: f32) bool {
+    // One rate sample per frame that brought rows: what they moved over the
+    // time since the last frame that did. Rows land on frames, so a single
+    // interval reads 17 or 33 ms at 40 Hz on 60 Hz; the average does not.
+    if (self.glide_pending_px > 0) {
+        if (self.glide_since_ms > 0) {
+            const r = self.glide_pending_px / self.glide_since_ms;
+            // The first sample may span the repeat delay; the first faster
+            // one replaces it rather than averaging with it.
+            if (self.glide_samples == 0 or (self.glide_samples < 3 and r > 2 * self.glide_rate)) {
+                self.glide_rate = r;
+                self.glide_iv_ms = self.glide_since_ms;
+                self.glide_sum_px = self.glide_pending_px;
+                self.glide_sum_ms = self.glide_since_ms;
+            } else if (self.glide_samples < glide_warm_samples) {
+                self.glide_sum_px += self.glide_pending_px;
+                self.glide_sum_ms += self.glide_since_ms;
+                self.glide_rate = self.glide_sum_px / self.glide_sum_ms;
+                self.glide_iv_ms += (self.glide_since_ms - self.glide_iv_ms) * glide_alpha;
+                if (self.glide_samples + 1 == glide_warm_samples) {
+                    // From here they are averages per sample, see below.
+                    const n: f32 = @floatFromInt(glide_warm_samples);
+                    self.glide_sum_px /= n;
+                    self.glide_sum_ms /= n;
+                }
+            } else {
+                // Distance and time averaged apart, then divided: averaging
+                // each frame's own rate weights a 17 ms sample (1.2 px/ms
+                // at 40 Hz) like a 33 ms one (0.6), and read 0.9 for a true
+                // 0.8 -- the glide ran ahead of the rows and kept braking.
+                self.glide_sum_px += (self.glide_pending_px - self.glide_sum_px) * glide_alpha;
+                self.glide_sum_ms += (self.glide_since_ms - self.glide_sum_ms) * glide_alpha;
+                self.glide_rate = self.glide_sum_px / self.glide_sum_ms;
+                self.glide_iv_ms = self.glide_sum_ms;
+            }
+            self.glide_samples +|= 1;
+        }
+        self.glide_pending_px = 0;
+        self.glide_since_ms = 0;
+    }
+    self.glide_since_ms += dt_ms;
+
+    const steady = self.key_paced and
+        self.glide_samples >= glide_min_samples and
+        self.pace_ms >= pace_intervals * glide_min_interval_ms;
+    const released = self.glide_since_ms >
+        @max(glide_release_intervals * self.glide_iv_ms, glide_release_min_ms);
+    if (!steady or released) {
+        self.gliding = false;
+        return false;
+    }
+    if (!self.gliding) {
+        self.gliding = true;
+        self.glide_v = @abs(self.vel_px_ms);
+    }
+
+    const g = @abs(self.offset_px);
+    const sign: f32 = if (self.offset_px > 0) 1 else -1;
+    const lead = @max(self.glide_rate * glide_lead_ms, 1.0);
+    const target = if (g >= lead)
+        self.glide_rate + (g - lead) / glide_catch_ms
+    else
+        self.glide_rate * g / lead;
+    self.glide_v += (target - self.glide_v) * (1.0 - @exp(-dt_ms / glide_smooth_ms));
+    var g2 = g - self.glide_v * dt_ms;
+    // Caught up with the model: wait there for the next row rather than
+    // end the animation, which would throw the averages away.
+    if (g2 < min_offset_px) {
+        g2 = min_offset_px;
+        self.glide_v = 0;
+    }
+    self.offset_px = sign * g2;
+    self.vel_px_ms = -sign * self.glide_v;
+    return true;
 }
 
 /// Decode a ghost row's grid y: rows above the region are stored as wrapped
@@ -3013,8 +3175,12 @@ test "spring: held key pace does not beat against the frame rate" {
 
 test "spring: a hold keeps pace from its first repeat" {
     // Press, the 300 ms repeat delay, then 40 Hz repeat. The delay must not
-    // linger in the pace: half a second in, the drawn text may trail the
-    // model by no more than the steady held-key lag (~1.3 rows).
+    // linger in the pace: from half a second in, the drawn text may trail
+    // the model by no more than the steady held-key lag. Measured as the
+    // mean, plus a looser bound on the peak: the glide keeps
+    // `glide_lead_ms` of travel in hand, so the frame a row lands on reads
+    // a row more than the mean (the spring's peaks were ~1.4 rows, the
+    // glide's ~2.2; the mean ~1 row either way). Unpaced it was 8 rows.
     var a: ScrollAnim = .{};
     a.key_paced = true;
     const dt: f32 = 1000.0 / 60.0;
@@ -3022,6 +3188,8 @@ test "spring: a hold keeps pace from its first repeat" {
     var next_push: f32 = 0;
     var t: f32 = 0;
     var worst: f32 = 0;
+    var sum: f32 = 0;
+    var n: f32 = 0;
     while (t < 1500) : (t += dt) {
         while (next_push <= t) {
             a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
@@ -3029,9 +3197,14 @@ test "spring: a hold keeps pace from its first repeat" {
             next_push += if (next_push == 0) 300 else 25;
         }
         a.advance(dt, 600, .spring);
-        if (t >= 450) worst = @max(worst, @abs(a.offset_px));
+        if (t >= 450) {
+            worst = @max(worst, @abs(a.offset_px));
+            sum += @abs(a.offset_px);
+            n += 1;
+        }
     }
-    try std.testing.expect(worst < 2 * 20);
+    try std.testing.expect(sum / n < 1.5 * 20);
+    try std.testing.expect(worst < 2.5 * 20);
 }
 
 test "spring: a single keypress is not paced" {
@@ -3039,6 +3212,108 @@ test "spring: a single keypress is not paced" {
     a.key_paced = true;
     a.push(20, 0, 50, 0, 200, 240);
     try std.testing.expect(a.pace_ms == 0);
+}
+
+test "glide: a held key whose rows land unevenly still moves evenly" {
+    // nvim's rows under 40 Hz repeat land 17-35 ms apart, not 25. The
+    // stiff paced spring followed every one (rows per frame 9-19 px, sd
+    // ~20 %, in a model of this file); the glide moves at their average.
+    const seq = [_]f32{ 25, 33, 18, 29, 21, 35, 24, 17, 30, 27 };
+    var a: ScrollAnim = .{};
+    const dt: f32 = 1000.0 / 60.0;
+    var model: f32 = 0;
+    var next_push: f32 = 5;
+    var i: usize = 0;
+    var t: f32 = 0;
+    var prev: ?f32 = null;
+    var lo: f32 = std.math.inf(f32);
+    var hi: f32 = 0;
+    var sum: f32 = 0;
+    var sum2: f32 = 0;
+    var n: f32 = 0;
+    var worst: f32 = 0;
+    while (t < 2000) : (t += dt) {
+        while (next_push <= t) {
+            a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+            model += 20;
+            next_push += seq[i % seq.len];
+            i += 1;
+        }
+        a.key_paced = true;
+        a.advance(dt, 580, .spring);
+        const drawn = model - a.offset_px;
+        if (prev) |p| if (t >= 800) {
+            const s = drawn - p;
+            lo = @min(lo, s);
+            hi = @max(hi, s);
+            sum += s;
+            sum2 += s * s;
+            n += 1;
+            worst = @max(worst, @abs(a.offset_px));
+        };
+        prev = drawn;
+    }
+    try std.testing.expect(a.gliding);
+    const mean = sum / n;
+    const sd = @sqrt(@max(sum2 / n - mean * mean, 0));
+    try std.testing.expect(sd / mean < 0.10);
+    try std.testing.expect(lo > 10.0);
+    try std.testing.expect(hi < 16.5);
+    // ...and no more lag than pacing gave.
+    try std.testing.expect(worst < 2 * 20);
+}
+
+test "glide: a Ctrl-D burst is left to the spring" {
+    // nvim's own half-page glide: a row every 6 ms, several a frame.
+    var a: ScrollAnim = .{};
+    const dt: f32 = 1000.0 / 60.0;
+    var next_push: f32 = 0;
+    var t: f32 = 0;
+    var pushed: usize = 0;
+    while (t < 600) : (t += dt) {
+        while (next_push <= t and pushed < 29) : (next_push += 6) {
+            a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+            pushed += 1;
+        }
+        a.key_paced = true;
+        a.advance(dt, 580, .spring);
+        try std.testing.expect(!a.gliding);
+    }
+}
+
+test "glide: letting go lands without stopping dead or going back" {
+    var a: ScrollAnim = .{};
+    const dt: f32 = 1000.0 / 60.0;
+    var model: f32 = 0;
+    var next_push: f32 = 5;
+    var t: f32 = 0;
+    var prev: ?f32 = null;
+    var was_gliding = false;
+    var landed_at: ?f32 = null;
+    var last_step: f32 = 0;
+    while (t < 2000) : (t += dt) {
+        while (next_push <= t and next_push < 1000) : (next_push += 25) {
+            a.push(20, 0, 50, 0, 200, ghost_lag_rows * 20);
+            model += 20;
+        }
+        a.key_paced = true;
+        a.advance(dt, 580, .spring);
+        if (a.gliding) was_gliding = true;
+        const drawn = model - a.offset_px;
+        if (prev) |p| {
+            const s = drawn - p;
+            try std.testing.expect(s >= -0.01);
+            // the last frames before it lands step down, not off a cliff
+            if (t > 1000 and s > 0.01) {
+                if (last_step > 0) try std.testing.expect(s < last_step * 1.05 or s < 2);
+                last_step = s;
+            }
+        }
+        prev = drawn;
+        if (landed_at == null and !a.active()) landed_at = t;
+    }
+    try std.testing.expect(was_gliding);
+    try std.testing.expect(landed_at != null and landed_at.? < 1000 + 300);
 }
 
 const TestGlyph = struct { grid_pos: [2]u16, id: u32 = 0 };
@@ -3283,3 +3558,5 @@ test "detectShift: the cursor walking a list too short to scroll is not a scroll
     try captureKeys(rows, cols, @embedFile("testdata/yazi-short-list-1.txt"), &cur);
     try testing.expectEqual(@as(?Shift, null), detectShift(&cur, &prev, rows, cols, 6, 0.6));
 }
+
+

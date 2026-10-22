@@ -2525,3 +2525,68 @@ the 1.3 s after every cursor event.
   images) are still whole-window.
 - The shader cache's own verify still shows the 2 px one-frame hole, including
   on full frames, where neither cache nor damage tracking does anything.
+
+## 2026-10-22 — held keys glide: the key-pace spring traded smoothness for lag
+
+### Why
+
+The user: holding j in nvim "stutters and jumps", worst on tables, callouts
+and figures, at every `gt scroll` duration (280/600/1000), under Hyprland
+and Plasma; smooth% said near-perfect. smooth% scores evenness from our own
+log, and `lat.py` follows a 64 px strip (too little text to match: the same
+setup read 25-90 % "spread" run to run). `holdfilm.py` films the whole
+screen and scores rows moved per display refresh -- spread (sd/mean), frozen
+refreshes, >1/>2-row leaps, lag behind nvim, motion after nvim's last row.
+
+Filmed (quiet machine, nvim at 40 Hz repeat on the 60 Hz eDP): held j
+18-24 % spread, the wheel at the same speed 5-7 %. By build: 10-12
+(`pre-keypace`) 8.5-14 % but ~9 rows behind and 0.8 s of overrun; 10-14 and
+10-19 18-27 %. The key pacing of 5c5f61b78/2e93b519f/8ff45a413 made the
+spring stiff (time constant ~17 ms at 40 Hz) so it follows within ~1 row --
+and passes nvim's timing straight to the screen: rows land 17-35 ms apart,
+not 25. A spring cannot be smooth and close at once; its steady lag is what
+its softness costs.
+
+### What
+
+`scroll_anim.zig` `advanceGlide`, called from `advanceSpring`: once a held
+key's rows have come steadily (5 frames, at most one per 15 ms -- key repeat,
+not a Ctrl-D burst) the offset is no longer a spring's response to each row.
+The display moves at the input's own rate, measured as distance over time
+(plain mean for 8 samples, then the two averaged apart -- averaging each
+frame's own rate reads 0.9 px/ms for a true 0.8 at 40 Hz on 60 Hz), keeps
+40 ms of that travel in hand for a late row, closes any extra gap over
+150 ms, slows in proportion inside the 40 ms, and hands back to the spring
+(velocity and all) when no row has come for 2 intervals (>= 45 ms): release
+or stall. Wheel, single press and Ctrl-D are untouched.
+
+Tuned in a Python copy of push/advanceSpring/advanceGlide fed the nvim
+timing of 24 filmed holds (`~/playground/fast-scroll/glide-sim`); the copy
+reproduces the filmed spring within a few points and its outliers.
+
+### Verified
+
+- Unit tests: 3 new (`glide:` uneven rows -> sd < 10 %, steps 10-16.5 px;
+  Ctrl-D never glides; release lands without a cliff or a reversal). The
+  first-repeat test now bounds the MEAN lag (< 1.5 rows) and the peak
+  (< 2.5): the glide's 40 ms in hand puts the frame a row lands on a row
+  above the mean. 171/171 scroll_anim tests.
+- Filmed A/B, alternating, nvim sync3, drum job paused, 5 holds x 2 rounds
+  (tables/callouts @60, figures @340/@490, big tables @2520, held k @1700):
+  spread median 19.9 -> 11.2 %, >1-row refreshes 0.6 -> 0.0 %, lag 0.70 ->
+  1.05 rows, motion after nvim's last row 112 -> 107 ms.
+
+### Traps
+
+- Halving a film by taking every other pixel drops a 1 px line whenever the
+  scroll offset puts it on an odd row: tables "lost their borders", text
+  thinned, and a tear detector fired on every table. Average 2x2.
+- The torn tables/figures were nvim, not us: the sync-split RPM patch had
+  never applied (dotfiles SETUP-LOG 2026-10-22, sync3). `ptyrec.py` between
+  Ghostty and nvim + `ptyreplay.py` per ?2026 block shows it in the bytes.
+- A fresh nvim stalls 150-250 ms on formulas the latex warm-up has not
+  reached yet: give harness nvims ~20 s before a hold, or the first hold of
+  every run carries a stall (the 59.7 % and 44.8 % outliers).
+- The user's drum-transcription job (7 cores, swap full) roughly doubles held-j
+  spread and brings the >2-row leaps; pause it (holdfilm `--load=PIDFILE`)
+  or A/B in alternating order.
