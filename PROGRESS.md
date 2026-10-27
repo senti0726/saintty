@@ -2640,3 +2640,16 @@ single-frame step 2.6 -> 1.1 rows, >2-row frames 1 -> 0.
   formulas; before that every new one blocks 150-250 ms.
 - Upstream re-cut the tmux 3.7c release tarball (789 KB vs the 1.1 MB Fedora
   built): rebuild scripts must take `sources` files from Fedora's lookaside.
+
+### 2026-10-27 — mode effects from idle got 2 frames (tbd-5 "effects sometimes don't play")
+
+`custom-shader-animation = cursor` keeps drawing while `cursorFxLive()`, which
+reads `cursor_fx_last_event`. A mode change was only noticed in
+`updateCursorFx`, i.e. at DRAW time, and on GTK the draw runs later on the app
+thread, after `renderCallback` had already called `armAnimationTimer`. From idle
+that query said "not live", so the mode effect got the 1-2 frames something
+else drew and was never seen; with another effect still running the timer was
+already armed, hence "sometimes". Measured with `--scroll-trace` and nvim driven
+over `--listen`: i/Esc 2.5 s apart = 2 frames in the 0.6 s after each mode event;
+after the fix (updateFrame notes a `visual_style` / `colors.cursor` change and
+sets `cursor_fx_last_event`, like the pulse and boom paths) 25-32 frames.

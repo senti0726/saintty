@@ -364,6 +364,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         cursor_fx_boom_seen: u32 = 0,
         cursor_fx_boom_pending: ?terminal.osc.Command.CursorBoom = null,
         cursor_fx_last_event: ?std.Io.Timestamp = null,
+        /// The cursor's style and colour at the last updateFrame, to see a
+        /// mode change there (see updateFrame) and not only at draw time.
+        cursor_fx_style_seen: ?terminal.CursorStyle = null,
+        cursor_fx_color_seen: ?terminal.color.RGB = null,
         /// Next slot of the uniforms' cursor effect event ring.
         cursor_fx_next: usize = 0,
 
@@ -2745,6 +2749,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.cursor_fx_boom_seen = self.terminal_state.cursor.boom;
                 self.cursor_fx_boom_pending = self.terminal_state.cursor.boom_last;
                 self.cursor_fx_last_event = .now(global.io(), .awake);
+            }
+
+            // A mode change (cursor style or colour, e.g. nvim i / Esc / v)
+            // is only recorded when the frame is DRAWN (updateCursorFx), and
+            // on GTK that happens later, on the app thread -- after this
+            // thread has already asked animationWake whether to keep
+            // drawing. From idle the answer was no, so the effect got the
+            // one or two frames something else drew and never visibly
+            // played ("the effects sometimes don't play", tbd-5: they did
+            // play when another effect was still running). Note it here, as
+            // for a pulse, so the animation timer is armed for it.
+            {
+                const style = self.terminal_state.cursor.visual_style;
+                const color = self.terminal_state.colors.cursor;
+                const seen = self.cursor_fx_style_seen != null;
+                if (seen and (self.cursor_fx_style_seen.? != style or
+                    !std.meta.eql(self.cursor_fx_color_seen, color)))
+                {
+                    self.cursor_fx_last_event = .now(global.io(), .awake);
+                }
+                self.cursor_fx_style_seen = style;
+                self.cursor_fx_color_seen = color;
             }
 
             // Now the render state is readable, look for movement no event
