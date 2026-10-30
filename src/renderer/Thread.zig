@@ -439,8 +439,9 @@ fn drainMailbox(self: *Thread) !void {
             },
 
             .input_activity => |dir| {
-                self.renderer.noteInputActivity();
-                if (dir != 0) self.renderer.noteWheelActivity(std.math.sign(dir), @abs(dir) >= 2);
+                const typed = dir == rendererpkg.Message.input_typed;
+                self.renderer.noteInputActivity(typed);
+                if (dir != 0 and !typed) self.renderer.noteWheelActivity(std.math.sign(dir), @abs(dir) >= 2);
             },
 
             .macos_display_id => |v| {

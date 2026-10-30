@@ -8,6 +8,9 @@ const terminal = @import("../terminal/main.zig");
 
 /// The messages that can be sent to a renderer thread.
 pub const Message = union(enum) {
+    /// `input_activity` for a key that typed text or deleted it.
+    pub const input_typed: i8 = 3;
+
     /// Purposely crash the renderer. This is used for testing and debugging.
     /// See the "crash" binding action.
     crash,
@@ -41,7 +44,8 @@ pub const Message = union(enum) {
     /// the wheel went, and a flick of several notches may move further than a
     /// key ever does. (One message, not a second one beside it: a wheel sends
     /// these at 160 a second.) +2/-2: the same, with the wheel turning
-    /// faster than `scroll-animation-wheel-snap`.
+    /// faster than `scroll-animation-wheel-snap`. `input_typed`: a key that
+    /// typed text (see `Renderer.noteInputActivity`).
     input_activity: i8,
 
     /// Change the font grid. This can happen for any number of reasons

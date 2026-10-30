@@ -2874,9 +2874,19 @@ pub fn keyCallback(
         // none of the scroll plumbing, so the repaint detector would never
         // run for it. Best effort: a dropped one costs a frame of animation,
         // never correctness.
+        //
+        // A key that TYPED (text with no Ctrl/Alt, or Backspace/Delete) is
+        // marked apart: in an insert cursor that is text entry, never a
+        // scroll (see `renderer.Message.input_activity`).
+        const typed = typed: {
+            if (event.key == .backspace or event.key == .delete) break :typed true;
+            const mods = event.effectiveMods();
+            break :typed event.utf8.len > 0 and !mods.ctrl and !mods.alt and
+                event.utf8[0] >= 0x20 and event.utf8[0] != 0x7f;
+        };
         _ = self.renderer_thread.mailbox.push(
             global.io(),
-            .{ .input_activity = 0 },
+            .{ .input_activity = if (typed) rendererpkg.Message.input_typed else 0 },
             .{ .instant = {} },
         );
 

@@ -212,6 +212,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// plumbing, so without this the repaint detector never runs for it.
         input_activity_ts: ?std.Io.Timestamp = null,
 
+        /// The last key TYPED text (or deleted it), as opposed to moving.
+        /// With an insert (bar) cursor such a key is text entry, and nothing
+        /// it redraws is a scroll. See `detectRepaintScroll`.
+        input_typed: bool = false,
+
         /// The wheel's last movement and its direction (+1 = content up).
         /// See `noteWheelActivity`.
         wheel_ts: ?std.Io.Timestamp = null,
@@ -1731,8 +1736,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Record that a key produced input, for the repaint detector's gate.
         ///
         /// Called from the render thread's mailbox.
-        pub fn noteInputActivity(self: *Self) void {
+        pub fn noteInputActivity(self: *Self, typed: bool) void {
             self.input_activity_ts = .now(global.io(), .awake);
+            self.input_typed = typed;
             // A wheel movement arrives as this AND `noteWheelActivity`,
             // which clears it again.
             self.scroll_anim.key_paced = true;
@@ -1902,8 +1908,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // output of a command you just pressed Enter on does not slide,
             // and key repeat at roughly 30Hz keeps it fresh while a key is
             // held.
-            if (sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms and
-                sinceMs(now, self.scroll_chain_ts) > repaint_chain_ms)
+            // Typing is not scrolling. With an insert cursor, a typed key's
+            // redraw is the text being edited: nvim's completion menu
+            // re-sorting moved its entries a row, and the region grew
+            // across the still text beside it and over the status line,
+            // which slid up and back and was drawn twice (tear.mkv
+            // 3:02, 2026-10-29). Normal-mode `j` has a block cursor, and
+            // the wheel and app-declared scrolls never come through here.
+            const typing = self.input_typed and
+                sinceMs(now, self.wheel_ts) > repaint_key_idle_ms and
+                self.terminal_state.cursor.visual_style == .bar;
+            if (typing or (sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms and
+                sinceMs(now, self.scroll_chain_ts) > repaint_chain_ms))
             {
                 self.scroll_chain_ts = null;
                 self.scroll_row_hashes.clearRetainingCapacity();
