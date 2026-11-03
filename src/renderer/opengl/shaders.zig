@@ -191,6 +191,43 @@ pub const Uniforms = extern struct {
     /// Various booleans, in a packed struct for space efficiency.
     bools: Bools align(4),
 
+    /// Scroll animation, as {offset_px, top_row, bottom_row, unused}.
+    ///
+    /// `offset_px` is added to the Y position of cells whose row is within
+    /// [top_row, bottom_row], so a scroll can be shown part-way through. Zero
+    /// means no animation is running and the shaders take their normal path.
+    ///
+    /// Rows are floats only so this packs as one vec4 under std140; they are
+    /// whole numbers.
+    scroll_anim: [4]f32 align(16),
+
+    /// Inclusive column range the scroll animation applies to, as
+    /// {left, right, unused, unused}.
+    ///
+    /// Separate from `scroll_anim` only because that vec4 is full. A scroll
+    /// is not always full width -- a preview pane, a tmux vertical split --
+    /// and moving the columns either side of it drags stationary content.
+    scroll_anim_cols: [4]f32 align(16),
+
+    comptime {
+        // std140 puts this vec4 at byte 144 (bools ends at 136, vec4 aligns
+        // to 16). If Zig disagrees the shader reads the wrong bytes and the
+        // animation silently does nothing.
+        if (@offsetOf(Uniforms, "scroll_anim") != 144) @compileError(
+            std.fmt.comptimePrint(
+                "scroll_anim at {d}, std140 expects 144",
+                .{@offsetOf(Uniforms, "scroll_anim")},
+            ),
+        );
+        // The next vec4 follows immediately at 160.
+        if (@offsetOf(Uniforms, "scroll_anim_cols") != 160) @compileError(
+            std.fmt.comptimePrint(
+                "scroll_anim_cols at {d}, std140 expects 160",
+                .{@offsetOf(Uniforms, "scroll_anim_cols")},
+            ),
+        );
+    }
+
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,
@@ -235,7 +272,14 @@ pub const CellText = extern struct {
     bools: packed struct(u8) {
         no_min_contrast: bool = false,
         is_cursor_glyph: bool = false,
-        _padding: u6 = 0,
+        /// A row the scroll animation carried out of its region, drawn in
+        /// the band its lag uncovers. See generic.zig `scroll_ghost`.
+        scroll_ghost: bool = false,
+        /// A kept glyph from what slid UNDER a pinned overlay (with
+        /// `scroll_ghost`): drawn only where it is not under the overlay.
+        /// See generic.zig `keepScrollGhosts`.
+        scroll_underlay: bool = false,
+        _padding: u4 = 0,
     } align(1) = .{},
 
     pub const Atlas = enum(u8) {
@@ -259,6 +303,8 @@ pub const Image = extern struct {
     cell_offset: [2]f32 align(8),
     source_rect: [4]f32 align(16),
     dest_size: [2]f32 align(8),
+    /// x: 1 for a kept row slice (see `image.State.kitty_ghosts`); y unused.
+    flags: [2]f32 align(8) = .{ 0, 0 },
 };
 
 /// Single parameter for the bg image shader.

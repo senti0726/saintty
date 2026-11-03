@@ -24,6 +24,11 @@ struct Uniforms {
   bool use_display_p3;
   bool use_linear_blending;
   bool use_linear_correction;
+
+  // Scroll animation: {offset_px, top_row, bottom_row, unused}. Declared to
+  // keep this struct byte-compatible with the Zig Uniforms; the Metal
+  // shaders do not use it yet, so scroll animation is OpenGL-only.
+  float4 scroll_anim;
 };
 
 //-------------------------------------------------------------------

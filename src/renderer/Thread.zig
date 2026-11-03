@@ -438,6 +438,12 @@ fn drainMailbox(self: *Thread) !void {
                 self.flags.has_inspector = v;
             },
 
+            .input_activity => |dir| {
+                const typed = dir == rendererpkg.Message.input_typed;
+                self.renderer.noteInputActivity(typed);
+                if (dir != 0 and !typed) self.renderer.noteWheelActivity(std.math.sign(dir), @abs(dir) >= 2);
+            },
+
             .macos_display_id => |v| {
                 if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
                     try self.renderer.setMacOSDisplayID(v, &self.draw_now);

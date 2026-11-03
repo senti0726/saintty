@@ -24,6 +24,18 @@ pub const State = struct {
     /// The placements for the Kitty image protocol.
     kitty_placements: std.ArrayListUnmanaged(Placement),
 
+    /// Row slices of virtual (unicode-placeholder) images that a running
+    /// scroll carried out of its region, kept and drawn in the band the
+    /// lagging offset uncovers -- the image counterpart of the renderer's
+    /// ghost rows. Owned and maintained by the renderer; drawn with the
+    /// `.kitty_below_text` set, flagged so the shader displaces and clips
+    /// them. Without them an image's edge row vanished the moment it left
+    /// the region while the text beside it slid out.
+    kitty_ghosts: std.ArrayListUnmanaged(Placement) = .empty,
+
+    /// Whether the ghosts should be drawn this frame (the animation is live).
+    kitty_ghosts_live: bool = false,
+
     /// The end index (exclusive) for placements that should be
     /// drawn below the background, below the text, etc.
     kitty_bg_end: u32,
@@ -53,6 +65,7 @@ pub const State = struct {
             self.images.deinit(alloc);
         }
         self.kitty_placements.deinit(alloc);
+        self.kitty_ghosts.deinit(alloc);
         self.overlay_placements.deinit(alloc);
     }
 
@@ -116,6 +129,19 @@ pub const State = struct {
             .overlay => self.overlay_placements.items,
         };
 
+        self.drawList(api, pipeline, pass, placements, false);
+        if (placement_type == .kitty_below_text and self.kitty_ghosts_live)
+            self.drawList(api, pipeline, pass, self.kitty_ghosts.items, true);
+    }
+
+    fn drawList(
+        self: *State,
+        api: *GraphicsAPI,
+        pipeline: GraphicsAPI.Pipeline,
+        pass: *GraphicsAPI.RenderPass,
+        placements: []const Placement,
+        ghost: bool,
+    ) void {
         for (placements) |p| {
             // Look up the image
             const image = self.images.get(p.image_id) orelse {
@@ -136,31 +162,35 @@ pub const State = struct {
 
             // Create our vertex buffer, which is always exactly one item.
             // future(mitchellh): we can group rendering multiple instances of a single image
+            var inst: GraphicsAPI.shaders.Image = .{
+                .grid_pos = .{
+                    @as(f32, @floatFromInt(p.x)),
+                    @as(f32, @floatFromInt(p.y)),
+                },
+
+                .cell_offset = .{
+                    @as(f32, @floatFromInt(p.cell_offset_x)),
+                    @as(f32, @floatFromInt(p.cell_offset_y)),
+                },
+
+                .source_rect = .{
+                    @as(f32, @floatFromInt(p.source_x)),
+                    @as(f32, @floatFromInt(p.source_y)),
+                    @as(f32, @floatFromInt(p.source_width)),
+                    @as(f32, @floatFromInt(p.source_height)),
+                },
+
+                .dest_size = .{
+                    @as(f32, @floatFromInt(p.width)),
+                    @as(f32, @floatFromInt(p.height)),
+                },
+            };
+            if (comptime @hasField(GraphicsAPI.shaders.Image, "flags")) {
+                inst.flags = .{ @as(f32, if (ghost) 1 else 0), 0 };
+            }
             var buf = GraphicsAPI.Buffer(GraphicsAPI.shaders.Image).initFill(
                 api.imageBufferOptions(),
-                &.{.{
-                    .grid_pos = .{
-                        @as(f32, @floatFromInt(p.x)),
-                        @as(f32, @floatFromInt(p.y)),
-                    },
-
-                    .cell_offset = .{
-                        @as(f32, @floatFromInt(p.cell_offset_x)),
-                        @as(f32, @floatFromInt(p.cell_offset_y)),
-                    },
-
-                    .source_rect = .{
-                        @as(f32, @floatFromInt(p.source_x)),
-                        @as(f32, @floatFromInt(p.source_y)),
-                        @as(f32, @floatFromInt(p.source_width)),
-                        @as(f32, @floatFromInt(p.source_height)),
-                    },
-
-                    .dest_size = .{
-                        @as(f32, @floatFromInt(p.width)),
-                        @as(f32, @floatFromInt(p.height)),
-                    },
-                }},
+                &.{inst},
             ) catch |err| {
                 log.warn("error creating image vertex buffer err={}", .{err});
                 continue;

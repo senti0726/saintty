@@ -28,12 +28,29 @@ const uint ATLAS_COLOR = 1u;
 // Masks for the `glyph_bools` attribute
 const uint NO_MIN_CONTRAST = 1u;
 const uint IS_CURSOR_GLYPH = 2u;
+// A row the scroll animation carried out of its region, kept to fill the band
+// its lag uncovers (generic.zig `scroll_ghost`). Its grid y is relative to the
+// current model and lies OUTSIDE the region -- above it as a wrapped u16 --
+// so it is displaced unconditionally, clipped to the region like any
+// displaced row, and never drawn once the animation is over.
+const uint SCROLL_GHOST = 4u;
+// A kept glyph of what slid UNDER a pinned overlay (with SCROLL_GHOST): the
+// text a label or bar hides, taken from the frame before the scroll. It is
+// displaced like any ghost and never drawn over a pinned cell (cell_text.f).
+const uint SCROLL_UNDERLAY = 8u;
 
 out CellTextVertexOut {
     flat uint atlas;
     flat vec4 color;
     flat vec4 bg_color;
     vec2 tex_coord;
+    // 1.0 when this glyph belongs to a row the scroll animation displaced, so
+    // the fragment stage knows to clip it to the region. Rows outside the
+    // region never move and must be left alone -- clipping them too erases
+    // exactly the things an application parks outside its margins.
+    // 2.0: an underlay glyph (SCROLL_UNDERLAY). 3.0: a glyph of a colour-only
+    // pin (yazi's hovered name), drawn only where it is over the bar.
+    flat float scroll_clip;
 } out_data;
 
 layout(binding = 1, std430) readonly buffer bg_cells {
@@ -46,8 +63,59 @@ void main() {
     bool cursor_wide = (bools & CURSOR_WIDE) != 0;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
+    bool ghost = (glyph_bools & SCROLL_GHOST) != 0u;
+    float gy = float(grid_pos.y);
+    if (ghost && gy >= 32768.0) gy -= 65536.0;
+
     // Convert the grid x, y into world space x, y by accounting for cell size
-    vec2 cell_pos = cell_size * vec2(grid_pos);
+    vec2 cell_pos = cell_size * vec2(float(grid_pos.x), gy);
+
+    // Scroll animation: rows inside the animated region are drawn offset from
+    // where they now live in the model, so a scroll can be shown part-way
+    // through. Rows outside the region -- tmux's status line, for one -- must
+    // not move, which is why this is bounded rather than a whole-grid shift.
+    bool scroll_clipped = false;
+    out_data.scroll_clip = 0.0;
+    // A glyph on a pinned cell (see cell_bg.f.glsl) stays where it is.
+    bool pinned = false;
+    bool bar_glyph = false;
+    if (!ghost && scroll_anim.x != 0.0 && scroll_anim_cols.w > 0.0 &&
+        grid_pos.x < grid_size.x && grid_pos.y < grid_size.y) {
+        uint pidx = uint(scroll_anim_cols.w) + uint(grid_pos.y) * grid_size.x + uint(grid_pos.x);
+        uint m = bg_colors[pidx];
+        // Byte 1: the pin holds its text too (ScrollAnim.markPinnedText).
+        pinned = ((m >> 8u) & 0xFFu) != 0u;
+        // Byte 0 alone: only the colour is held; the text slides, but is
+        // this colour's text, so it shows only while over the bar.
+        bar_glyph = !pinned && (m & 0xFFu) != 0u;
+    }
+    bool underlay = (glyph_bools & SCROLL_UNDERLAY) != 0u;
+    // An underlay glyph stands for the text hidden under a pinned cell: where
+    // its own cell is not pinned now, the model draws that text itself.
+    if (underlay && scroll_anim_cols.w > 0.0 &&
+        grid_pos.x < grid_size.x && gy >= 0.0 && gy < float(grid_size.y)) {
+        uint hidx = uint(scroll_anim_cols.w) + uint(gy) * grid_size.x + uint(grid_pos.x);
+        if ((bg_colors[hidx] & 0xFFu) == 0u) scroll_clipped = true;
+    }
+    if (!pinned && scroll_anim.x != 0.0 &&
+        (ghost || (gy >= scroll_anim.y && gy <= scroll_anim.z)) &&
+        float(grid_pos.x) >= scroll_anim_cols.x &&
+        float(grid_pos.x) <= scroll_anim_cols.y) {
+        cell_pos.y += scroll_anim.x;
+        out_data.scroll_clip = underlay ? 2.0 : (bar_glyph ? 3.0 : 1.0);
+
+        // A row displaced past the edge of the region must not be drawn: it
+        // would land on rows that are deliberately stationary, painting
+        // glyphs over tmux's status line. The background pass leaves a blank
+        // line there instead.
+        float displaced = gy + scroll_anim.x / cell_size.y;
+        if (displaced < scroll_anim.y - 0.999 || displaced > scroll_anim.z + 0.999) {
+            scroll_clipped = true;
+        }
+    } else if (ghost) {
+        // No animation, or outside its columns: a ghost has no place to be.
+        scroll_clipped = true;
+    }
 
     int vid = gl_VertexID;
 
@@ -107,6 +175,10 @@ void main() {
     cell_pos = cell_pos + size * corner + offset;
     gl_Position = projection_matrix * vec4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
 
+    // Push a scroll-clipped glyph outside the clip volume so it is discarded
+    // before rasterization, rather than drawing over a stationary row.
+    if (scroll_clipped) gl_Position = vec4(-2.0, -2.0, -2.0, 1.0);
+
     // Calculate the texture coordinate in pixels. This is NOT normalized
     // (between 0.0 and 1.0), and does not need to be, since the texture will
     // be sampled with pixel coordinate mode.
@@ -115,8 +187,10 @@ void main() {
     // Get our color. We always fetch a linearized version to
     // make it easier to handle minimum contrast calculations.
     out_data.color = load_color(color, true);
-    // Get the BG color
-    out_data.bg_color = load_color(
+    // Get the BG color. A ghost row is not on the grid, so it has no cell
+    // background to read (its index would be out of bounds): use none, and
+    // take the global background below.
+    out_data.bg_color = ghost ? vec4(0.0) : load_color(
             unpack4u8(bg_colors[grid_pos.y * grid_size.x + grid_pos.x]),
             true
         );
@@ -140,7 +214,7 @@ void main() {
 
     // If this cell is the cursor cell, but we're not processing
     // the cursor glyph itself, then we need to change the color.
-    if ((glyph_bools & IS_CURSOR_GLYPH) == 0 && is_cursor_pos) {
+    if ((glyph_bools & IS_CURSOR_GLYPH) == 0 && is_cursor_pos && !ghost) {
         out_data.color = load_color(unpack4u8(cursor_color_packed_4u8), use_linear_blending);
     }
 }

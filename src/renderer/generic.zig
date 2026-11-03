@@ -22,6 +22,9 @@ const Overlay = @import("Overlay.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
+const ScrollAnim = @import("scroll_anim.zig");
+
+/// An inclusive row range that a scroll applies to.
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -157,11 +160,221 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
+        /// `custom-shader-cache`: what changed since the last frame drawn.
+        /// See `drawFrame` and SPEC.md "Shader cache". `full` means "no idea,
+        /// redo everything" and is the answer whenever in doubt.
+        cache_damage_full: bool = true,
+        /// Rows rebuilt since the last frame drawn, indexed by row.
+        cache_damage_rows: std.ArrayListUnmanaged(bool) = .empty,
+        /// Hovered links are drawn by rebuilding their rows, but leaving a
+        /// link does not mark its row dirty.
+        cache_had_links: bool = false,
+        /// What the last drawn frame was drawn from, to spot changes that no
+        /// dirty row announces.
+        cache_last_uniforms: ?shaderpkg.Uniforms = null,
+        cache_last_cursor: ?shaderpkg.CellText = null,
+        cache_last_post_uniforms: ?shadertoy.Uniforms = null,
+        /// The whole-screen state that forces a full redraw was present in
+        /// the last frame (so this one must be full too, to clean up).
+        cache_last_volatile: bool = true,
+        /// The target holds the last shader's output for a frame in which no
+        /// animation was live, drawn over the whole window.
+        cache_final_settled: bool = false,
+        /// Where the last shader drew a cursor effect in the last frame, as
+        /// a GL scissor. The next frame has to redraw it: with the effect a
+        /// little further on, or without it once the effect is over.
+        cache_fx_box: ?[4]u32 = null,
+        /// The last few frames, for the verify log: what each one redid.
+        cache_history: [12]CacheFrameNote = @splat(.{}),
+        cache_history_i: usize = 0,
+        cache_note_volatile: [2]bool = .{ false, false },
+        cache_stats: CacheStats = .{},
+        cache_verify_buf: std.ArrayListUnmanaged(u8) = .empty,
+
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
+        /// In-flight scroll animation, if any. Seeded when the terminal
+        /// reports a region scroll and eased to zero over the following
+        /// frames. See SPEC.md stage 2.
+        scroll_anim: ScrollAnim = .{},
+
+        /// Cumulative rows the terminal model has scrolled, and the clock
+        /// base, both only for `scroll-trace`. Together with the per-frame
+        /// offset these reconstruct where content was actually drawn.
+        scroll_trace_rows: i64 = 0,
+        scroll_trace_base: ?std.Io.Timestamp = null,
+
+        /// When a key last produced input for the program.
+        ///
+        /// Keyboard scrolling -- `j`/`k` held in vim or a pager -- moves the
+        /// screen exactly as a wheel does but touches none of the scroll
+        /// plumbing, so without this the repaint detector never runs for it.
+        input_activity_ts: ?std.Io.Timestamp = null,
+
+        /// The last key TYPED text (or deleted it), as opposed to moving.
+        /// With an insert (bar) cursor such a key is text entry, and nothing
+        /// it redraws is a scroll. See `detectRepaintScroll`.
+        input_typed: bool = false,
+
+        /// The wheel's last movement and its direction (+1 = content up).
+        /// See `noteWheelActivity`.
+        wheel_ts: ?std.Io.Timestamp = null,
+        wheel_dir: i8 = 0,
+        /// The last wheel movement past `scroll-animation-wheel-snap`.
+        wheel_fast_ts: ?std.Io.Timestamp = null,
+
+        /// When a scroll last arrived inside an open gate: a real scroll
+        /// event, or a shift the repaint detector recovered.
+        ///
+        /// Keeps the gate open for as long as a scroll the user started is
+        /// still arriving. See `repaint_chain_ms`.
+        scroll_chain_ts: ?std.Io.Timestamp = null,
+
+        /// Row content hashes from the previous frame.
+        ///
+        /// Some applications move the picture without ever telling us they
+        /// scrolled. nvim with `smoothscroll` repaints every row rather than
+        /// scrolling the grid when it moves within a wrapped line -- measured
+        /// at 9008 bytes of repaint against 1873 for the same movement with
+        /// `nosmoothscroll`, which does scroll and emits `CSI M`. Anything on
+        /// the primary screen -- a plain shell, Claude Code -- moves our own
+        /// scrollback viewport instead, which never reaches `noteScroll`
+        /// either. In both cases the content demonstrably moved by whole rows
+        /// and there is no event to hook, so we recover the movement by
+        /// noticing that this frame's rows are last frame's rows, shifted.
+        scroll_row_hashes: std.ArrayList(u64) = .empty,
+
+        /// The cell hashes from just BEFORE the last frame that carried a
+        /// scroll event. See "a frame caught mid-redraw" in
+        /// `detectRepaintScroll`.
+        scroll_pre_event_hashes: std.ArrayList(u64) = .empty,
+
+        /// The previous frame's cell hashes, kept one frame longer than
+        /// `scroll_row_hashes` so the pin pass can ask whether a pinned
+        /// cell's TEXT stayed too. See `markPinnedText`.
+        scroll_hashes_before: std.ArrayList(u64) = .empty,
+
+        /// The scrolling region the application last declared for itself,
+        /// while a gesture is in progress.
+        ///
+        /// The repaint detector has to infer its row range from which rows
+        /// *changed*, and nvim's status line changes on every scroll -- it
+        /// carries the position percentage and the cursor's line:col. So the
+        /// detector sweeps in the very rows the application excluded from its
+        /// own scrolling margins, and reported rows 0..54 where nvim's own
+        /// events said 0..52. The status line then animated on detector
+        /// frames and held still on event frames.
+        ///
+        /// An application that narrows its region is naming its interface
+        /// rows, and that is better information than anything the detector
+        /// can recover from pixels. `grid_rows` is kept so a resize
+        /// invalidates the region rather than clamping against a stale one.
+        scroll_anim_app_region: ?struct {
+            top: usize,
+            bottom: usize,
+            grid_rows: usize,
+        } = null,
+
+        /// Glyphs of rows the running scroll carried out of its region, kept
+        /// so the band a lagging offset uncovers shows them instead of a
+        /// hole. Their grid y is relative to the CURRENT model and lies
+        /// outside the region (wrapped u16 above it); the shader draws them
+        /// only while the animation is live. See `ScrollAnim.shiftGhosts`.
+        scroll_ghost: std.ArrayListUnmanaged(shaderpkg.CellText) = .empty,
+
+        /// The kept rows' backgrounds, as an extended grid. See
+        /// `ScrollAnim.shiftGhostBg`; appended after the real background
+        /// cells at upload, and read by the background shader for the band.
+        scroll_ghost_bg: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
+        scroll_ghost_bg_live: bool = false,
+        scroll_image_ghosts_stale: bool = false,
+
+        /// Cells pinned as an overlay on the running scroll (see
+        /// `ScrollAnim.computePins`), one CellBg per grid cell, byte 0 = 255.
+        /// Uploaded after the bg cells (and the ghost backgrounds); the text
+        /// and bg shaders leave these cells undisplaced and let nothing
+        /// sliding draw over them.
+        scroll_pin: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
+        /// Per cell, what the last push carried in UNDER a pinned overlay:
+        /// its background, uploaded after the mask for the slid copy of a
+        /// pinned cell to draw (cell_bg.f). Its text goes into
+        /// `scroll_ghost` as underlay glyphs. See `keepScrollGhosts`.
+        scroll_pin_under: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
+        scroll_pin_live: bool = false,
+        /// The backgrounds as drawn before this frame's rebuild, for pins.
+        scroll_bg_prev: std.ArrayListUnmanaged(shaderpkg.CellBg) = .empty,
+        /// The last push this frame, for pins: set by `keepScrollGhosts`.
+        scroll_frame_push: ?struct { rows: isize, top: usize, bottom: usize, left: usize, right: usize } = null,
+        /// The last push, kept: pins are recomputed on every frame of a
+        /// running animation, not only on frames that pushed (see the
+        /// rebuild block).
+        scroll_last_push: ?struct { rows: isize, top: usize, bottom: usize, left: usize, right: usize } = null,
+
+        /// The image placements as last drawn, snapshotted before each
+        /// kitty update rebuilds them: by the time a scroll is handled the
+        /// placements already describe the new model, and the slices that
+        /// left are only in here. See `image.State.kitty_ghosts`.
+        scroll_prev_images: std.ArrayListUnmanaged(imagepkg.Placement) = .empty,
+        scroll_bg_view: std.ArrayListUnmanaged(std.ArrayListUnmanaged(shaderpkg.CellBg)) = .empty,
+
+        /// The row lists plus the ghost list, handed to the GPU upload in one
+        /// go. Shallow copies of `cells.fg_rows`; rebuilt every frame.
+        scroll_ghost_view: std.ArrayListUnmanaged(std.ArrayListUnmanaged(shaderpkg.CellText)) = .empty,
+
+        /// The application's most recent scroll event: its rows and when.
+        /// See `ScrollAnim.isRepair`.
+        scroll_anim_last_event: ?struct {
+            rows: isize,
+            ts: std.Io.Timestamp,
+            /// The rows it animated (region top .. bottom after the reserve).
+            top: usize = 0,
+            bottom: usize = 0,
+        } = null,
+
+        /// Every row any scroll event of this gesture covered: the only rows
+        /// `extendEventRows` may take as "arriving" content. A changed row
+        /// just outside an event can be the app's own status line (nvim's,
+        /// row 53: its position readout changes on every step).
+        scroll_event_span: ?struct { top: usize, bottom: usize } = null,
+
+        /// This frame's scroll event, animated once the frame has been read.
+        /// See `applyPendingScroll`.
+        scroll_pending: ?struct { rows: isize, top: usize, bottom: usize, right: usize, limit: f32 } = null,
+        /// Set by `detectRepaintScroll` on an event frame: how far the
+        /// content really moved, when that is further than the event said.
+        scroll_event_total: ?isize = null,
+
+        /// When the last frame was actually drawn, so the scroll animation
+        /// can pace itself against every draw rather than adding its own on
+        /// top of them.
+        last_draw_ts: ?std.Io.Timestamp = null,
+
+        /// When the scroll animation was last advanced.
+        scroll_anim_last: ?std.Io.Timestamp = null,
+
         /// Custom shader uniform values.
         custom_shader_uniforms: shadertoy.Uniforms,
+
+        /// Cursor-effect tracking (this fork), see updateCursorFx. The
+        /// cell and mode last seen, the pulse counter last seen, and when
+        /// the latest effect-starting event happened, which is what
+        /// `custom-shader-animation = cursor` animates after.
+        cursor_fx_cell: ?[2]u16 = null,
+        cursor_fx_mode: ?struct { style: i32, color: [4]f32 } = null,
+        cursor_fx_pulse_seen: u32 = 0,
+        cursor_fx_pulse_pending: bool = false,
+        /// OSC 777;cursor-boom (this fork): the last count seen, and the
+        /// boom waiting for the next frame's uniforms.
+        cursor_fx_boom_seen: u32 = 0,
+        cursor_fx_boom_pending: ?terminal.osc.Command.CursorBoom = null,
+        cursor_fx_last_event: ?std.Io.Timestamp = null,
+        /// The cursor's style and colour at the last updateFrame, to see a
+        /// mode change there (see updateFrame) and not only at draw time.
+        cursor_fx_style_seen: ?terminal.CursorStyle = null,
+        cursor_fx_color_seen: ?terminal.color.RGB = null,
+        /// Next slot of the uniforms' cursor effect event ring.
+        cursor_fx_next: usize = 0,
 
         /// Timestamp we rendered out first frame.
         ///
@@ -322,6 +535,50 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reports that the frame is complete.
         ///
         /// This is used to implement double/triple buffering.
+        const CacheStats = struct {
+            since: ?std.Io.Timestamp = null,
+            frames: u32 = 0,
+            cells_none: u32 = 0,
+            cells_part: u32 = 0,
+            cells_full: u32 = 0,
+            final_none: u32 = 0,
+            final_part: u32 = 0,
+            final_full: u32 = 0,
+            /// Sum over frames of the share of the window the static chain redid.
+            share: f64 = 0,
+            /// The same for the last shader.
+            final_share: f64 = 0,
+            verified: u32 = 0,
+            mismatched: u32 = 0,
+        };
+
+        const CacheFrameNote = struct {
+            full: bool = false,
+            bands: u8 = 0,
+            first_top: u32 = 0,
+            last_bottom: u32 = 0,
+            volatile_now: bool = false,
+            volatile_before: bool = false,
+            scroll_off: f32 = 0,
+            live: bool = false,
+            final_full: bool = false,
+            final_n: u8 = 0,
+            uniforms_same: bool = false,
+        };
+
+        /// One horizontal strip of the window, in pixels from the top.
+        const CacheBand = struct { top: u32, bottom: u32 };
+        const cache_max_bands = 8;
+        const CacheDamage = struct {
+            full: bool = false,
+            n: usize = 0,
+            bands: [cache_max_bands]CacheBand = undefined,
+
+            fn none(self: CacheDamage) bool {
+                return !self.full and self.n == 0;
+            }
+        };
+
         const FrameState = struct {
             uniforms: UniformBuffer,
             cells: CellTextBuffer,
@@ -466,7 +723,69 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             uniforms: UniformBuffer,
 
+            /// `custom-shader-cache`: `cache[0]` holds the terminal image and
+            /// `cache[i]` the output of shader `i - 1`, for every shader but
+            /// the last. Unlike front/back these are never swapped, so each
+            /// keeps its contents from frame to frame and a pass can redo a
+            /// strip of it. `verify` is the same chain drawn in full, for
+            /// `custom-shader-cache-debug = verify`.
+            cache: [max_cache]?Texture = @splat(null),
+            verify: [max_cache]?Texture = @splat(null),
+            verify_target: ?Target = null,
+            cache_width: usize = 0,
+            cache_height: usize = 0,
+
+            /// More shaders than this and the cache is simply not used.
+            const max_cache = 8;
+
             const UniformBuffer = Buffer(shadertoy.Uniforms);
+
+            fn freeCache(self: *CustomShaderState) void {
+                for (&self.cache) |*t| if (t.*) |tex| {
+                    tex.deinit();
+                    t.* = null;
+                };
+                for (&self.verify) |*t| if (t.*) |tex| {
+                    tex.deinit();
+                    t.* = null;
+                };
+                if (self.verify_target) |*t| {
+                    t.deinit();
+                    self.verify_target = null;
+                }
+                self.cache_width = 0;
+                self.cache_height = 0;
+            }
+
+            /// Make `n` cache textures of this size exist. Returns true if
+            /// any had to be created, in which case they hold nothing yet.
+            fn ensureCache(
+                self: *CustomShaderState,
+                api: GraphicsAPI,
+                n: usize,
+                width: usize,
+                height: usize,
+                with_verify: bool,
+            ) !bool {
+                var have: usize = 0;
+                for (self.cache) |t| {
+                    if (t != null) have += 1;
+                }
+                const verify_ok = !with_verify or
+                    (self.verify_target != null and self.verify[n - 1] != null);
+                if (have == n and verify_ok and
+                    self.cache_width == width and self.cache_height == height) return false;
+                self.freeCache();
+                errdefer self.freeCache();
+                for (0..n) |i| {
+                    self.cache[i] = try Texture.init(api.textureOptions(), @intCast(width), @intCast(height), null);
+                    if (with_verify) self.verify[i] = try Texture.init(api.textureOptions(), @intCast(width), @intCast(height), null);
+                }
+                if (with_verify) self.verify_target = try api.initTarget(width, height);
+                self.cache_width = width;
+                self.cache_height = height;
+                return true;
+            }
 
             /// Swap the front and back textures.
             pub fn swap(self: *CustomShaderState) void {
@@ -507,6 +826,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *CustomShaderState) void {
+                self.freeCache();
                 self.front_texture.deinit();
                 self.back_texture.deinit();
                 self.sampler.deinit();
@@ -559,6 +879,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background: terminal.color.RGB,
             background_opacity: f64,
             background_opacity_cells: bool,
+            scroll_animation: bool,
+            scroll_animation_duration_ms: u32,
+            scroll_animation_reserve_bottom: u8,
+            scroll_animation_easing: ScrollAnim.Easing,
+            scroll_trace: bool,
             foreground: terminal.color.RGB,
             selection_background: ?configpkg.Config.TerminalColor,
             selection_foreground: ?configpkg.Config.TerminalColor,
@@ -583,6 +908,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background_blur: configpkg.Config.BackgroundBlur,
             scroll_to_bottom_on_output: bool,
             custom_shader_animation: configpkg.CustomShaderAnimation,
+            custom_shader_cache: bool,
+            custom_shader_cache_margin: u32,
+            custom_shader_cache_fx_reach: f32,
+            custom_shader_cache_debug: configpkg.Config.CustomShaderCacheDebug,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -636,6 +965,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .faint_opacity = @intFromFloat(@ceil(config.@"faint-opacity" * 255)),
 
                     .min_contrast = @floatCast(config.@"minimum-contrast"),
+
+                    .scroll_animation = config.@"scroll-animation",
+                    .scroll_animation_duration_ms = config.@"scroll-animation-duration",
+                    .scroll_animation_reserve_bottom = config.@"scroll-animation-reserve-bottom",
+                    .scroll_animation_easing = switch (config.@"scroll-animation-easing") {
+                        .linear => .linear,
+                        .@"ease-out-cubic" => .ease_out_cubic,
+                        .@"ease-out-quint" => .ease_out_quint,
+                        .@"ease-out-quad" => .ease_out_quad,
+                        .material => .material,
+                        .spring => .spring,
+                    },
+                    .scroll_trace = config.@"scroll-trace",
                     .padding_color = config.@"window-padding-color",
 
                     .selection_background = config.@"selection-background",
@@ -658,6 +1000,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_blur = config.@"background-blur",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .custom_shader_animation = config.@"custom-shader-animation",
+                    .custom_shader_cache = config.@"custom-shader-cache",
+                    .custom_shader_cache_margin = config.@"custom-shader-cache-margin",
+                    .custom_shader_cache_fx_reach = config.@"custom-shader-cache-fx-reach",
+                    .custom_shader_cache_debug = config.@"custom-shader-cache-debug",
                     .arena = arena,
                 };
             }
@@ -726,6 +1072,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cell_size = undefined,
                     .grid_size = undefined,
                     .grid_padding = undefined,
+                    .scroll_anim = .{ 0, 0, 0, 0 },
+                    .scroll_anim_cols = .{ 0, 0, 0, 0 },
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
@@ -775,6 +1123,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cursor_text = @splat(0),
                     .selection_background_color = @splat(0),
                     .selection_foreground_color = @splat(0),
+                    .cursor_move_from = @splat(0),
+                    .cursor_move_to = @splat(0),
+                    .time_cursor_move = -1000,
+                    .time_cursor_mode = -1000,
+                    .time_cursor_pulse = -1000,
+                    .cursor_fx_event = @splat(.{ -1000, 0, 0, 0 }),
+                    .cursor_fx_event_color = @splat(@splat(0)),
+                    .cursor_fx_event_rect = @splat(@splat(0)),
                 },
                 .bg_image_buffer = undefined,
 
@@ -804,6 +1160,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
+            self.scroll_row_hashes.deinit(self.alloc);
+            self.scroll_pre_event_hashes.deinit(self.alloc);
+            self.scroll_hashes_before.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
@@ -817,6 +1176,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             self.cells.deinit(self.alloc);
+            self.scroll_ghost.deinit(self.alloc);
+            self.scroll_ghost_bg.deinit(self.alloc);
+            self.scroll_prev_images.deinit(self.alloc);
+            self.scroll_pin.deinit(self.alloc);
+            self.cache_damage_rows.deinit(self.alloc);
+            self.cache_verify_buf.deinit(self.alloc);
+            self.scroll_pin_under.deinit(self.alloc);
+            self.scroll_bg_prev.deinit(self.alloc);
+            self.scroll_bg_view.deinit(self.alloc);
+            self.scroll_ghost_view.deinit(self.alloc);
 
             self.font_shaper.deinit();
             self.font_shaper_cache.deinit(self.alloc);
@@ -1011,6 +1380,43 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// i.e. 120fps, and the floor for any animation wake delay.
         pub const draw_interval_ms: u64 = 8;
 
+        /// Rows that must agree before a shift is believed, as a count and as
+        /// a fraction of the rows compared.
+        ///
+        /// Blank and repeating rows match at many offsets at once, so a mostly
+        /// empty screen can "match" a shift of any size. Animating that
+        /// invents motion that never happened, so a shift has to be carried by
+        /// a substantial majority of the screen before it is acted on.
+        /// The same gate for the keyboard, kept shorter.
+        ///
+        /// Key repeat when a key is held runs at roughly 30Hz, so a window
+        /// this size stays continuously fresh while `j` is down and closes
+        /// promptly once it is released -- which is what keeps the output of
+        /// a command you just pressed Enter on from sliding.
+        pub const repaint_key_idle_ms: i64 = 150;
+
+        /// How long after the last scroll of a gesture the gate stays open.
+        ///
+        /// A key can start a scroll that outlasts `repaint_key_idle_ms`: nvim
+        /// replays a page jump or a counted `15j` as one-row steps over
+        /// 250-450 ms (neoscroll; the user's linewalk.lua), and every step
+        /// that crosses a wrapped line (a `skipcol` change) arrives as a
+        /// repaint, not a scroll event. With the gate shut after 150 ms those
+        /// steps snapped -- a sweep of `15j` through a book chapter lost
+        /// about a third of its travel. Each scroll that lands inside the
+        /// gate re-arms it for this long, so the chain holds exactly as long
+        /// as the scroll keeps coming. It never opens the gate by itself, so
+        /// output that follows Enter still does not slide. Long enough for
+        /// the slowest step of an eased glide (its last row, ~65 ms).
+        pub const repaint_chain_ms: i64 = 100;
+
+        pub const repaint_scroll_min_rows: usize = 6;
+        pub const repaint_scroll_min_ratio: f32 = 0.6;
+
+        /// How soon after a scroll event a counter-shift may be the rest of
+        /// that event's redraw. See "a frame caught mid-redraw".
+        pub const repair_partial_ms: i64 = 60;
+
         /// A point in the future when the renderer needs to be driven
         /// again to keep animating, and what kind of drive it needs.
         pub const AnimationWake = struct {
@@ -1027,6 +1433,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 update,
             };
         };
+
+        /// How long after a cursor move, mode change or pulse the
+        /// `cursor` animation mode keeps drawing. Longer than any effect
+        /// in shaders/cursor-fx.glsl, so the last frame is a clean one.
+        const cursor_fx_window_ns: i96 = 1300 * std.time.ns_per_ms;
+
+        fn cursorFxLive(self: *const Self) bool {
+            const last = self.cursor_fx_last_event orelse return false;
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            return last.durationTo(now).nanoseconds < cursor_fx_window_ns;
+        }
 
         /// The soonest animation wake this renderer needs, if any:
         /// custom shader animation wants continuous draw-only wakes
@@ -1045,6 +1462,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .false => null,
                     .always => draw_interval_ms,
                     .true => if (self.focused) draw_interval_ms else null,
+                    .cursor => if (self.cursorFxLive()) draw_interval_ms else null,
                 };
             };
 
@@ -1074,7 +1492,680 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (shader_delay) |s| return .{ .delay_ms = s, .kind = .draw };
 
+            // A scroll animation needs draw-only wakes until it settles.
+            //
+            // Pace them against the *last actual draw*, not on a fixed
+            // interval. A scroll animation runs precisely when the terminal
+            // is also being updated, so a fixed 8ms wake stacks animation
+            // draws on top of the update-driven ones. At 4K on an iGPU that
+            // overruns the vsync budget and halves the observed frame rate --
+            // measured at 33ms/frame with the animation on versus 18ms with
+            // it off, which reads as the animation making scrolling *worse*.
+            if (self.scroll_anim.active()) {
+                const min_interval_ms: u64 = 16;
+                const delay: u64 = delay: {
+                    const last = self.last_draw_ts orelse break :delay 1;
+                    const now: std.Io.Timestamp = .now(global.io(), .awake);
+                    const since_ns = last.durationTo(now).nanoseconds;
+                    if (since_ns <= 0) break :delay min_interval_ms;
+                    const since_ms: u64 = @intCast(@divTrunc(since_ns, std.time.ns_per_ms));
+                    break :delay min_interval_ms -| since_ms;
+                };
+                return .{ .delay_ms = @max(delay, 1), .kind = .draw };
+            }
+
             return null;
+        }
+
+        /// Advance any in-flight scroll animation. The easing itself lives in
+        /// scroll_anim.zig so it can be unit tested; this only supplies the
+        /// clock.
+        ///
+        /// Must be called on the render thread.
+        fn advanceScrollAnim(self: *Self) void {
+            if (!self.scroll_anim.active()) return;
+
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const last = self.scroll_anim_last orelse {
+                // First frame of this animation: no interval to integrate yet.
+                self.scroll_anim_last = now;
+                return;
+            };
+            self.scroll_anim_last = now;
+
+            const dt_ms: f32 = @floatFromInt(@divTrunc(
+                last.durationTo(now).nanoseconds,
+                std.time.ns_per_ms,
+            ));
+            self.scroll_anim.advance(
+                dt_ms,
+                @floatFromInt(self.config.scroll_animation_duration_ms),
+                self.config.scroll_animation_easing,
+            );
+            if (!self.scroll_anim.active()) {
+                self.scroll_anim_last = null;
+                self.clearScrollGhosts();
+            }
+        }
+
+        /// Keep the rows a push of `rows` over this region is about to carry
+        /// out of it. Must run BEFORE the push (to know whether it adds to
+        /// the running animation) and before this frame's cells are rebuilt
+        /// (`cells.fg_rows` still holds what was last drawn). See
+        /// `ScrollAnim.captureGhosts`.
+        fn keepScrollGhosts(self: *Self, rows: isize, top: usize, bottom: usize, left: usize, right: usize, hashes: ?[2][]const u64) void {
+            if (!self.scroll_anim.accumulates(
+                @floatFromInt(top),
+                @floatFromInt(bottom),
+                @floatFromInt(left),
+                @floatFromInt(right),
+            )) self.clearScrollGhosts();
+            const nrows = self.cells.size.rows;
+            if (nrows == 0 or bottom >= nrows) return;
+            ScrollAnim.shiftGhosts(shaderpkg.CellText, &self.scroll_ghost, rows, top, bottom);
+            const before = self.scroll_ghost.items.len;
+            ScrollAnim.captureGhosts(
+                shaderpkg.CellText,
+                self.alloc,
+                &self.scroll_ghost,
+                self.cells.fg_rows[1 .. nrows + 1],
+                rows,
+                top,
+                bottom,
+                left,
+                right,
+            ) catch {
+                self.clearScrollGhosts();
+                return;
+            };
+            self.scroll_frame_push = .{ .rows = rows, .top = top, .bottom = bottom, .left = left, .right = right };
+            // A pinned cell stays on screen; a kept copy of it would be a
+            // second one sliding away (Claude Code's label, once per row).
+            // The mask from the last computation, even between animations: the
+            // first push of a new scroll captures before this frame's pins
+            // exist, and a label that stayed put is still where it was.
+            if (self.scroll_pin.items.len == nrows * self.cells.size.columns) {
+                const pc = self.cells.size.columns;
+                var w: usize = before;
+                for (self.scroll_ghost.items[before..]) |g| {
+                    const sy = ScrollAnim.ghostY(g.grid_pos[1]) + @as(i32, @intCast(rows));
+                    const sx: usize = g.grid_pos[0];
+                    if (sy >= 0 and sy < @as(i32, @intCast(nrows)) and sx < pc and
+                        self.scroll_pin.items[@as(usize, @intCast(sy)) * pc + sx][1] != 0) continue;
+                    self.scroll_ghost.items[w] = g;
+                    w += 1;
+                }
+                self.scroll_ghost.shrinkRetainingCapacity(w);
+            }
+            if (comptime @hasField(@TypeOf(self.scroll_ghost.items[0].bools), "scroll_ghost")) {
+                for (self.scroll_ghost.items[before..]) |*g| g.bools.scroll_ghost = true;
+            } else {
+                // A backend whose shader cannot draw them: keep none.
+                self.clearScrollGhosts();
+                return;
+            }
+
+            // Their backgrounds, the same way. `cells.bg_cells` still holds
+            // what was last drawn, as `fg_rows` does above.
+            const cols = self.cells.size.columns;
+            const want = ScrollAnim.ghostBgLen(nrows, cols);
+            if (self.scroll_ghost_bg.items.len != want) {
+                self.scroll_ghost_bg.resize(self.alloc, want) catch {
+                    self.clearScrollGhosts();
+                    return;
+                };
+                @memset(self.scroll_ghost_bg.items, .{ 0, 0, 0, 0 });
+            } else if (!self.scroll_ghost_bg_live) {
+                @memset(self.scroll_ghost_bg.items, .{ 0, 0, 0, 0 });
+            }
+            ScrollAnim.shiftGhostBg(shaderpkg.CellBg, self.scroll_ghost_bg.items, cols, rows, top, bottom);
+            ScrollAnim.captureGhostBg(shaderpkg.CellBg, self.scroll_ghost_bg.items, self.cells.bg_cells, cols, rows, top, bottom, left, right);
+            self.scroll_ghost_bg_live = true;
+            // Not the background of a pinned cell either (grey stripes of the
+            // label's box sliding away in the band).
+            if (self.scroll_pin.items.len == nrows * cols and rows != 0 and bottom >= top) {
+                const g = ScrollAnim.max_ghost_rows;
+                const n_dep: usize = @min(@abs(rows), bottom - top + 1, g);
+                const first: usize = if (rows > 0) top else bottom + 1 - n_dep;
+                for (first..first + n_dep) |y| {
+                    const e = @as(isize, @intCast(y + g)) - rows;
+                    if (e < 0 or @as(usize, @intCast(e)) * cols >= self.scroll_ghost_bg.items.len) continue;
+                    // Under the label is unknown; carry the colour from its
+                    // left (a diff's green stays green, plain text stays bare).
+                    const row = self.scroll_ghost_bg.items[@as(usize, @intCast(e)) * cols ..][0..cols];
+                    var fill: shaderpkg.CellBg = .{ 0, 0, 0, 0 };
+                    for (0..cols) |c| {
+                        if (self.scroll_pin.items[y * cols + c][0] != 0) row[c] = fill else fill = row[c];
+                    }
+                }
+            }
+
+            // What this push slides UNDER a pinned overlay: model row y now
+            // holds what row y + rows held, and where y is pinned the overlay
+            // hides it -- but the frame about to be replaced still shows it
+            // whole. Keep those glyphs, as underlay ghosts at row y that the
+            // shader never draws over the overlay (the colour is
+            // `fillUnderlay`'s, every frame). The next push drops them
+            // (shiftGhosts: back inside the region), by which time the model
+            // draws that text itself, clear of the overlay. The mask is the
+            // last one computed, as for the filter above. `same_row` says,
+            // per row, whether the new frame's row y really is the old row
+            // y + rows where it is visible (repaint path: the hashes); a row
+            // an application has not finished redrawing gets no underlay
+            // rather than the wrong one.
+            if (self.scroll_pin.items.len == nrows * cols) under: {
+                const nr: isize = @intCast(nrows);
+                for (0..nrows) |y| {
+                    const pin_row = self.scroll_pin.items[y * cols ..][0..cols];
+                    var any = false;
+                    for (pin_row) |m| if (m[0] != 0) {
+                        any = true;
+                        break;
+                    };
+                    if (!any) continue;
+                    const src = @as(isize, @intCast(y)) + rows;
+                    if (src < 0 or src >= nr) continue;
+                    if (hashes) |h| {
+                        // Where the new row y is visible, is it the old row
+                        // `src`? (cur = h[0], prev = h[1].)
+                        if (h[0].len != nrows * cols or h[1].len != nrows * cols) continue;
+                        const su: usize = @intCast(src);
+                        var seen: usize = 0;
+                        var same: usize = 0;
+                        // Only the scrolling columns: yazi relabels its line
+                        // numbers every step, which failed every row.
+                        for (left..@min(right + 1, cols)) |c| {
+                            if (pin_row[c][0] != 0) continue;
+                            const k = h[0][y * cols + c];
+                            if (ScrollAnim.glyphOf(k) == ScrollAnim.blank_glyph) continue;
+                            seen += 1;
+                            // Glyphs, not styles: the row that just became
+                            // the hovered one is restyled (yazi's size column).
+                            if (ScrollAnim.glyphOf(k) == ScrollAnim.glyphOf(h[1][su * cols + c])) same += 1;
+                        }
+                        if (same * 5 < seen * 4) continue;
+                    }
+                    // The whole row within the scroll, not just the cells
+                    // pinned now: the next mask can be wider (yazi's bar
+                    // grows to cover a symlink's target), and the shader
+                    // draws an underlay glyph only where its own cell is
+                    // pinned in the CURRENT mask.
+                    for (self.cells.fg_rows[@as(usize, @intCast(src)) + 1].items) |g| {
+                        const x: usize = g.grid_pos[0];
+                        if (x >= cols or x < left or x > right) continue;
+                        var h = g;
+                        h.grid_pos[1] = ScrollAnim.ghostYEncode(@intCast(y));
+                        h.bools.scroll_ghost = true;
+                        h.bools.scroll_underlay = true;
+                        self.scroll_ghost.append(self.alloc, h) catch break :under;
+                    }
+                }
+            }
+
+            // And the image row slices, from the placements as last drawn.
+            // (updateFrame holds `draw_mutex` here.)
+            if (self.scroll_image_ghosts_stale) {
+                self.images.kitty_ghosts.clearRetainingCapacity();
+                self.scroll_image_ghosts_stale = false;
+            }
+            ScrollAnim.shiftGhostSlices(imagepkg.Placement, &self.images.kitty_ghosts, rows, top, bottom);
+            ScrollAnim.captureGhostSlices(
+                imagepkg.Placement,
+                self.alloc,
+                &self.images.kitty_ghosts,
+                self.scroll_prev_images.items,
+                rows,
+                top,
+                bottom,
+                left,
+                right,
+            ) catch self.images.kitty_ghosts.clearRetainingCapacity();
+        }
+
+        /// Callable with or without `draw_mutex` held (drawFrame holds it
+        /// when the animation ends): the image slices live in the image
+        /// state drawFrame reads, so they are only marked here and emptied
+        /// under the lock by the next `keepScrollGhosts`.
+        fn clearScrollGhosts(self: *Self) void {
+            self.scroll_pin_live = false;
+            self.scroll_ghost.clearRetainingCapacity();
+            self.scroll_ghost_bg_live = false;
+            self.scroll_image_ghosts_stale = true;
+        }
+
+        /// Record that a key produced input, for the repaint detector's gate.
+        ///
+        /// Called from the render thread's mailbox.
+        pub fn noteInputActivity(self: *Self, typed: bool) void {
+            self.input_activity_ts = .now(global.io(), .awake);
+            self.input_typed = typed;
+            // A wheel movement arrives as this AND `noteWheelActivity`,
+            // which clears it again.
+            self.scroll_anim.key_paced = true;
+        }
+
+        /// Record a wheel or touchpad scroll and its direction.
+        ///
+        /// Claude Code answers the wheel by redrawing, four rows a notch. A
+        /// hand flicks several notches at once, and two things went wrong
+        /// (8 scrolls in 10 "jump directly", 2026-10-02): the redraws merge
+        /// into one frame that moved 12 or 16 rows, past what a recovered
+        /// shift was allowed to be, so it was dropped and the screen snapped;
+        /// and a transcript full of bullets and blank lines sometimes matched
+        /// better the WRONG way (wheel up read as `shift=6`), which slid the
+        /// text backwards before it landed. While the wheel is the cause, the
+        /// detector looks as far as `max_wheel_rows` and only the wheel's way.
+        ///
+        /// Called from the render thread's mailbox.
+        pub fn noteWheelActivity(self: *Self, dir: i8, fast: bool) void {
+            self.wheel_ts = .now(global.io(), .awake);
+            if (fast) self.wheel_fast_ts = self.wheel_ts;
+            self.wheel_dir = dir;
+            self.scroll_anim.key_paced = false;
+        }
+
+        /// The wheel is spinning too fast to animate (`scroll-animation-wheel-snap`):
+        /// a scroll arriving now is drawn as a plain jump. Holds for a short
+        /// while after the last fast movement, which is how long the
+        /// application takes to answer it.
+        fn wheelSnapping(self: *const Self, now: std.Io.Timestamp) bool {
+            const t = self.wheel_fast_ts orelse return false;
+            return t.durationTo(now).nanoseconds <= 80 * std.time.ns_per_ms;
+        }
+
+        /// How long after a wheel movement a repaint is taken to be its doing.
+        pub const wheel_repaint_ms: i64 = 300;
+
+        /// Animate this frame's scroll event (stashed by the event handling in
+        /// `updateFrame`), by the distance the frame shows when that is
+        /// further than the event said (`scroll_event_total`).
+        fn applyPendingScroll(self: *Self) void {
+            const p = self.scroll_pending orelse return;
+            self.scroll_pending = null;
+            const rows = self.scroll_event_total orelse p.rows;
+            self.scroll_event_total = null;
+            if (rows != p.rows) {
+                self.scroll_trace_rows += rows - p.rows;
+                if (self.scroll_anim_last_event) |*le| le.rows = rows;
+                if (self.config.scroll_trace) log.info(
+                    "scroll event undersold rows={d} -> {d} region={d}..{d}",
+                    .{ p.rows, rows, p.top, p.bottom },
+                );
+            }
+            const cell_h: f32 = @floatFromInt(self.size.cell.height);
+            const was_idle = !self.scroll_anim.active();
+            self.keepScrollGhosts(rows, p.top, p.bottom, 0, p.right, null);
+            self.scroll_anim.push(
+                @as(f32, @floatFromInt(rows)) * cell_h,
+                @floatFromInt(p.top),
+                @floatFromInt(p.bottom),
+                0,
+                @floatFromInt(p.right),
+                p.limit,
+            );
+            if (self.wheelSnapping(.now(global.io(), .awake))) self.scroll_anim.stop();
+            if (was_idle) self.scroll_anim_last = null;
+            // Rows beside the event that moved with it (needs the push done).
+            const n = self.terminal_state.row_data.items(.cells).len;
+            const cols: usize = self.terminal_state.cols;
+            const cur = self.scroll_row_hashes.items;
+            const prev = self.scroll_hashes_before.items;
+            if (n > 0 and cur.len == n * cols and prev.len == cur.len)
+                self.extendEventRows(cur, prev, n, cols);
+        }
+
+        /// An application's scroll may leave out rows that moved with it,
+        /// repainting them instead. nvim scrolling up onto a figure hung above
+        /// its top line (virtual lines, `topfill`) scrolls only the rows BELOW
+        /// the figure -- `IL` in a region starting there, `region=5..52`, then
+        /// 6..52, 7..52 -- and repaints the figure's rows, one row lower. The
+        /// event animated only its region, so the figure's lower rows slid and
+        /// its upper rows did not: the picture tore, its first row drawn twice
+        /// and a later one lost (recorded with OBS at CSAPP ch. 2 line 291).
+        /// Rows next to the event's region whose content IS last frame's
+        /// shifted by the same amount join the animation, and the region the
+        /// rest of the gesture is held to. Rows arriving at the edge the
+        /// content comes from (new, so matching nothing) come along, as in
+        /// `detectShift`.
+        fn extendEventRows(self: *Self, cur: []const u64, prev: []const u64, n: usize, cols: usize) void {
+            const le = self.scroll_anim_last_event orelse return;
+            if (le.rows == 0 or !self.scroll_anim.active()) return;
+            if (le.bottom >= n or le.top > le.bottom) return;
+            const rowMoved = struct {
+                fn f(cu: []const u64, pr: []const u64, r: usize, rows: isize, n_: usize, cols_: usize) bool {
+                    const src = @as(isize, @intCast(r)) + rows;
+                    if (src < 0 or src >= @as(isize, @intCast(n_))) return false;
+                    const a = cu[r * cols_ ..][0..cols_];
+                    const b = pr[@as(usize, @intCast(src)) * cols_ ..][0..cols_];
+                    return std.mem.eql(u64, a, b) and !std.mem.eql(u64, a, pr[r * cols_ ..][0..cols_]);
+                }
+            }.f;
+            const rowChanged = struct {
+                fn f(cu: []const u64, pr: []const u64, r: usize, cols_: usize) bool {
+                    return !std.mem.eql(u64, cu[r * cols_ ..][0..cols_], pr[r * cols_ ..][0..cols_]);
+                }
+            }.f;
+            var lo = le.top;
+            while (lo > 0 and rowMoved(cur, prev, lo - 1, le.rows, n, cols)) lo -= 1;
+            var hi = le.bottom;
+            while (hi + 1 < n and rowMoved(cur, prev, hi + 1, le.rows, n, cols)) hi += 1;
+            // The rows arriving from the edge: above for content moving down.
+            // Only into rows some event of this gesture scrolled -- never the
+            // status line (see `scroll_event_span`).
+            // A row holding part of a figure is content wherever it is.
+            const sp = self.scroll_event_span orelse return;
+            const hasImage = struct {
+                fn f(cu: []const u64, r: usize, cols_: usize) bool {
+                    for (cu[r * cols_ ..][0..cols_]) |key| {
+                        if (ScrollAnim.glyphOf(key) == ScrollAnim.placeholder_glyph) return true;
+                    }
+                    return false;
+                }
+            }.f;
+            var k: usize = 0;
+            while (k < @abs(le.rows)) : (k += 1) {
+                if (le.rows < 0 and lo > 0 and rowChanged(cur, prev, lo - 1, cols) and
+                    (lo > sp.top or hasImage(cur, lo - 1, cols))) lo -= 1;
+                if (le.rows > 0 and hi + 1 < n and rowChanged(cur, prev, hi + 1, cols) and
+                    (hi < sp.bottom or hasImage(cur, hi + 1, cols))) hi += 1;
+            }
+            if (lo == le.top and hi == le.bottom) return;
+            self.scroll_anim.top = @min(self.scroll_anim.top, @as(f32, @floatFromInt(lo)));
+            self.scroll_anim.bottom = @max(self.scroll_anim.bottom, @as(f32, @floatFromInt(hi)));
+            if (self.scroll_anim_app_region) |*r| {
+                r.top = @min(r.top, lo);
+                r.bottom = @max(r.bottom, hi);
+            }
+            if (self.config.scroll_trace) log.info(
+                "scroll event widened rows={d} {d}..{d} -> {d}..{d}",
+                .{ le.rows, le.top, le.bottom, lo, hi },
+            );
+        }
+
+        /// Recover a scroll that an application performed by repainting.
+        ///
+        /// `had_event` is true when a real scroll event already described this
+        /// frame. The hashes are still refreshed in that case -- the next
+        /// frame has to compare against the truth -- but the movement has been
+        /// animated already and counting it twice would double the offset.
+        ///
+        /// Hashes are only kept while a gesture is in progress, so this costs
+        /// nothing at rest.
+        fn detectRepaintScroll(self: *Self, had_event: bool) void {
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const sinceMs = struct {
+                fn f(now_: std.Io.Timestamp, ts: ?std.Io.Timestamp) i64 {
+                    const t = ts orelse return std.math.maxInt(i64);
+                    return @intCast(@divTrunc(
+                        t.durationTo(now_).nanoseconds,
+                        std.time.ns_per_ms,
+                    ));
+                }
+            }.f;
+
+            // Only movement the user drove. Both the wheel and the keyboard
+            // mark the same timestamp; the window is short enough that the
+            // output of a command you just pressed Enter on does not slide,
+            // and key repeat at roughly 30Hz keeps it fresh while a key is
+            // held.
+            // Typing is not scrolling. With an insert cursor, a typed key's
+            // redraw is the text being edited: nvim's completion menu
+            // re-sorting moved its entries a row, and the region grew
+            // across the still text beside it and over the status line,
+            // which slid up and back and was drawn twice (tear.mkv
+            // 3:02, 2026-10-29). Normal-mode `j` has a block cursor, and
+            // the wheel and app-declared scrolls never come through here.
+            const typing = self.input_typed and
+                sinceMs(now, self.wheel_ts) > repaint_key_idle_ms and
+                self.terminal_state.cursor.visual_style == .bar;
+            if (typing or (sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms and
+                sinceMs(now, self.scroll_chain_ts) > repaint_chain_ms))
+            {
+                self.scroll_chain_ts = null;
+                self.scroll_row_hashes.clearRetainingCapacity();
+                self.scroll_hashes_before.clearRetainingCapacity();
+                // The gesture is over, so the region an application declared
+                // during it stops being what the next one will use.
+                self.scroll_anim_app_region = null;
+                self.scroll_event_span = null;
+                return;
+            }
+
+            // A real scroll inside the gate is the gesture still going.
+            if (had_event) self.scroll_chain_ts = now;
+
+            const cells_list = self.terminal_state.row_data.items(.cells);
+            const n = cells_list.len;
+            const cols: usize = self.terminal_state.cols;
+            if (n == 0 or cols == 0) return;
+
+            // One hash per *cell*, not per row. A row hash cannot tell a
+            // full-width scroll from one confined to a pane, and animating a
+            // pane's rows across the whole width drags its neighbours along
+            // and springs them back.
+            const cur = self.alloc.alloc(u64, n * cols) catch return;
+            defer self.alloc.free(cur);
+            for (cells_list, 0..) |*cells, i| {
+                const raw = cells.items(.raw);
+                const graphemes = cells.items(.grapheme);
+                const base = i * cols;
+                for (0..cols) |c| {
+                    // FNV-1a over the cell's bytes. Cheaper than Wyhash per
+                    // cell, which is called ~12k times a frame here and is
+                    // built for longer inputs.
+                    //
+                    // Packed with the glyph alone, so the detector can tell a
+                    // cell whose text changed from one that was only
+                    // repainted -- see `ScrollAnim.cellKey`. A space is as
+                    // blank as an empty cell: TUIs pad with styled spaces,
+                    // and those match each other at any offset.
+                    cur[base + c] = if (c < raw.len) key: {
+                        const cell = raw[c];
+                        var h: u64 = 0xcbf29ce484222325;
+                        for (std.mem.asBytes(&cell)) |b| {
+                            h = (h ^ b) *% 0x100000001b3;
+                        }
+                        // And the combining marks, which live outside the raw
+                        // cell. A Kitty image placeholder's row and column ARE
+                        // its marks: without them every row of a figure hashed
+                        // the same, read as unchanged, and the figure was left
+                        // out of the region -- it snapped while text slid.
+                        if (cell.content_tag == .codepoint_grapheme and c < graphemes.len) {
+                            for (graphemes[c]) |gcp| {
+                                h = (h ^ @as(u64, gcp)) *% 0x100000001b3;
+                            }
+                        }
+                        const cp = cell.codepoint();
+                        // Kitty image placeholders (U+10EEEE) keep their
+                        // glyph: they cannot testify to a shift (see
+                        // `ScrollAnim.testifies`) but do say which rows moved.
+                        const glyph: u32 = if (!cell.hasText() or cp == ' ')
+                            ScrollAnim.blank_glyph
+                        else
+                            cp;
+                        break :key ScrollAnim.cellKey(glyph, @truncate(h ^ (h >> 32)));
+                    } else ScrollAnim.cellKey(ScrollAnim.blank_glyph, 0);
+                }
+            }
+
+            const prev = self.scroll_row_hashes.items;
+            defer {
+                self.scroll_hashes_before.clearRetainingCapacity();
+                self.scroll_hashes_before.appendSlice(self.alloc, prev) catch {};
+                self.scroll_row_hashes.clearRetainingCapacity();
+                self.scroll_row_hashes.appendSlice(self.alloc, cur) catch {};
+            }
+
+            if (had_event) {
+                self.scroll_pre_event_hashes.clearRetainingCapacity();
+                self.scroll_pre_event_hashes.appendSlice(self.alloc, prev) catch {};
+                // AN EVENT THAT UNDERSELLS. tmux merges an application's
+                // updates, so one frame can hold a scroll command AND a
+                // repaint that moved the content further: a wheel notch in
+                // nvim went 2343 -> 2350 (skipcol 752), about ten rows in 8
+                // steps over 26 ms, and arrived as `rows=2` plus a repaint.
+                // The event animated 2 and the other 8 rows snapped -- with a
+                // figure on screen, the figure jumped (captured frame by frame
+                // with GHOSTTY_FRAME_DUMP). The frame is compared with the one
+                // before it; if the content moved further the same way, the
+                // pending event is animated by that distance instead.
+                if (self.scroll_pending) |pend| if (prev.len == cur.len) {
+                    if (ScrollAnim.detectShiftUpTo(cur, prev, n, cols, repaint_scroll_min_rows, repaint_scroll_min_ratio, ScrollAnim.max_detect_rows)) |whole| {
+                        // The same direction, further, and across (nearly)
+                        // the event's whole width: a tmux pane beside it
+                        // moving on its own must not stretch this one.
+                        const wide = (whole.right - whole.left + 1) * 5 >= (pend.right + 1) * 4;
+                        if (wide and (whole.rows > 0) == (pend.rows > 0) and @abs(whole.rows) > @abs(pend.rows))
+                            self.scroll_event_total = whole.rows;
+                    }
+                };
+                return;
+            }
+            if (prev.len != cur.len) return;
+
+            // The rows an event left out are often repainted a frame AFTER it
+            // (nvim's figure rows, see `extendEventRows`): check again against
+            // the screen from before the event, while that event is recent.
+            if (self.scroll_anim_last_event) |le| {
+                const pre = self.scroll_pre_event_hashes.items;
+                if (sinceMs(now, le.ts) <= repair_partial_ms and pre.len == cur.len)
+                    self.extendEventRows(cur, pre, n, cols);
+            }
+
+            // Only for an application that answers the wheel by redrawing
+            // alone. nvim sends scroll commands for the wheel; recovering
+            // its large repaints as well took fast wheel scrolling there
+            // from 94% smooth to 86%.
+            const by_wheel = self.wheel_dir != 0 and sinceMs(now, self.wheel_ts) <= wheel_repaint_ms and
+                (self.scroll_anim_last_event == null or sinceMs(now, self.scroll_anim_last_event.?.ts) > 1000);
+            const shift = ScrollAnim.detectShiftDir(
+                cur,
+                prev,
+                n,
+                cols,
+                repaint_scroll_min_rows,
+                repaint_scroll_min_ratio,
+                if (by_wheel) ScrollAnim.max_wheel_rows else ScrollAnim.max_animated_rows,
+                if (by_wheel) self.wheel_dir else 0,
+            ) orelse return;
+
+            // Hold the detected rows inside the application's own scrolling
+            // region. See `scroll_anim_app_region`: what *changed* is not the
+            // same question as what *scrolled*, and a status line carrying a
+            // position percentage changes on every frame of a scroll without
+            // ever moving.
+            var top = shift.top;
+            var bottom = shift.bottom;
+            if (self.scroll_anim_app_region) |r| {
+                if (r.grid_rows == n) {
+                    top = @max(top, r.top);
+                    bottom = @min(bottom, r.bottom);
+                    if (bottom < top) return;
+                }
+            } else if (bottom + 1 == n) {
+                // Nothing has declared a region this gesture, so fall back to
+                // the same manual reservation the event path applies when an
+                // application names none -- otherwise the two producers
+                // disagree about the last rows exactly as they did about the
+                // status line. Only when the detected range actually reaches
+                // the last row: a scroll that ends mid-screen has no
+                // interface at its bottom edge to reserve.
+                bottom = bottom -| self.config.scroll_animation_reserve_bottom;
+                if (bottom < top) return;
+            }
+
+            // A FRAME CAUGHT MID-REDRAW. The frame with the event can be drawn
+            // between the application's scroll command and its repaint of the
+            // rows below it, so the NEXT frame's rows differ from that
+            // half-done one -- and can match it a row the other way. nvim at
+            // CSAPP ch. 2 line 2808 (a formula at the top of the window): `j`
+            // gave `rows=1`, and 1 ms later `shift=-1 rows=7..52 cols=0..162`
+            // against it, which slid the left three quarters of the page back
+            // down, gutter included, and pinned a dozen runs of text. Against
+            // the screen from before the event the same rows moved exactly as
+            // the event said, so the event already animates them: drop it.
+            if (self.scroll_anim_last_event) |le| {
+                const pre = self.scroll_pre_event_hashes.items;
+                if (sinceMs(now, le.ts) <= repair_partial_ms and
+                    (shift.rows > 0) != (le.rows > 0) and pre.len == cur.len)
+                {
+                    if (ScrollAnim.detectShift(cur, pre, n, cols, repaint_scroll_min_rows, repaint_scroll_min_ratio)) |whole| {
+                        if (whole.rows == le.rows) {
+                            if (self.config.scroll_trace) log.info(
+                                "repaintscroll partial shift={d} rows={d}..{d} cols={d}..{d} after rows={d} mono_us={d}",
+                                .{ shift.rows, shift.top, shift.bottom, shift.left, shift.right, le.rows, @divTrunc(now.nanoseconds, std.time.ns_per_us) },
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // The application's own scroll carried screen-fixed columns (the
+            // relative line numbers) with it, and this is it rewriting them.
+            if (self.scroll_anim_last_event) |le| {
+                if (ScrollAnim.isRepair(le.rows, sinceMs(now, le.ts), cols, shift)) {
+                    if (self.config.scroll_trace) log.info(
+                        "repaintscroll repair shift={d} cols={d}..{d} after rows={d} mono_us={d}",
+                        .{ shift.rows, shift.left, shift.right, le.rows, @divTrunc(now.nanoseconds, std.time.ns_per_us) },
+                    );
+                    return;
+                }
+            }
+
+            // (A label held on screen -- Claude Code's "Jump to bottom" -- is
+            // no longer cut out of the region by rows: its cells are pinned
+            // individually after the rebuild, see `ScrollAnim.computePins`.)
+
+            const cell_h: f32 = @floatFromInt(self.size.cell.height);
+            const was_idle = !self.scroll_anim.active();
+            self.keepScrollGhosts(shift.rows, top, bottom, shift.left, shift.right, .{ cur, prev });
+            self.scroll_anim.push(
+                @as(f32, @floatFromInt(shift.rows)) * cell_h,
+                @floatFromInt(top),
+                @floatFromInt(bottom),
+                @floatFromInt(shift.left),
+                @floatFromInt(shift.right),
+                cell_h * ScrollAnim.ghost_lag_rows,
+            );
+            if (self.wheelSnapping(now)) self.scroll_anim.stop();
+            if (was_idle) self.scroll_anim_last = null;
+            self.scroll_chain_ts = now;
+
+            if (self.config.scroll_trace) log.info(
+                "repaintscroll shift={d} rows={d}..{d} clamped={d}..{d} cols={d}..{d} of {d}x{d} mono_us={d}",
+                .{ shift.rows, shift.top, shift.bottom, top, bottom, shift.left, shift.right, n, cols, @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us) },
+            );
+        }
+
+        /// Emit one `scroll-trace` line for this frame.
+        ///
+        /// `model_rows` is where the terminal thinks the content is;
+        /// `off_px` is how far from that it is actually being drawn. The
+        /// analyzer reconstructs the drawn position as
+        /// `-(model_rows * cell_h) + off_px` and checks that curve for the
+        /// things eyes are bad at judging: reversals, stalls, and jumps.
+        fn traceScrollFrame(self: *Self) void {
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const base = self.scroll_trace_base orelse base: {
+                self.scroll_trace_base = now;
+                break :base now;
+            };
+            const t_us = @divTrunc(base.durationTo(now).nanoseconds, std.time.ns_per_us);
+            log.info(
+                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} top={d} bot={d} cell_h={d} mono_us={d} left={d} right={d}",
+                .{
+                    t_us,
+                    self.scroll_trace_rows,
+                    self.scroll_anim.offset_px,
+                    self.scroll_anim.top,
+                    self.scroll_anim.bottom,
+                    self.size.cell.height,
+                    @divTrunc(now.nanoseconds, std.time.ns_per_us),
+                    self.scroll_anim.left,
+                    self.scroll_anim.right,
+                },
+            );
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1298,7 +2389,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
+                scroll_event: ?terminal.Terminal.ScrollEvent,
             };
+
+            // Hold the draw mutex from here until the rebuilt cells are in
+            // place. With GTK, frames are drawn on the app thread while this
+            // runs on the renderer thread, and three things below change
+            // what a draw would show before the cells catch up: the image
+            // placements (kittyUpdate), the scroll offset (push), and the kept
+            // band rows. A draw landing in between showed the old grid at the
+            // new offset, or new image placements over the old grid -- for one
+            // frame everything, or just a figure, sat a scroll's distance off
+            // and came back ("the image jumps up a line and back"). The draw
+            // thread waits at most one update for this.
+            self.draw_mutex.lockUncancelable(global.io());
+            var draw_held = true;
+            defer if (draw_held) self.draw_mutex.unlock(global.io());
 
             // Update all our data as tightly as possible within the mutex.
             var critical: Critical = critical: {
@@ -1320,6 +2426,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.debug("synchronized output started, skipping render", .{});
                     return;
                 }
+
+                // Drain any region scroll the terminal recorded since the last
+                // frame. Left in place if we bail out above; it coalesces, so a
+                // skipped frame costs accuracy of timing, not of position.
+                const scroll_event = state.terminal.scroll_event;
+                state.terminal.scroll_event = null;
 
                 // If scroll-to-bottom on output is enabled, check if the final line
                 // changed by comparing the bottom-right pin. If the node pointer or
@@ -1405,10 +2517,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // kitty state on every frame because any cell change can move
                 // an image.
                 if (self.images.kittyRequiresUpdate(state.terminal)) {
-                    // We need to grab the draw mutex since this updates
-                    // our image state that drawFrame uses.
-                    self.draw_mutex.lockUncancelable(global.io());
-                    defer self.draw_mutex.unlock(global.io());
+                    // The draw mutex is already held (see above).
+                    if (self.config.scroll_animation) {
+                        self.scroll_prev_images.clearRetainingCapacity();
+                        self.scroll_prev_images.appendSlice(self.alloc, self.images.kitty_placements.items) catch
+                            self.scroll_prev_images.clearRetainingCapacity();
+                    }
                     self.images.kittyUpdate(
                         self.alloc,
                         state.terminal,
@@ -1452,13 +2566,236 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
+                    .scroll_event = scroll_event,
                 };
             };
+
+            // Stage 2a of SPEC.md is detection only: prove we see the right
+            // scrolls, with the right row counts and regions, before anything
+            // visual depends on it. `index` is deliberately not yet hooked --
+            // it fires on every newline at the bottom of the screen, and we
+            // want to know what the deliberate-scroll traffic looks like on
+            // its own first.
+            if (critical.scroll_event) |ev| scroll: {
+                // Promote to info while tracing so the harness works against
+                // a release build; debug logs are compiled out of those, and a
+                // debug build runs at ~40fps which swamps what we measure.
+                if (self.config.scroll_trace) {
+                    // Everything that decides whether a sub-row offset is
+                    // applied here, so this does not have to be inferred:
+                    // the *region* top (not the cursor row `top`), whether it
+                    // counted as narrowed, and the offset actually drawn.
+                    log.info(
+                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} cell_h={d} mono_us={d}",
+                        .{
+                            ev.rows,
+                            ev.top,
+                            ev.region_top,
+                            ev.bottom,
+                            self.size.grid().rows,
+                            @tagName(ev.source),
+                            self.size.cell.height,
+                            @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
+                        },
+                    );
+                } else {
+                    log.debug(
+                        "scroll event: rows={d} region={d}..{d} source={s} enabled={} cell_h={d}",
+                        .{ ev.rows, ev.top, ev.bottom, @tagName(ev.source), self.config.scroll_animation, self.size.cell.height },
+                    );
+                }
+
+                // Before any filtering: the trace needs the model's true
+                // position, including scrolls we deliberately do not animate.
+                self.scroll_trace_rows += @intCast(ev.rows);
+
+                // Remember the region so a sub-row displacement arriving
+                // between scrolls moves the same rows, and leaves tmux's
+                // status line alone.
+                // Only remember a region the application has actually
+                // narrowed. tmux and nvim set margins precisely so the rows
+                // outside them -- a status line, a mode line -- hold still,
+                // and that is the only signal we get about which rows are
+                // content and which are interface.
+                //
+                // A region spanning the whole screen carries no such signal.
+                // Claude Code, for one, sets no margins and redraws its prompt
+                // box in place, so treating full-screen as "everything may
+                // move" nudged the box and it sprang back on the next redraw.
+                // Without the signal, hold still.
+                // Adopt a region between gestures, never during one.
+                //
+                // Which end an application reserves says nothing useful: a
+                // tmux status line sits at the top as readily as the bottom.
+                // What matters is that the region stay *put* while a scroll is
+                // in progress. Claude Code alternates between `0..54` and
+                // `1..54` as it redraws, and re-deciding on each event
+                // switched smoothing on and off between frames, snapping the
+                // whole screen half a row back and forth. Freezing the choice
+                // for the duration of the gesture removes that entirely, and
+                // an application with a stable region -- tmux, nvim -- is
+                // unaffected because there is nothing to re-decide.
+                // `narrowed` says the application named its own interface
+                // rows at one end or the other, which is better information
+                // than a number in a config file. See the reserve below.
+                const grid_rows = self.size.grid().rows;
+                const narrowed = ev.region_top > 0 or ev.bottom + 1 < grid_rows;
+
+                if (ev.rows != 0) self.scroll_anim_last_event = .{
+                    .rows = @intCast(ev.rows),
+                    .ts = .now(global.io(), .awake),
+                };
+
+                if (!self.config.scroll_animation) break :scroll;
+                if (ev.rows == 0) break :scroll;
+
+                // A jump this large is a page move, a full-screen redraw or a
+                // burst of output, not a scroll. Animating it would sweep a
+                // screenful of text past the eye more slowly than the instant
+                // change it replaces. Drop any animation in flight too: it
+                // describes rows that just stopped being where it thought.
+                // Ghost rows (see `scroll_ghost`) let a longer scroll than the
+                // detector's slide: they fill the band the lag uncovers.
+                // A scroll of the region's whole height or more moves every
+                // row out: nothing on screen before is on screen after, so it
+                // is a clear, not a scroll. tmux uses exactly that to redraw
+                // panes on unzoom (`C-a z`): rows=16 over region 2..17, and the
+                // whole row of panes slid.
+                const region_h: i64 = @as(i64, @intCast(ev.bottom)) - @as(i64, @intCast(ev.region_top)) + 1;
+                if (region_h > 0 and @abs(@as(i64, ev.rows)) >= region_h) {
+                    self.scroll_anim.stop();
+                    self.clearScrollGhosts();
+                    break :scroll;
+                }
+                if (@abs(ev.rows) > ScrollAnim.max_ghost_animated_rows) {
+                    self.scroll_anim.stop();
+                    self.clearScrollGhosts();
+                    break :scroll;
+                }
+
+                // Displace by exactly the distance just scrolled, so the first
+                // animated frame reproduces the pre-scroll screen, and ease to
+                // zero from there. The model is already current -- writes land
+                // during the animation and must not be delayed (SPEC stage 2)
+                // -- so this only ever moves what is drawn.
+                const cell_h: f32 = @floatFromInt(self.size.cell.height);
+                const rows: f32 = @floatFromInt(ev.rows);
+                const offset = rows * cell_h;
+
+                // Cap how far behind the model the drawn position may fall.
+                // Scrolls arrive faster than the ramp retires them during a
+                // fling, so without a tight cap the offset winds up until the
+                // whole block sits half a screen from where it belongs.
+                const limit = cell_h * ScrollAnim.ghost_lag_rows;
+                // Accumulate rather than replace, and only reset the clock
+                // when starting from idle. Resetting it on every scroll would
+                // skip the integration frame each time, so during continuous
+                // scrolling the offset would never decay and would simply
+                // wind up to the limit.
+                // Hold back rows the user has reserved for an interface the
+                // application pins but does not exclude from its own scrolling
+                // region. Use the region's *margin*, not `ev.top`, which for
+                // insert/delete lines is the cursor row.
+                // Only when the application tells us *nothing*. A region
+                // narrowed at either end is the application naming its own
+                // interface rows, and that is better information than a
+                // number typed into a config file -- subtracting from it as
+                // well steals content rows and freezes them mid-scroll while
+                // everything above slides, which is more jarring than the
+                // interface wobble the reserve exists to stop.
+                //
+                // tmux run with `status-position top` is the case that proves
+                // it: its region is 1..last, so it *reaches* the bottom row
+                // and "does the region touch the bottom" cannot tell it apart
+                // from Claude Code. That it narrows at the top can.
+                const reserve: usize = if (narrowed)
+                    0
+                else
+                    self.config.scroll_animation_reserve_bottom;
+                const bottom = ev.bottom -| reserve;
+                if (bottom < ev.region_top) break :scroll;
+                if (self.scroll_anim_last_event) |*le| {
+                    le.top = ev.region_top;
+                    le.bottom = bottom;
+                }
+                self.scroll_event_span = if (self.scroll_event_span) |sp| .{
+                    .top = @min(sp.top, ev.region_top),
+                    .bottom = @max(sp.bottom, bottom),
+                } else .{ .top = ev.region_top, .bottom = bottom };
+
+                // Remember it for the repaint detector, which cannot see a
+                // scrolling margin and would otherwise animate the rows this
+                // one deliberately leaves out. See `scroll_anim_app_region`.
+                self.scroll_anim_app_region = .{
+                    .top = ev.region_top,
+                    .bottom = bottom,
+                    .grid_rows = grid_rows,
+                };
+
+                // Applied after the frame is read (`applyPendingScroll`),
+                // not here: the frame may show the content moved FURTHER than
+                // this event says -- see "an event that undersells".
+                _ = offset;
+                self.scroll_pending = .{
+                    .rows = @intCast(ev.rows),
+                    .top = ev.region_top,
+                    .bottom = bottom,
+                    // An application that says it scrolled a region means the
+                    // whole width of it; only repaint detection can see a
+                    // scroll narrower than the screen.
+                    .right = self.size.grid().columns -| 1,
+                    .limit = limit,
+                };
+                // (see applyPendingScroll)
+            }
 
             // Outside the critical area, complete the update we began
             // within it. This must be done before anything reads the
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
+
+            // A cursor pulse changes no cell, so nothing else would draw a
+            // frame for it: note it here, and animationWake asks for frames.
+            if (self.terminal_state.cursor.pulse != self.cursor_fx_pulse_seen) {
+                self.cursor_fx_pulse_seen = self.terminal_state.cursor.pulse;
+                self.cursor_fx_pulse_pending = true;
+                self.cursor_fx_last_event = .now(global.io(), .awake);
+            }
+            if (self.terminal_state.cursor.boom != self.cursor_fx_boom_seen) {
+                self.cursor_fx_boom_seen = self.terminal_state.cursor.boom;
+                self.cursor_fx_boom_pending = self.terminal_state.cursor.boom_last;
+                self.cursor_fx_last_event = .now(global.io(), .awake);
+            }
+
+            // A mode change (cursor style or colour, e.g. nvim i / Esc / v)
+            // is only recorded when the frame is DRAWN (updateCursorFx), and
+            // on GTK that happens later, on the app thread -- after this
+            // thread has already asked animationWake whether to keep
+            // drawing. From idle the answer was no, so the effect got the
+            // one or two frames something else drew and never visibly
+            // played ("the effects sometimes don't play", tbd-5: they did
+            // play when another effect was still running). Note it here, as
+            // for a pulse, so the animation timer is armed for it.
+            {
+                const style = self.terminal_state.cursor.visual_style;
+                const color = self.terminal_state.colors.cursor;
+                const seen = self.cursor_fx_style_seen != null;
+                if (seen and (self.cursor_fx_style_seen.? != style or
+                    !std.meta.eql(self.cursor_fx_color_seen, color)))
+                {
+                    self.cursor_fx_last_event = .now(global.io(), .awake);
+                }
+                self.cursor_fx_style_seen = style;
+                self.cursor_fx_color_seen = color;
+            }
+
+            // Now the render state is readable, look for movement no event
+            // described. Must come after endUpdate: row_data is not valid
+            // until the update it began is completed.
+            if (self.config.scroll_animation) {
+                self.detectRepaintScroll(critical.scroll_event != null);
+            }
+            self.applyPendingScroll();
 
             // Outside the critical area we can update our links to contain
             // our regex results.
@@ -1536,10 +2873,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
             };
 
-            // Acquire the draw mutex for all remaining state updates.
+            // Still under the draw mutex taken above, for all remaining
+            // state updates.
             {
-                self.draw_mutex.lockUncancelable(global.io());
-                defer self.draw_mutex.unlock(global.io());
+                // Overlay pins compare this frame's backgrounds with the last.
+                // On every frame of a running animation, not only on frames
+                // that pushed: an application can move its overlay between
+                // scrolls (yazi's bar moving down a list that stopped), and a
+                // mask left from the last push held the old row still and
+                // left the new one sliding -- a bar half on one row, its caps
+                // on another. Frames without a push use the last push's
+                // direction for "carried".
+                const pushed = self.scroll_frame_push != null;
+                if (self.scroll_frame_push) |fp| self.scroll_last_push = .{ .rows = fp.rows, .top = fp.top, .bottom = fp.bottom, .left = fp.left, .right = fp.right };
+                const pin_push = if (self.scroll_frame_push) |fp| fp else if (self.scroll_anim.active() and self.scroll_pin_live) if (self.scroll_last_push) |lp| @TypeOf(self.scroll_frame_push.?){ .rows = lp.rows, .top = lp.top, .bottom = lp.bottom, .left = lp.left, .right = lp.right } else null else null;
+                self.scroll_frame_push = null;
+                if (pin_push != null) {
+                    self.scroll_bg_prev.clearRetainingCapacity();
+                    self.scroll_bg_prev.appendSlice(self.alloc, self.cells.bg_cells) catch
+                        self.scroll_bg_prev.clearRetainingCapacity();
+                }
 
                 // Build our GPU cells
                 self.rebuildCells(
@@ -1557,6 +2910,114 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     comptime assert(@TypeOf(err) == error{OutOfMemory});
                     log.warn("error rebuilding GPU cells err={}", .{err});
                 };
+
+                if (pin_push) |pp| pins: {
+                    const n = self.cells.bg_cells.len;
+                    if (self.scroll_bg_prev.items.len != n) break :pins;
+                    self.scroll_pin.resize(self.alloc, n) catch break :pins;
+                    // Over everything the running animation displaces, not just
+                    // this push's rows: pushes jitter a row (1..48, then 1..49)
+                    // and the union is what the shaders move -- a label on the
+                    // row one push left out still slid with the next.
+                    const a = self.scroll_anim;
+                    const f2u = struct {
+                        fn f(v: f32, dflt: usize) usize {
+                            return if (v >= 0) @intFromFloat(v) else dflt;
+                        }
+                    }.f;
+                    const lo_r = if (a.active()) @min(pp.top, f2u(a.top, pp.top)) else pp.top;
+                    const hi_r = if (a.active()) @min(@max(pp.bottom, f2u(a.bottom, pp.bottom)), self.cells.size.rows - 1) else pp.bottom;
+                    const lo_c = if (a.active()) @min(pp.left, f2u(a.left, pp.left)) else pp.left;
+                    const hi_c = if (a.active()) @min(@max(pp.right, f2u(a.right, pp.right)), self.cells.size.columns - 1) else pp.right;
+                    if (!pushed) {
+                        // A FRAME THAT DID NOT SCROLL finds no new overlays:
+                        // with nothing moving, every coloured run "stayed
+                        // where it was" and "was not carried there" -- inline
+                        // code, a code block's language label, all pinned
+                        // and held still while the text around them slid,
+                        // and the text check held every overlay's text (the
+                        // round-7 per-frame recompute did exactly that). It
+                        // keeps last frame's pins instead, dropping cells
+                        // whose colour or text changed since (yazi's bar
+                        // leaving a row without a scroll).
+                        const now_h = self.scroll_row_hashes.items;
+                        const bef_h = self.scroll_hashes_before.items;
+                        const have_h = now_h.len == n and bef_h.len == n;
+                        const eq = std.meta.eql;
+                        for (0..n) |k| {
+                            const m = &self.scroll_pin.items[k];
+                            if (m[0] == 0) continue;
+                            if (!eq(self.cells.bg_cells[k], self.scroll_bg_prev.items[k])) {
+                                m.* = .{ 0, 0, 0, 0 };
+                            } else if (m[1] != 0 and have_h and now_h[k] != bef_h[k]) {
+                                m[1] = 0;
+                            }
+                        }
+                    } else {
+                        ScrollAnim.computePins(
+                            shaderpkg.CellBg,
+                            self.scroll_pin.items,
+                            self.scroll_bg_prev.items,
+                            self.cells.bg_cells,
+                            self.cells.size.columns,
+                            pp.rows,
+                            lo_r,
+                            hi_r,
+                            lo_c,
+                            hi_c,
+                        );
+                        ScrollAnim.pinStillText(
+                            shaderpkg.CellBg,
+                            self.scroll_pin.items,
+                            self.scroll_row_hashes.items,
+                            self.scroll_hashes_before.items,
+                            self.cells.size.columns,
+                            pp.rows,
+                            lo_r,
+                            hi_r,
+                            lo_c,
+                            hi_c,
+                        );
+                        ScrollAnim.markPinnedText(
+                            shaderpkg.CellBg,
+                            self.scroll_pin.items,
+                            self.scroll_row_hashes.items,
+                            self.scroll_hashes_before.items,
+                            self.cells.size.columns,
+                        );
+                    }
+                    self.scroll_pin_live = self.scroll_anim.active();
+                    if (self.config.scroll_trace) {
+                        const pc = self.cells.size.columns;
+                        for (0..self.cells.size.rows) |r| {
+                            var first: ?usize = null;
+                            var cnt: usize = 0;
+                            for (0..pc) |c| if (self.scroll_pin.items[r * pc + c][0] != 0) {
+                                if (first == null) first = c;
+                                cnt += 1;
+                            };
+                            if (cnt > 0) {
+                                // The pinned run's text now and last frame,
+                                // and which cells hold their text (T).
+                                var nb: [48]u8 = @splat(' ');
+                                var bb: [48]u8 = @splat(' ');
+                                var tb: [48]u8 = @splat(' ');
+                                const nh = self.scroll_row_hashes.items;
+                                const bh = self.scroll_hashes_before.items;
+                                if (nh.len == n and bh.len == n) for (0..@min(48, pc - first.?)) |j| {
+                                    const k = r * pc + first.? + j;
+                                    const g1 = ScrollAnim.glyphOf(nh[k]);
+                                    const g2 = ScrollAnim.glyphOf(bh[k]);
+                                    nb[j] = if (g1 == 0) ' ' else if (g1 < 127 and g1 > 32) @intCast(g1) else '#';
+                                    bb[j] = if (g2 == 0) ' ' else if (g2 < 127 and g2 > 32) @intCast(g2) else '#';
+                                    const m = self.scroll_pin.items[k];
+                                    tb[j] = if (m[0] == 0) '.' else if (m[1] != 0) 'T' else 'c';
+                                };
+                                log.info("scrollpin row={d} col={d} n={d} text={} shift={d} pushed={} now=[{s}] before=[{s}] mask=[{s}]", .{ r, first.?, cnt, self.scroll_pin.items[r * pc + first.?][1] != 0, pp.rows, pushed, nb, bb, tb });
+                            }
+                        }
+                    }
+                }
 
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
@@ -1598,6 +3059,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Update custom shader uniforms that depend on terminal state.
                 self.updateCustomShaderUniformsFromState();
             }
+            self.draw_mutex.unlock(global.io());
+            draw_held = false;
 
             // Start the display link now that the rebuilt frame is ready.
             self.syncDisplayLink(null, null);
@@ -1685,6 +3148,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             }
             self.cells_rebuilt = false;
+            self.last_draw_ts = .now(global.io(), .awake);
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();
@@ -1696,6 +3160,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.reinitialize_shaders = false;
                 self.shaders.deinit(self.alloc);
                 try self.initShaders();
+                self.cache_damage_full = true;
             }
 
             // Our shaders should not be defunct at this point.
@@ -1741,7 +3206,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.size.screen.height,
                 );
                 frame.target_config_modified = self.target_config_modified;
+                self.cache_damage_full = true;
             }
+            if (size_changed or swap_chain_rebuilt) self.cache_damage_full = true;
 
             // Upload images to the GPU as necessary.
             _ = self.images.upload(self.alloc, &self.api);
@@ -1753,21 +3220,90 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try self.updateCustomShaderUniformsForFrame();
 
             // Setup our frame data
+            // Advance any scroll animation and publish it to the shaders.
+            // Done here, immediately before upload, so the value drawn is the
+            // value computed for this frame.
+            self.advanceScrollAnim();
+            if (self.config.scroll_trace) self.traceScrollFrame();
+            const total_off = self.scroll_anim.offset_px;
+            const top: f32, const bot: f32 = if (self.scroll_anim.active())
+                .{ self.scroll_anim.top, self.scroll_anim.bottom }
+            else
+                .{ 0, 0 };
+            // Whole device pixels. Glyphs are sampled from the atlas with
+            // linear filtering, so a fractional offset draws every glyph
+            // blended across two pixel rows: soft, doubled strokes and a
+            // visibly dimmer screen for as long as anything moves, which
+            // read as the screen dimming and brightening on every scroll.
+            // A rounded offset moves at most half a pixel off the curve.
+            self.uniforms.scroll_anim = .{
+                if (@abs(total_off) < ScrollAnim.min_offset_px) 0 else @round(total_off),
+                top,
+                bot,
+                0,
+            };
+            // Full width unless a repaint-detected scroll narrowed it.
+            const cols_f: f32 = @floatFromInt(self.size.grid().columns -| 1);
+            self.uniforms.scroll_anim_cols = if (self.scroll_anim.active())
+                .{ self.scroll_anim.left, self.scroll_anim.right, 0, 0 }
+            else
+                .{ 0, cols_f, 0, 0 };
+
             try frame.uniforms.sync(&.{self.uniforms});
-            try frame.cells_bg.sync(self.cells.bg_cells);
-            const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);
+            self.images.kitty_ghosts_live = self.scroll_anim.active() and
+                !self.scroll_image_ghosts_stale and self.images.kitty_ghosts.items.len > 0;
+            const grid_n: usize = @as(usize, self.cells.size.rows) * self.cells.size.columns;
+            const ghost_bg = self.scroll_anim.active() and self.scroll_ghost_bg_live and
+                self.scroll_ghost_bg.items.len == ScrollAnim.ghostBgLen(self.cells.size.rows, self.cells.size.columns);
+            const pinned = self.scroll_anim.active() and self.scroll_pin_live and
+                self.scroll_pin.items.len == grid_n;
+            if (ghost_bg or pinned) {
+                // The kept rows' backgrounds ride after the grid's own (found
+                // through `scroll_anim[3]`), then the pin mask (found through
+                // `scroll_anim_cols[3]`, its offset; 0 = none).
+                self.scroll_bg_view.clearRetainingCapacity();
+                try self.scroll_bg_view.append(self.alloc, .{ .items = self.cells.bg_cells, .capacity = self.cells.bg_cells.len });
+                var off = grid_n;
+                if (ghost_bg) {
+                    try self.scroll_bg_view.append(self.alloc, self.scroll_ghost_bg);
+                    off += self.scroll_ghost_bg.items.len;
+                    self.uniforms.scroll_anim[3] = @floatFromInt(ScrollAnim.max_ghost_rows);
+                }
+                if (pinned) {
+                    try self.scroll_bg_view.append(self.alloc, self.scroll_pin);
+                    self.uniforms.scroll_anim_cols[3] = @floatFromInt(off);
+                    // The underlay grid directly after the mask: the shader
+                    // reads it at mask index + grid size, so it must be there.
+                    if (self.scroll_pin_under.items.len != grid_n) {
+                        try self.scroll_pin_under.resize(self.alloc, grid_n);
+                        @memset(self.scroll_pin_under.items, .{ 0, 0, 0, 0 });
+                    }
+                    ScrollAnim.fillUnderlay(shaderpkg.CellBg, self.scroll_pin_under.items, self.scroll_pin.items, self.cells.bg_cells, self.cells.size.columns);
+                    try self.scroll_bg_view.append(self.alloc, self.scroll_pin_under);
+                }
+                _ = try frame.cells_bg.syncFromArrayLists(self.scroll_bg_view.items);
+                try frame.uniforms.sync(&.{self.uniforms});
+            } else try frame.cells_bg.sync(self.cells.bg_cells);
+            const fg_count = if (self.scroll_anim.active() and self.scroll_ghost.items.len > 0) ghosted: {
+                self.scroll_ghost_view.clearRetainingCapacity();
+                try self.scroll_ghost_view.appendSlice(self.alloc, self.cells.fg_rows);
+                try self.scroll_ghost_view.append(self.alloc, self.scroll_ghost);
+                break :ghosted try frame.cells.syncFromArrayLists(self.scroll_ghost_view.items);
+            } else try frame.cells.syncFromArrayLists(self.cells.fg_rows);
 
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
                 try frame.bg_image_buffer.sync(&.{self.bg_image_buffer});
 
                 frame.bg_image_buffer_modified = self.bg_image_buffer_modified;
+                self.cache_damage_full = true;
             }
 
             // If our font atlas changed, sync the texture data
             texture: {
                 const modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
                 if (modified <= frame.grayscale_modified) break :texture;
+                self.cache_damage_full = true;
                 self.font_grid.lock.lockSharedUncancelable(global.io());
                 defer self.font_grid.lock.unlockShared(global.io());
                 frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
@@ -1776,6 +3312,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: {
                 const modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 if (modified <= frame.color_modified) break :texture;
+                self.cache_damage_full = true;
                 self.font_grid.lock.lockSharedUncancelable(global.io());
                 defer self.font_grid.lock.unlockShared(global.io());
                 frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
@@ -1786,6 +3323,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
 
+            // custom-shader-cache: the cached path replaces everything below.
+            if (comptime @hasDecl(GraphicsAPI, "custom_shader_cache_supported")) cached: {
+                const state = if (frame.custom_shader_state) |*st| st else break :cached;
+                const n = self.shaders.post_pipelines.len;
+                if (!self.config.custom_shader_cache or n == 0 or
+                    n > CustomShaderState.max_cache)
+                {
+                    // Leaving the cached path: nothing it tracked is valid
+                    // when it is next entered.
+                    self.cache_damage_full = true;
+                    self.cache_final_settled = false;
+                    break :cached;
+                }
+                try self.drawFrameCached(frame, state, &frame_ctx, fg_count);
+                return;
+            }
+
             {
                 var pass = frame_ctx.renderPass(&.{.{
                     .target = if (frame.custom_shader_state) |state|
@@ -1795,95 +3349,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
                 }});
                 defer pass.complete();
-
-                // First we draw our background image, if we have one.
-                // The bg image shader also draws the main bg color.
-                //
-                // Otherwise, if we don't have a background image, we
-                // draw the background color by itself in its own step.
-                //
-                // NOTE: We don't use the clear_color for this because that
-                //       would require us to do color space conversion on the
-                //       CPU-side. In the future when we have utilities for
-                //       that we should remove this step and use clear_color.
-                if (self.bg_image) |img| switch (img) {
-                    .ready => |texture| pass.step(.{
-                        .pipeline = self.shaders.pipelines.bg_image,
-                        .uniforms = frame.uniforms.buffer,
-                        .buffers = &.{frame.bg_image_buffer.buffer},
-                        .textures = &.{texture},
-                        .draw = .{ .type = .triangle, .vertex_count = 3 },
-                    }),
-                    else => {},
-                } else {
-                    pass.step(.{
-                        .pipeline = self.shaders.pipelines.bg_color,
-                        .uniforms = frame.uniforms.buffer,
-                        .buffers = &.{ null, frame.cells_bg.buffer },
-                        .draw = .{ .type = .triangle, .vertex_count = 3 },
-                    });
-                }
-
-                // Then we draw any kitty images that need
-                // to be behind text AND cell backgrounds.
-                self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .kitty_below_bg,
-                );
-
-                // Then we draw any opaque cell backgrounds.
-                pass.step(.{
-                    .pipeline = self.shaders.pipelines.cell_bg,
-                    .uniforms = frame.uniforms.buffer,
-                    .buffers = &.{ null, frame.cells_bg.buffer },
-                    .draw = .{ .type = .triangle, .vertex_count = 3 },
-                });
-
-                // Kitty images between cell backgrounds and text.
-                self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .kitty_below_text,
-                );
-
-                // Text.
-                pass.step(.{
-                    .pipeline = self.shaders.pipelines.cell_text,
-                    .uniforms = frame.uniforms.buffer,
-                    .buffers = &.{
-                        frame.cells.buffer,
-                        frame.cells_bg.buffer,
-                    },
-                    .textures = &.{
-                        frame.grayscale,
-                        frame.color,
-                    },
-                    .draw = .{
-                        .type = .triangle_strip,
-                        .vertex_count = 4,
-                        .instance_count = fg_count,
-                    },
-                });
-
-                // Kitty images in front of text.
-                self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .kitty_above_text,
-                );
-
-                // Debug overlay. We do this before any custom shader state
-                // because our debug overlay is aligned with the grid.
-                if (self.overlay != null) self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .overlay,
-                );
+                self.drawCellSteps(&pass, frame, fg_count);
             }
 
             // If we have custom shaders, then we render them.
@@ -1915,6 +3381,600 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     });
                 }
             }
+        }
+
+        /// The terminal image: backgrounds, images, text. Everything a frame
+        /// draws before any custom shader runs.
+        fn drawCellSteps(
+            self: *Self,
+            pass: *RenderPass,
+            frame: *FrameState,
+            fg_count: usize,
+        ) void {
+            // First we draw our background image, if we have one.
+            // The bg image shader also draws the main bg color.
+            //
+            // Otherwise, if we don't have a background image, we
+            // draw the background color by itself in its own step.
+            //
+            // NOTE: We don't use the clear_color for this because that
+            //       would require us to do color space conversion on the
+            //       CPU-side. In the future when we have utilities for
+            //       that we should remove this step and use clear_color.
+            if (self.bg_image) |img| switch (img) {
+                .ready => |texture| pass.step(.{
+                    .pipeline = self.shaders.pipelines.bg_image,
+                    .uniforms = frame.uniforms.buffer,
+                    .buffers = &.{frame.bg_image_buffer.buffer},
+                    .textures = &.{texture},
+                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                }),
+                else => {},
+            } else {
+                pass.step(.{
+                    .pipeline = self.shaders.pipelines.bg_color,
+                    .uniforms = frame.uniforms.buffer,
+                    .buffers = &.{ null, frame.cells_bg.buffer },
+                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                });
+            }
+
+            // Then we draw any kitty images that need
+            // to be behind text AND cell backgrounds.
+            self.images.draw(
+                &self.api,
+                self.shaders.pipelines.image,
+                pass,
+                .kitty_below_bg,
+            );
+
+            // Then we draw any opaque cell backgrounds.
+            pass.step(.{
+                .pipeline = self.shaders.pipelines.cell_bg,
+                .uniforms = frame.uniforms.buffer,
+                .buffers = &.{ null, frame.cells_bg.buffer },
+                .draw = .{ .type = .triangle, .vertex_count = 3 },
+            });
+
+            // Kitty images between cell backgrounds and text.
+            self.images.draw(
+                &self.api,
+                self.shaders.pipelines.image,
+                pass,
+                .kitty_below_text,
+            );
+
+            // Text.
+            pass.step(.{
+                .pipeline = self.shaders.pipelines.cell_text,
+                .uniforms = frame.uniforms.buffer,
+                .buffers = &.{
+                    frame.cells.buffer,
+                    frame.cells_bg.buffer,
+                },
+                .textures = &.{
+                    frame.grayscale,
+                    frame.color,
+                },
+                .draw = .{
+                    .type = .triangle_strip,
+                    .vertex_count = 4,
+                    .instance_count = fg_count,
+                },
+            });
+
+            // Kitty images in front of text.
+            self.images.draw(
+                &self.api,
+                self.shaders.pipelines.image,
+                pass,
+                .kitty_above_text,
+            );
+
+            // Debug overlay. We do this before any custom shader state
+            // because our debug overlay is aligned with the grid.
+            if (self.overlay != null) self.images.draw(
+                &self.api,
+                self.shaders.pipelines.image,
+                pass,
+                .overlay,
+            );
+        }
+
+        /// What part of the terminal image differs from the last frame
+        /// drawn, and consume the record of it. Anything this cannot name
+        /// as a set of rows is `full`.
+        fn takeCacheDamage(self: *Self) CacheDamage {
+            const rows = self.cache_damage_rows.items;
+            defer {
+                @memset(rows, false);
+                self.cache_damage_full = false;
+                self.cache_last_uniforms = self.uniforms;
+                self.cache_last_cursor = self.cells.getCursorGlyph();
+            }
+
+            // State that redraws the whole window, or that no dirty row
+            // announces. It forces `full` on the frame after it ends as well:
+            // that frame is what paints over what it left behind.
+            const volatile_now = self.scroll_anim.active() or
+                self.images.kitty_placements.items.len > 0 or
+                self.images.kitty_ghosts.items.len > 0 or
+                self.overlay != null or
+                self.bg_image != null;
+            const volatile_before = self.cache_last_volatile;
+            self.cache_last_volatile = volatile_now;
+            self.cache_note_volatile = .{ volatile_now, volatile_before };
+            if (self.cache_damage_full or volatile_now or volatile_before) return .{ .full = true };
+
+            // The uniforms move the whole image (padding, colours, the
+            // scroll offset), except the cursor's: those recolour the text
+            // under a block cursor, on the cursor's own row.
+            const last_u = self.cache_last_uniforms orelse return .{ .full = true };
+            var cursor_rows: [4]?usize = @splat(null);
+            {
+                var cmp = self.uniforms;
+                cmp.cursor_pos = last_u.cursor_pos;
+                cmp.cursor_color = last_u.cursor_color;
+                cmp.bools.cursor_wide = last_u.bools.cursor_wide;
+                if (!std.meta.eql(cmp, last_u)) return .{ .full = true };
+                if (!std.meta.eql(self.uniforms, last_u)) {
+                    cursor_rows[0] = last_u.cursor_pos[1];
+                    cursor_rows[1] = self.uniforms.cursor_pos[1];
+                }
+            }
+            {
+                const now_c = self.cells.getCursorGlyph();
+                if (!std.meta.eql(now_c, self.cache_last_cursor)) {
+                    if (self.cache_last_cursor) |c| cursor_rows[2] = c.grid_pos[1];
+                    if (now_c) |c| cursor_rows[3] = c.grid_pos[1];
+                }
+            }
+            // An off-grid row (the uniform's "no cursor" value) is no row.
+            for (cursor_rows) |r| if (r) |y| {
+                if (y < rows.len) rows[y] = true;
+            };
+
+            // Rows to strips. Rows closer than two margins share a strip,
+            // because their strips would overlap anyway.
+            const cell_h: u32 = self.size.cell.height;
+            const pad_top: u32 = self.size.padding.top;
+            const screen_h: u32 = self.size.screen.height;
+            const margin: u32 = self.config.custom_shader_cache_margin;
+            if (cell_h == 0) return .{ .full = true };
+            const gap: usize = (2 * margin) / cell_h + 1;
+
+            var d: CacheDamage = .{};
+            var y: usize = 0;
+            while (y < rows.len) {
+                if (!rows[y]) {
+                    y += 1;
+                    continue;
+                }
+                var last = y;
+                var z = y + 1;
+                while (z < rows.len and z - last <= gap) : (z += 1) {
+                    if (rows[z]) last = z;
+                }
+                const top: u32 = if (y == 0) 0 else (pad_top + @as(u32, @intCast(y)) * cell_h) -| margin;
+                const bottom: u32 = if (last + 1 >= rows.len)
+                    screen_h
+                else
+                    @min(screen_h, pad_top + @as(u32, @intCast(last + 1)) * cell_h + margin);
+                if (d.n == cache_max_bands) {
+                    // Too many strips: one strip from the first to the last.
+                    d.bands[0].bottom = bottom;
+                    d.n = 1;
+                    var w = last + 1;
+                    while (w < rows.len) : (w += 1) if (rows[w]) {
+                        d.bands[0].bottom = if (w + 1 >= rows.len)
+                            screen_h
+                        else
+                            @min(screen_h, pad_top + @as(u32, @intCast(w + 1)) * cell_h + margin);
+                    };
+                    break;
+                }
+                d.bands[d.n] = .{ .top = @min(top, screen_h), .bottom = bottom };
+                d.n += 1;
+                y = last + 1;
+            }
+            // Nearly everything: the bookkeeping buys nothing.
+            var px: u64 = 0;
+            for (d.bands[0..d.n]) |b| px += b.bottom - b.top;
+            if (px * 10 >= @as(u64, screen_h) * 9) return .{ .full = true };
+            return d;
+        }
+
+        /// The box a live cursor effect can draw in, as a GL scissor: the
+        /// cursor as it is, the ends of its last move, and where it was at
+        /// each recent mode change or pulse, grown by the configured reach.
+        /// Shader coordinates here are GL's (+y up, a rect is left, top, w, h).
+        fn cacheFxBox(self: *const Self, width: u32, height: u32) [4]u32 {
+            const u = &self.custom_shader_uniforms;
+            const w_f: f32 = @floatFromInt(width);
+            const h_f: f32 = @floatFromInt(height);
+            var x0: f32 = w_f;
+            var y0: f32 = h_f;
+            var x1: f32 = 0;
+            var y1: f32 = 0;
+            const Acc = struct {
+                fn add(r: [4]f32, ax0: *f32, ay0: *f32, ax1: *f32, ay1: *f32) void {
+                    if (r[2] <= 0 and r[3] <= 0) return; // never set
+                    ax0.* = @min(ax0.*, r[0]);
+                    ax1.* = @max(ax1.*, r[0] + r[2]);
+                    ay1.* = @max(ay1.*, r[1]);
+                    ay0.* = @min(ay0.*, r[1] - r[3]);
+                }
+            };
+            // Longer than any effect lasts; the live window is 1.3 s.
+            const recent: f32 = 2.0;
+            Acc.add(u.current_cursor, &x0, &y0, &x1, &y1);
+            if (u.time - u.time_cursor_move < recent) {
+                Acc.add(u.cursor_move_from, &x0, &y0, &x1, &y1);
+                Acc.add(u.cursor_move_to, &x0, &y0, &x1, &y1);
+            }
+            for (u.cursor_fx_event, u.cursor_fx_event_rect) |ev, rect| {
+                if (u.time - ev[0] < recent) Acc.add(rect, &x0, &y0, &x1, &y1);
+            }
+            if (x1 <= x0 or y1 <= y0) return .{ 0, 0, width, height };
+            const reach = self.config.custom_shader_cache_fx_reach *
+                @as(f32, @floatFromInt(self.size.cell.height));
+            x0 = std.math.clamp(@floor(x0 - reach), 0, w_f);
+            y0 = std.math.clamp(@floor(y0 - reach), 0, h_f);
+            x1 = std.math.clamp(@ceil(x1 + reach), 0, w_f);
+            y1 = std.math.clamp(@ceil(y1 + reach), 0, h_f);
+            if (x1 <= x0 or y1 <= y0) return .{ 0, 0, width, height };
+            return .{
+                @intFromFloat(x0),
+                @intFromFloat(y0),
+                @intFromFloat(x1 - x0),
+                @intFromFloat(y1 - y0),
+            };
+        }
+
+        /// `custom-shader-cache`: draw a frame by redoing only what changed.
+        ///
+        /// Three layers, each kept from the last frame:
+        ///
+        ///   cache[0]        the terminal image
+        ///   cache[1..n-1]   the output of each static shader
+        ///   frame.target    the output of the last (animated) shader
+        ///
+        /// Every pass draws exactly what the uncached path draws, clipped to
+        /// the strips of the window that changed. That is correct as long as
+        /// nothing outside the strips would have come out different, which is
+        /// what `takeCacheDamage` and the margin are for.
+        fn drawFrameCached(
+            self: *Self,
+            frame: *FrameState,
+            state: *CustomShaderState,
+            frame_ctx: anytype,
+            fg_count: usize,
+        ) !void {
+            const pipelines = self.shaders.post_pipelines;
+            const n = pipelines.len;
+            const width: u32 = self.size.screen.width;
+            const height: u32 = self.size.screen.height;
+            const debug = self.config.custom_shader_cache_debug;
+
+            if (try state.ensureCache(self.api, n, width, height, debug == .verify)) {
+                self.cache_damage_full = true;
+                self.cache_final_settled = false;
+            }
+
+            const damage = self.takeCacheDamage();
+            try state.uniforms.sync(&.{self.custom_shader_uniforms});
+
+            // A strip as a GL scissor: origin bottom-left, and the image is
+            // upright (row 0 at the top of the window is the highest y).
+            const Scissor = struct {
+                fn of(b: CacheBand, w: u32, h: u32) [4]u32 {
+                    return .{ 0, h - b.bottom, w, b.bottom - b.top };
+                }
+            };
+            const whole: [1]CacheBand = .{.{ .top = 0, .bottom = height }};
+            const bands: []const CacheBand = if (damage.full) &whole else damage.bands[0..damage.n];
+
+            // 1. The terminal image and the static shaders, over the strips.
+            for (bands) |b| {
+                const scissor: ?[4]u32 = if (damage.full) null else Scissor.of(b, width, height);
+                {
+                    var pass = frame_ctx.renderPass(&.{.{
+                        .target = .{ .texture = state.cache[0].? },
+                        .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                        .scissor = scissor,
+                    }});
+                    defer pass.complete();
+                    self.drawCellSteps(&pass, frame, fg_count);
+                }
+                for (pipelines[0 .. n - 1], 0..) |pipeline, i| {
+                    var pass = frame_ctx.renderPass(&.{.{
+                        .target = .{ .texture = state.cache[i + 1].? },
+                        .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                        .scissor = scissor,
+                    }});
+                    defer pass.complete();
+                    pass.step(.{
+                        .pipeline = pipeline,
+                        .uniforms = state.uniforms.buffer,
+                        .textures = &.{state.cache[i].?},
+                        .samplers = &.{state.sampler},
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                    });
+                }
+            }
+
+            // 2. The last shader.
+            //
+            // Without a reach (or outside `cursor` animation): over the whole
+            // window while it animates and for one frame after it stops.
+            //
+            // With `custom-shader-cache-fx-reach` in `cursor` animation: over
+            // a box around the cursor's recent events instead, plus the box
+            // the last frame drew in, plus the strips. A cursor effect then
+            // costs a few cells per frame, not the window.
+            //
+            // Either way the whole window whenever a uniform the shader can
+            // see changed that is not the clock or the cursor's.
+            const boxed = self.config.custom_shader_animation == .cursor and
+                self.config.custom_shader_cache_fx_reach > 0;
+            const live = switch (self.config.custom_shader_animation) {
+                .cursor => self.cursorFxLive(),
+                .false => false,
+                .true, .always => true,
+            };
+            const uniforms_same = same: {
+                const last = self.cache_last_post_uniforms orelse break :same false;
+                var cmp = self.custom_shader_uniforms;
+                cmp.time = last.time;
+                cmp.time_delta = last.time_delta;
+                cmp.frame = last.frame;
+                cmp.frame_rate = last.frame_rate;
+                cmp.date = last.date;
+                if (boxed) {
+                    // The cursor's own uniforms only matter inside the box.
+                    cmp.current_cursor = last.current_cursor;
+                    cmp.previous_cursor = last.previous_cursor;
+                    cmp.current_cursor_color = last.current_cursor_color;
+                    cmp.previous_cursor_color = last.previous_cursor_color;
+                    cmp.current_cursor_style = last.current_cursor_style;
+                    cmp.previous_cursor_style = last.previous_cursor_style;
+                    cmp.cursor_visible = last.cursor_visible;
+                    cmp.cursor_change_time = last.cursor_change_time;
+                    cmp.cursor_move_from = last.cursor_move_from;
+                    cmp.cursor_move_to = last.cursor_move_to;
+                    cmp.time_cursor_move = last.time_cursor_move;
+                    cmp.time_cursor_mode = last.time_cursor_mode;
+                    cmp.time_cursor_pulse = last.time_cursor_pulse;
+                    cmp.cursor_fx_event = last.cursor_fx_event;
+                    cmp.cursor_fx_event_color = last.cursor_fx_event_color;
+                    cmp.cursor_fx_event_rect = last.cursor_fx_event_rect;
+                }
+                break :same std.meta.eql(cmp, last);
+            };
+            self.cache_last_post_uniforms = self.custom_shader_uniforms;
+
+            const box_now: ?[4]u32 = if (boxed and live) self.cacheFxBox(width, height) else null;
+            const box_prev = self.cache_fx_box;
+            const final_full = !self.cache_final_settled or !uniforms_same or damage.full or
+                (live and !boxed);
+
+            var final_rects: [cache_max_bands + 2]?[4]u32 = @splat(null);
+            var final_n: usize = 0;
+            if (final_full) {
+                final_n = 1; // one pass, no scissor
+            } else {
+                for (damage.bands[0..damage.n]) |b| {
+                    final_rects[final_n] = Scissor.of(b, width, height);
+                    final_n += 1;
+                }
+                if (box_now) |r| {
+                    final_rects[final_n] = r;
+                    final_n += 1;
+                }
+                if (box_prev) |r| if (box_now == null or !std.meta.eql(r, box_now.?)) {
+                    final_rects[final_n] = r;
+                    final_n += 1;
+                };
+            }
+            for (final_rects[0..final_n]) |scissor| {
+                var pass = frame_ctx.renderPass(&.{.{
+                    .target = .{ .target = frame.target },
+                    .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                    .scissor = scissor,
+                }});
+                defer pass.complete();
+                pass.step(.{
+                    .pipeline = pipelines[n - 1],
+                    .uniforms = state.uniforms.buffer,
+                    .textures = &.{state.cache[n - 1].?},
+                    .samplers = &.{state.sampler},
+                    .draw = .{ .type = .triangle, .vertex_count = 3 },
+                });
+            }
+            // The target changed inside those rectangles and nowhere else,
+            // which is all a framebuffer that kept the last frame needs
+            // (`gtk-damage-tracking`).
+            if (comptime @hasDecl(GraphicsAPI, "setFrameDamage")) {
+                if (!final_full) self.api.setFrameDamage(final_rects[0..final_n]);
+                self.api.present_verify = debug == .verify;
+            }
+            if (boxed) {
+                // After any frame the target is right everywhere except
+                // (possibly) inside the box an effect was just drawn in.
+                self.cache_final_settled = true;
+                self.cache_fx_box = box_now;
+            } else {
+                if (final_full) self.cache_final_settled = !live;
+                self.cache_fx_box = null;
+            }
+
+            if (debug == .off) return;
+
+            self.cache_history[self.cache_history_i % self.cache_history.len] = .{
+                .full = damage.full,
+                .bands = @intCast(damage.n),
+                .first_top = if (damage.n > 0) damage.bands[0].top else 0,
+                .last_bottom = if (damage.n > 0) damage.bands[damage.n - 1].bottom else 0,
+                .volatile_now = self.cache_note_volatile[0],
+                .volatile_before = self.cache_note_volatile[1],
+                .scroll_off = self.uniforms.scroll_anim[0],
+                .live = live,
+                .final_full = final_full,
+                .final_n = @intCast(final_n),
+                .uniforms_same = uniforms_same,
+            };
+            self.cache_history_i += 1;
+
+            // Stats, and the uncached frame to compare against.
+            const st = &self.cache_stats;
+            st.frames += 1;
+            if (damage.full) st.cells_full += 1 else if (damage.n > 0) st.cells_part += 1 else st.cells_none += 1;
+            if (final_full) st.final_full += 1 else if (final_n > 0) st.final_part += 1 else st.final_none += 1;
+            if (final_full) {
+                st.final_share += 1;
+            } else {
+                var fpx: u64 = 0;
+                for (final_rects[0..final_n]) |r| fpx += @as(u64, r.?[2]) * r.?[3];
+                st.final_share += @min(1.0, @as(f64, @floatFromInt(fpx)) /
+                    @as(f64, @floatFromInt(@max(@as(u64, width) * height, 1))));
+            }
+            {
+                var px: u64 = 0;
+                for (bands) |b| px += b.bottom - b.top;
+                st.share += @as(f64, @floatFromInt(px)) / @as(f64, @floatFromInt(@max(height, 1)));
+            }
+
+            if (debug == .verify) verify: {
+                {
+                    var pass = frame_ctx.renderPass(&.{.{
+                        .target = .{ .texture = state.verify[0].? },
+                        .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                    }});
+                    defer pass.complete();
+                    self.drawCellSteps(&pass, frame, fg_count);
+                }
+                for (pipelines, 0..) |pipeline, i| {
+                    var pass = frame_ctx.renderPass(&.{.{
+                        .target = if (i < n - 1)
+                            .{ .texture = state.verify[i + 1].? }
+                        else
+                            .{ .target = state.verify_target.? },
+                        .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                    }});
+                    defer pass.complete();
+                    pass.step(.{
+                        .pipeline = pipeline,
+                        .uniforms = state.uniforms.buffer,
+                        .textures = &.{state.verify[i].?},
+                        .samplers = &.{state.sampler},
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                    });
+                }
+                const bytes: usize = @as(usize, width) * height * 4;
+                self.cache_verify_buf.resize(self.alloc, bytes * 2) catch break :verify;
+                const got = self.cache_verify_buf.items[0..bytes];
+                const want = self.cache_verify_buf.items[bytes..];
+                self.api.readTarget(frame.target, got) catch break :verify;
+                self.api.readTarget(state.verify_target.?, want) catch break :verify;
+                st.verified += 1;
+                if (std.mem.eql(u8, got, want)) break :verify;
+                st.mismatched += 1;
+                // Which rows of the window differ (readback is bottom-up).
+                var first: ?u32 = null;
+                var last_row: u32 = 0;
+                var diff_px: u64 = 0;
+                var max_delta: u32 = 0;
+                const stride: usize = @as(usize, width) * 4;
+                for (0..height) |gy| {
+                    const a = got[gy * stride ..][0..stride];
+                    const b = want[gy * stride ..][0..stride];
+                    if (std.mem.eql(u8, a, b)) continue;
+                    const from_top: u32 = height - 1 - @as(u32, @intCast(gy));
+                    if (first == null or from_top < first.?) first = from_top;
+                    last_row = @max(last_row, from_top);
+                    var x: usize = 0;
+                    while (x < stride) : (x += 4) {
+                        var differs = false;
+                        for (0..4) |c| {
+                            const dlt = @abs(@as(i32, a[x + c]) - @as(i32, b[x + c]));
+                            if (dlt > 0) differs = true;
+                            max_delta = @max(max_delta, dlt);
+                        }
+                        if (differs) diff_px += 1;
+                    }
+                }
+                log.warn(
+                    "shader-cache MISMATCH px={} max_delta={} rows_px={}..{} (cell rows {}..{}) damage full={} bands={} final_full={} live={}",
+                    .{
+                        diff_px,                                                                      max_delta,
+                        first orelse 0,                                                               last_row,
+                        ((first orelse 0) -| self.size.padding.top) / @max(self.size.cell.height, 1), (last_row -| self.size.padding.top) / @max(self.size.cell.height, 1),
+                        damage.full,                                                                  damage.n,
+                        final_full,                                                                   live,
+                    },
+                );
+                for (damage.bands[0..damage.n]) |b| log.warn("  band px {}..{}", .{ b.top, b.bottom });
+                {
+                    // Where across, and what the last shader was given.
+                    var min_x: usize = width;
+                    var max_x: usize = 0;
+                    for (0..height) |gy| {
+                        const ra = got[gy * stride ..][0..stride];
+                        const rb = want[gy * stride ..][0..stride];
+                        if (std.mem.eql(u8, ra, rb)) continue;
+                        var x: usize = 0;
+                        while (x < stride) : (x += 4) {
+                            if (!std.mem.eql(u8, ra[x..][0..4], rb[x..][0..4])) {
+                                min_x = @min(min_x, x / 4);
+                                max_x = @max(max_x, x / 4);
+                            }
+                        }
+                    }
+                    for (0..self.cache_history.len) |back| {
+                        if (back >= self.cache_history_i) break;
+                        const h = self.cache_history[(self.cache_history_i - 1 - back) % self.cache_history.len];
+                        log.warn("  frame -{}: full={} bands={} px {}..{} vol={}/{} scroll_off={d:.1} live={} final_full={} final_n={} uni_same={}", .{
+                            back,           h.full,            h.bands,      h.first_top, h.last_bottom,
+                            h.volatile_now, h.volatile_before, h.scroll_off, h.live,      h.final_full,
+                            h.final_n,      h.uniforms_same,
+                        });
+                    }
+                    if (max_x >= min_x and first != null) {
+                        const gy: usize = height - 1 - first.?;
+                        const o = gy * stride + min_x * 4;
+                        log.warn("  first px got={any} want={any} cursor_uniform={any} cursor_glyph_row={any}", .{
+                            got[o..][0..4].*,         want[o..][0..4].*,
+                            self.uniforms.cursor_pos, if (self.cells.getCursorGlyph()) |c| c.grid_pos else null,
+                        });
+                    }
+                    const u = &self.custom_shader_uniforms;
+                    log.warn("  cols_px {}..{} box_now={any} box_prev={any} t={d:.3} move_t={d:.3} cur={any} from={any} to={any}", .{
+                        min_x,            max_x,              box_now,          box_prev,
+                        u.time,           u.time_cursor_move, u.current_cursor, u.cursor_move_from,
+                        u.cursor_move_to,
+                    });
+                }
+            }
+
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const since = st.since orelse {
+                st.since = now;
+                return;
+            };
+            const ms = @divTrunc(since.durationTo(now).nanoseconds, std.time.ns_per_ms);
+            if (ms < 2000) return;
+            log.info(
+                "shader-cache {}ms frames={} chain none/part/full={}/{}/{} final none/part/full={}/{}/{} mean_share={d:.3} final_share={d:.3} verified={} mismatched={}",
+                .{
+                    ms,                                            st.frames,
+                    st.cells_none,                                 st.cells_part,
+                    st.cells_full,                                 st.final_none,
+                    st.final_part,                                 st.final_full,
+                    st.share / @as(f64, @floatFromInt(st.frames)), st.final_share / @as(f64, @floatFromInt(st.frames)),
+                    st.verified,                                   st.mismatched,
+                },
+            );
+            st.* = .{ .since = now };
         }
 
         // Callback from the graphics API when a frame is completed.
@@ -2046,6 +4106,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn changeConfig(self: *Self, config: *DerivedConfig) !void {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
+
+            // custom-shader-cache: anything may look different now.
+            self.cache_damage_full = true;
+            self.cache_final_settled = false;
+            self.cache_fx_box = null;
 
             // We always redo the font shaper in case font features changed. We
             // could check to see if there was an actual config change but this is
@@ -2301,6 +4366,90 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
         }
 
+        /// Record a mode change (kind 0), pulse (kind 1) or boom (kind 2,
+        /// `arg` = its power) in the uniforms' event ring, overwriting the
+        /// oldest, so effects stack.
+        fn pushCursorFxEvent(
+            self: *Self,
+            kind: f32,
+            arg: f32,
+            style: i32,
+            color: [4]f32,
+            rect: [4]f32,
+        ) void {
+            const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
+            const i = self.cursor_fx_next;
+            uniforms.cursor_fx_event[i] = .{ uniforms.time, @floatFromInt(style), kind, arg };
+            uniforms.cursor_fx_event_color[i] = color;
+            uniforms.cursor_fx_event_rect[i] = rect;
+            self.cursor_fx_next = (i + 1) % shadertoy.cursor_fx_events;
+        }
+
+        /// This fork's cursor-effect uniforms, from the cursor as drawn this
+        /// frame. Unlike iTimeCursorChange, a MOVE is only the cell
+        /// changing (a bar/block width change is not one) and a MODE change
+        /// is only the style or colour changing, so an effect for one is
+        /// never cut short by the other: typing right after `i` keeps the
+        /// insert ripple.
+        ///
+        /// A move while the scroll animation runs is a snap, not a move:
+        /// the cursor is riding the text, and a smear there would fly over
+        /// every scrolled row. Snapping also ends any smear in flight.
+        fn updateCursorFx(
+            self: *Self,
+            cell_pos: [2]u16,
+            rect: [4]f32,
+            color: [4]f32,
+            now: std.Io.Timestamp,
+        ) void {
+            const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
+            const style = uniforms.current_cursor_style;
+
+            if (self.cursor_fx_cell) |old| {
+                if (old[0] != cell_pos[0] or old[1] != cell_pos[1]) {
+                    // Or the wheel is turning: between an application's
+                    // scroll batches the animation can be idle, and with
+                    // `scroll-animation-wheel-snap` it never runs at all, so
+                    // a flick smeared the cursor all over the screen
+                    // (2026-10-14).
+                    const wheel_recent = if (self.wheel_ts) |t|
+                        t.durationTo(now).nanoseconds <= wheel_repaint_ms * std.time.ns_per_ms
+                    else
+                        false;
+                    const riding = self.scroll_anim.active() or wheel_recent;
+                    if (riding) {
+                        uniforms.cursor_move_from = rect;
+                        uniforms.time_cursor_move = -1000;
+                    } else {
+                        uniforms.cursor_move_from = uniforms.cursor_move_to;
+                        uniforms.time_cursor_move = uniforms.time;
+                        self.cursor_fx_last_event = now;
+                    }
+                    if (self.config.scroll_trace) log.info(
+                        "cursorfx move {s} ({},{})->({},{})",
+                        .{ if (riding) "snap" else "smear", old[0], old[1], cell_pos[0], cell_pos[1] },
+                    );
+                }
+            } else {
+                uniforms.cursor_move_from = rect;
+            }
+            self.cursor_fx_cell = cell_pos;
+            uniforms.cursor_move_to = rect;
+
+            if (self.cursor_fx_mode) |old| {
+                if (old.style != style or !std.meta.eql(old.color, color)) {
+                    uniforms.time_cursor_mode = uniforms.time;
+                    self.cursor_fx_last_event = now;
+                    self.pushCursorFxEvent(0, 0, style, color, rect);
+                    if (self.config.scroll_trace) log.info(
+                        "cursorfx mode style {}->{} color {d:.3}->{d:.3} t={d:.3}",
+                        .{ old.style, style, old.color[0], color[0], uniforms.time },
+                    );
+                }
+            }
+            self.cursor_fx_mode = .{ .style = style, .color = color };
+        }
+
         /// Update per-frame custom shader uniforms.
         ///
         /// This should be called exactly once per frame, inside `drawFrame`.
@@ -2410,6 +4559,49 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     uniforms.current_cursor_color = cursor_color;
                     uniforms.cursor_change_time = uniforms.time;
                 }
+
+                self.updateCursorFx(
+                    .{ cursor.grid_pos[0], cursor.grid_pos[1] },
+                    new_cursor,
+                    cursor_color,
+                    now,
+                );
+            }
+
+            if (self.cursor_fx_pulse_pending) {
+                self.cursor_fx_pulse_pending = false;
+                uniforms.time_cursor_pulse = uniforms.time;
+                self.pushCursorFxEvent(
+                    1,
+                    0,
+                    uniforms.current_cursor_style,
+                    uniforms.current_cursor_color,
+                    uniforms.current_cursor,
+                );
+            }
+
+            if (self.cursor_fx_boom_pending) |boom| {
+                self.cursor_fx_boom_pending = null;
+                // At the named cell, as a cell-sized rect in the same
+                // convention as the cursor's (left, +Y edge, w, h); else at
+                // the cursor.
+                const rect: [4]f32 = if (boom.col != null and boom.row != null) r: {
+                    const x: f32 = @floatFromInt(@as(u32, boom.col.?) * cell.width + padding.left);
+                    var y: f32 = @floatFromInt(@as(u32, boom.row.?) * cell.height + padding.top);
+                    if (GraphicsAPI.custom_shader_y_is_down) {
+                        y += @floatFromInt(cell.height);
+                    } else {
+                        y = @as(f32, @floatFromInt(screen.height)) - y;
+                    }
+                    break :r .{ x, y, @floatFromInt(cell.width), @floatFromInt(cell.height) };
+                } else uniforms.current_cursor;
+                self.pushCursorFxEvent(
+                    2,
+                    @floatFromInt(@max(boom.power, 1)),
+                    uniforms.current_cursor_style,
+                    uniforms.current_cursor_color,
+                    rect,
+                );
             }
 
             // Update focus uniforms
@@ -2516,6 +4708,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 new_size.rows = state.rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
+                self.clearScrollGhosts();
 
                 // Update our uniforms accordingly, otherwise
                 // our background cells will be out of place.
@@ -2523,6 +4716,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             const rebuild = state.dirty == .full or grid_size_diff;
+
+            // custom-shader-cache: note what is about to change.
+            if (self.cache_damage_rows.items.len != state.rows) {
+                try self.cache_damage_rows.resize(self.alloc, state.rows);
+                @memset(self.cache_damage_rows.items, false);
+                self.cache_damage_full = true;
+            }
+            if (rebuild) self.cache_damage_full = true;
+            {
+                const has_links = links.count() > 0;
+                if (has_links or self.cache_had_links) self.cache_damage_full = true;
+                self.cache_had_links = has_links;
+            }
+
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -2610,6 +4817,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Unmark the dirty state in our render state.
                 dirty.* = false;
+                self.cache_damage_rows.items[y] = true;
 
                 self.rebuildRow(
                     y,
