@@ -167,6 +167,46 @@ pub const Command = union(Key) {
     /// Kitty desktop notifications (OSC 99)
     kitty_desktop_notification: KittyDesktopNotification,
 
+    /// OSC 777;cursor-pulse (this fork). Asks custom shaders to play a
+    /// one-shot effect at the cursor: iTimeCursorPulse. tmux sends it
+    /// when a pane gains focus.
+    cursor_pulse,
+
+    /// OSC 777;cursor-boom[;power[;col;row]] (this fork). Asks custom
+    /// shaders to play an explosion: at the cursor, or at the given cell
+    /// (0-based, in the terminal's own grid). The shell's `rm` and yazi's
+    /// `D` send it.
+    cursor_boom: CursorBoom,
+
+    /// OSC 777;wheel-ack;N (this fork). The application has finished
+    /// handling N more of the wheel events it was sent. Lets the terminal
+    /// stop queueing wheel events faster than they are drawn -- see
+    /// `Surface.wheelBudget`.
+    wheel_ack: WheelAck,
+
+    pub const WheelAck = struct { n: u32 };
+
+    pub const CursorBoom = struct {
+        /// 1 = a small pop, 2 = a big blast.
+        power: u8 = 1,
+        col: ?u16 = null,
+        row: ?u16 = null,
+
+        pub const C = extern struct {
+            power: u8,
+            col: i32,
+            row: i32,
+        };
+
+        pub fn cval(self: CursorBoom) C {
+            return .{
+                .power = self.power,
+                .col = if (self.col) |v| v else -1,
+                .row = if (self.row) |v| v else -1,
+            };
+        }
+    };
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const KittyClipboardProtocol = parsers.kitty_clipboard_protocol.OSC;
@@ -206,6 +246,9 @@ pub const Command = union(Key) {
             "kitty_dnd_protocol",
             "context_signal",
             "kitty_desktop_notification",
+            "cursor_pulse",
+            "cursor_boom",
+            "wheel_ack",
         },
     );
 
@@ -454,6 +497,9 @@ pub const Parser = struct {
             .kitty_dnd_protocol,
             .kitty_desktop_notification,
             .context_signal,
+            .cursor_pulse,
+            .cursor_boom,
+            .wheel_ack,
             => {},
         }
 

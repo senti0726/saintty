@@ -450,6 +450,12 @@ pub const Handler = struct {
             },
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.terminal.decaln(),
+            .cursor_pulse => self.terminal.cursor_pulse +%= 1,
+            .cursor_boom => {
+                self.terminal.cursor_boom +%= 1;
+                self.terminal.cursor_boom_last = value;
+            },
+            .wheel_ack => self.terminal.wheel_acked +%= value,
             .full_reset => {
                 self.terminal.fullReset();
 

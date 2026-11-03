@@ -26,6 +26,7 @@ const ApprtSurface = @import("../Surface.zig");
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Config = @import("config.zig").Config;
+const DamageGLArea = @import("damage_gl_area.zig").DamageGLArea;
 const ResizeOverlay = @import("resize_overlay.zig").ResizeOverlay;
 const SearchOverlay = @import("search_overlay.zig").SearchOverlay;
 const KeyStateOverlay = @import("key_state_overlay.zig").KeyStateOverlay;
@@ -734,6 +735,36 @@ pub const Surface = extern struct {
         /// stops scrolling.
         pending_horizontal_scroll_reset: ?c_uint = null,
 
+        /// Momentum ("fling") state. GTK's scroll controller carries the
+        /// `kinetic` flag, so it emits ::decelerate with a velocity in px/s
+        /// when a touchpad gesture ends and we do not have to estimate one
+        /// ourselves. We then decay that velocity on the frame clock and feed
+        /// the result back through the normal scroll path.
+        ///
+        /// Velocity is in pixels/second, in GTK's sign convention (the same
+        /// one `scroll` delivers, i.e. before the inversion applied in
+        /// ecMouseScrollVertical).
+        momentum_velocity: f64 = 0.0,
+
+        /// Frame-clock tick driving the fling, and the timestamp of the last
+        /// frame we integrated. Non-null id means a fling is in flight.
+        momentum_tick: ?c_uint = null,
+        momentum_last_us: i64 = 0,
+
+        /// Frame time at which a fling was paused because the user put their
+        /// fingers back down. Velocity is preserved across the gesture so a
+        /// second flick *stacks* on the first, but it is decayed by however
+        /// long the gesture took, so stacking only rewards a quick follow-up.
+        /// 0 means there is no paused fling.
+        momentum_paused_us: i64 = 0,
+
+        /// Recorded touchpad samples being replayed for testing, the index of
+        /// the next one, and the timer feeding them. See
+        /// `scroll-input-script`.
+        replay: ?[]f64 = null,
+        replay_idx: usize = 0,
+        replay_timer: c_uint = 0,
+
         overrides: struct {
             command: ?configpkg.Command = null,
             shell_integration: ?configpkg.Config.ShellIntegration = null,
@@ -816,6 +847,17 @@ pub const Surface = extern struct {
                 }
             }
         }
+    }
+
+    /// gtk-damage-tracking: the GL area keeps its last frame and redraws
+    /// only what changed. Only once the core surface exists, because the
+    /// widget then draws with the GL functions the renderer loaded.
+    fn syncDamageTracking(self: *Self) void {
+        const priv = self.private();
+        const area = gobject.ext.cast(DamageGLArea, priv.gl_area) orelse return;
+        const want = priv.core_surface != null and
+            if (priv.config) |c| c.get().@"gtk-damage-tracking" else false;
+        area.setDamageTracking(want);
     }
 
     /// Force the surface to redraw itself. Ghostty often will only redraw
@@ -1924,6 +1966,10 @@ pub const Surface = extern struct {
             priv.progress_bar_timer = null;
         }
 
+        // A momentum fling must not outlive the widget: its tick callback
+        // dereferences core_surface every frame.
+        self.momentumStop();
+
         if (priv.idle_rechild) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove idle source", .{});
@@ -2355,6 +2401,8 @@ pub const Surface = extern struct {
     ) callconv(.c) void {
         const priv = self.private();
         const config = if (priv.config) |c| c.get() else return;
+
+        self.syncDamageTracking();
 
         // resize-overlay-duration
         {
@@ -3060,6 +3108,267 @@ pub const Surface = extern struct {
         self.private().precision_scroll = false;
     }
 
+    /// Stop any in-flight momentum scroll. Safe to call when none is running.
+    fn momentumStop(self: *Self) void {
+        const priv = self.private();
+        self.momentumCancelTick();
+        priv.momentum_velocity = 0.0;
+        priv.momentum_paused_us = 0;
+    }
+
+    /// Remove the tick but keep the velocity, so it can be stacked onto.
+    fn momentumPause(self: *Self) void {
+        const priv = self.private();
+        if (priv.momentum_tick == null and priv.momentum_velocity == 0.0) return;
+        self.momentumCancelTick();
+        priv.momentum_paused_us = self.momentumNowUs();
+    }
+
+    fn momentumCancelTick(self: *Self) void {
+        const priv = self.private();
+        if (priv.momentum_tick) |v| {
+            self.as(gtk.Widget).removeTickCallback(v);
+            priv.momentum_tick = null;
+        }
+        priv.momentum_last_us = 0;
+    }
+
+    /// Monotonic microseconds from the widget's frame clock, or 0 if the
+    /// widget is not realized (in which case residual decay is skipped).
+    fn momentumNowUs(self: *Self) i64 {
+        const clock = self.as(gtk.Widget).getFrameClock() orelse return 0;
+        return clock.getFrameTime();
+    }
+
+    /// GTK emits ::decelerate when a continuous (touchpad) scroll gesture
+    /// ends, giving us the gesture's exit velocity in px/s. That is the
+    /// "fingers lifted" signal: without the kinetic flag there is none on
+    /// Wayland, and we would have to infer it from a gap between events.
+    fn ecMouseScrollVerticalDecelerate(
+        _: *gtk.EventControllerScroll,
+        _: f64,
+        vel_y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        if (priv.core_surface == null) return;
+
+        // Respect the config. Off by default while this is experimental.
+        const enabled = if (priv.config) |c| c.get().@"mouse-scroll-momentum" else false;
+        if (!enabled) return;
+
+        const tau = self.momentumTau();
+
+        // Stack onto whatever is left of a previous fling, rather than
+        // replacing it. Flicking repeatedly should build speed the way it does
+        // on a phone; before this, a second flick killed the first.
+        //
+        // The residual is decayed by how long the new gesture took, so it is
+        // as if the old fling had kept coasting underneath the finger. A quick
+        // follow-up stacks nearly all of it; a flick seconds later stacks
+        // nothing, which is what makes this safe to do unconditionally.
+        const residual = residual: {
+            if (priv.momentum_velocity == 0.0) break :residual 0.0;
+            const paused_us = priv.momentum_paused_us;
+            const now_us = self.momentumNowUs();
+            if (paused_us == 0 or now_us <= paused_us) break :residual priv.momentum_velocity;
+            const gap: f64 = @as(f64, @floatFromInt(now_us - paused_us)) / std.time.us_per_s;
+            break :residual priv.momentum_velocity * @exp(-gap / tau);
+        };
+
+        self.momentumCancelTick();
+
+        // Same sign convention as vel_y, so opposing flicks cancel naturally.
+        const combined = std.math.clamp(
+            residual + vel_y,
+            -momentum_max_velocity,
+            momentum_max_velocity,
+        );
+
+        // Logged because this is the signal the whole feature depends on:
+        // if a fling feels wrong, the first question is whether GTK emitted
+        // ::decelerate at all and with what velocity. Without this, "nothing
+        // happened" is ambiguous between "never fired" and "decayed too fast".
+        log.debug(
+            "scroll momentum: vel_y={d:.0} residual={d:.0} combined={d:.0} px/s tau={d:.2}s",
+            .{ vel_y, residual, combined, tau },
+        );
+
+        priv.momentum_velocity = combined;
+        priv.momentum_paused_us = 0;
+
+        if (@abs(combined) < momentum_min_velocity) {
+            priv.momentum_velocity = 0.0;
+            return;
+        }
+
+        // 0 means "no baseline yet"; the first tick establishes it.
+        priv.momentum_last_us = 0;
+        priv.momentum_tick = self.as(gtk.Widget).addTickCallback(
+            momentumTickCallback,
+            null,
+            null,
+        );
+    }
+
+    /// Below this speed (px/s) a fling is over. Slow enough to coast to a
+    /// gentle stop rather than cutting out while still visibly moving.
+    const momentum_min_velocity: f64 = 8.0;
+
+    /// Ceiling on stacked velocity (px/s). Without it, repeated flicks compound
+    /// without bound and one more flick sends the viewport into orbit.
+    const momentum_max_velocity: f64 = 30_000.0;
+
+    /// Decay time constant in seconds: velocity falls by 1/e every tau, so a
+    /// fling runs for roughly 4-5x tau before crossing the stop threshold.
+    /// Configurable because "how far a flick should carry" is pure taste and
+    /// nobody should rebuild a terminal to adjust it.
+    fn momentumTau(self: *Self) f64 {
+        const priv = self.private();
+        const config = priv.config orelse return 0.45;
+        return @max(0.01, config.get().@"mouse-scroll-momentum-decay");
+    }
+
+    /// Integrate the fling once per frame and feed the resulting pixel delta
+    /// through the ordinary scroll path.
+    ///
+    /// Threading: frame-clock ticks run on the GTK main thread, exactly like
+    /// the input events in ecMouseScrollVertical, so calling scrollCallback
+    /// from here is no different from calling it from a real scroll event.
+    /// This is why momentum needs no locking of its own.
+    fn momentumTickCallback(
+        widget: *gtk.Widget,
+        frame_clock: *gdk.FrameClock,
+        _: ?*anyopaque,
+    ) callconv(.c) c_int {
+        const self: *Self = gobject.ext.cast(Self, widget) orelse return 0;
+        const priv = self.private();
+
+        const surface = priv.core_surface orelse {
+            self.momentumStop();
+            return 0;
+        };
+
+        // The frame clock's own timestamp (microseconds, monotonic) rather
+        // than a wall clock: it is what the frame is actually scheduled
+        // against, and it does not jump if the system clock is adjusted.
+        const now_us = frame_clock.getFrameTime();
+        if (priv.momentum_last_us == 0) {
+            // First frame of the fling: we have no interval to integrate over
+            // yet, so just establish the baseline.
+            priv.momentum_last_us = now_us;
+            return 1;
+        }
+        const dt: f64 = @as(f64, @floatFromInt(now_us - priv.momentum_last_us)) / std.time.us_per_s;
+        priv.momentum_last_us = now_us;
+
+        // A hidden or stalled surface can hand us a huge dt; clamp so we never
+        // teleport the viewport on the first frame after a stall.
+        const dt_clamped = @min(@max(dt, 0.0), 0.05);
+
+        // Distance covered this frame, then decay for the next one.
+        const dy = priv.momentum_velocity * dt_clamped;
+        priv.momentum_velocity *= @exp(-dt_clamped / self.momentumTau());
+
+        if (@abs(priv.momentum_velocity) < momentum_min_velocity) {
+            self.momentumStop();
+            // Fall through and deliver this last delta before stopping.
+        }
+
+        if (dy != 0) {
+            const scaled = self.scaledCoordinates(0, dy);
+            surface.scrollCallback(
+                0,
+                // Same inversion and precision multiplier as a real precision
+                // scroll event, so the fling is indistinguishable downstream.
+                scaled.y * -1 * 10.0,
+                .{ .precision = true },
+            ) catch |err| {
+                log.warn("error in momentum scroll callback err={}", .{err});
+                self.momentumStop();
+                return 0;
+            };
+        }
+
+        return if (priv.momentum_tick == null) 0 else 1;
+    }
+
+    /// Load `scroll-input-script` and start feeding it through the real
+    /// scroll handler.
+    ///
+    /// Synthesising touchpad events at the OS level needs uinput and root.
+    /// Feeding the samples in here instead costs nothing and still exercises
+    /// everything that has actually been breaking: the precision multiplier,
+    /// momentum, the rounding that decides when to scroll, the sub-row offset
+    /// and the region logic.
+    fn startScrollReplay(self: *Self) void {
+        const priv = self.private();
+        const surface = priv.core_surface orelse return;
+        const path = surface.config.scroll_input_script orelse return;
+
+        const alloc = Application.default().allocator();
+        const data = std.Io.Dir.cwd().readFileAlloc(
+            global.io(),
+            path,
+            alloc,
+            .limited(1024 * 1024),
+        ) catch |err| {
+            log.warn("scroll-input-script unreadable path={s} err={}", .{ path, err });
+            return;
+        };
+        defer alloc.free(data);
+
+        var list: std.ArrayList(f64) = .empty;
+        defer list.deinit(alloc);
+        var it = std.mem.tokenizeAny(u8, data, "\r\n");
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t");
+            if (line.len == 0 or line[0] == '#') continue;
+            if (line[0] == '@') {
+                // `@n` waits n frames, so pauses between gestures replay too.
+                const n = std.fmt.parseInt(usize, line[1..], 10) catch continue;
+                for (0..n) |_| list.append(alloc, 0) catch return;
+                continue;
+            }
+            const v = std.fmt.parseFloat(f64, line) catch continue;
+            list.append(alloc, v) catch return;
+        }
+        if (list.items.len == 0) return;
+
+        priv.replay = list.toOwnedSlice(alloc) catch return;
+        priv.replay_idx = 0;
+        log.info("scroll replay: {d} samples from {s}", .{ priv.replay.?.len, path });
+        priv.replay_timer = glib.timeoutAdd(8, scrollReplayTick, self);
+    }
+
+    fn scrollReplayTick(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const priv = self.private();
+        const samples = priv.replay orelse return 0;
+
+        if (priv.replay_idx >= samples.len) {
+            log.info("scroll replay: done", .{});
+            priv.replay_timer = 0;
+            return 0;
+        }
+
+        const dy = samples[priv.replay_idx];
+        priv.replay_idx += 1;
+
+        // A zero sample is a deliberate pause, not a scroll of nothing:
+        // delivering it would reset momentum and defeat the point.
+        if (dy != 0) {
+            // GTK reports precision deltas with the opposite sign to ours and
+            // sets the precision flag, so go through the same entry point
+            // rather than a shortcut, or the test stops testing the thing that
+            // breaks.
+            priv.precision_scroll = true;
+            _ = ecMouseScrollVertical(undefined, 0, dy, self);
+        }
+
+        return 1;
+    }
+
     fn ecMouseScrollVertical(
         _: *gtk.EventControllerScroll,
         x: f64,
@@ -3068,6 +3377,10 @@ pub const Surface = extern struct {
     ) callconv(.c) c_int {
         const priv: *Private = self.private();
         const surface = priv.core_surface orelse return 0;
+
+        // A real scroll takes over from a fling in flight, but the fling's
+        // velocity is kept so the next flick stacks onto it.
+        self.momentumPause();
 
         // Multiply precision scrolls by 10 to get a better response from
         // touchpad scrolling
@@ -3343,6 +3656,7 @@ pub const Surface = extern struct {
                 break :realize;
             };
 
+            self.syncDamageTracking();
             self.redraw();
         }
 
@@ -3435,10 +3749,23 @@ pub const Surface = extern struct {
         const priv = self.private();
         const surface = priv.core_surface orelse return 1;
 
+        // gtk-damage-tracking: if the widget kept the last frame, the
+        // renderer presents only what changed and we pass on what that was.
+        const area = gobject.ext.cast(DamageGLArea, priv.gl_area);
+        if (comptime @hasField(@TypeOf(surface.renderer.api), "present_persistent")) {
+            surface.renderer.api.present_persistent =
+                if (area) |a| a.framePersistent() else false;
+            _ = surface.renderer.api.takePresented();
+        }
+
         surface.renderer.drawFrame(true) catch |err| {
             log.warn("failed to draw frame err={}", .{err});
             return 0;
         };
+
+        if (comptime @hasField(@TypeOf(surface.renderer.api), "present_persistent")) {
+            if (area) |a| a.noteDamage(surface.renderer.api.takePresented());
+        }
 
         return 1;
     }
@@ -3578,6 +3905,9 @@ pub const Surface = extern struct {
 
         // Store it!
         priv.core_surface = surface;
+        self.syncDamageTracking();
+
+        self.startScrollReplay();
 
         // Emit the signal that we initialized the surface.
         Surface.signals.init.impl.emit(
@@ -3865,6 +4195,7 @@ pub const Surface = extern struct {
         pub const Instance = Self;
 
         fn init(class: *Class) callconv(.c) void {
+            gobject.ext.ensureType(DamageGLArea);
             gobject.ext.ensureType(ResizeOverlay);
             gobject.ext.ensureType(SearchOverlay);
             gobject.ext.ensureType(KeyStateOverlay);
@@ -3908,6 +4239,7 @@ pub const Surface = extern struct {
             class.bindTemplateCallback("scroll_vertical", &ecMouseScrollVertical);
             class.bindTemplateCallback("scroll_vertical_begin", &ecMouseScrollVerticalPrecisionBegin);
             class.bindTemplateCallback("scroll_vertical_end", &ecMouseScrollVerticalPrecisionEnd);
+            class.bindTemplateCallback("scroll_vertical_decelerate", &ecMouseScrollVerticalDecelerate);
             class.bindTemplateCallback("scroll_horizontal", &ecMouseScrollHorizontal);
             class.bindTemplateCallback("drop", &dtDrop);
             class.bindTemplateCallback("gl_realize", &glareaRealize);

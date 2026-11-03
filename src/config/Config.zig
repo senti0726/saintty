@@ -1001,6 +1001,157 @@ palette: Palette = .{},
 /// The default value is "3" for discrete devices and "1" for precision devices.
 @"mouse-scroll-multiplier": MouseScrollMultiplier = .default,
 
+/// Continue scrolling with decaying momentum after a touchpad scroll
+/// gesture ends, instead of stopping the instant the fingers lift.
+///
+/// This only applies to precision (touchpad) scrolling. A notched mouse
+/// wheel has no gesture to end, so this setting does nothing for one.
+///
+/// The velocity comes from the windowing system, which measures the
+/// gesture, so the feel matches other applications on the desktop rather
+/// than being invented here. The fling decays exponentially and stops once
+/// it falls below a speed that would read as a stuck screen rather than
+/// motion.
+///
+/// Momentum works by synthesizing further scroll events, so it applies
+/// wherever a real scroll would: the terminal's own scrollback, an
+/// application receiving mouse reports (tmux), and alternate-scroll cursor
+/// keys alike.
+///
+/// Currently only implemented on Linux (GTK).
+@"mouse-scroll-momentum": bool = false,
+
+/// How far a momentum fling carries, as a decay time constant in seconds.
+///
+/// Velocity drops by 1/e every this many seconds, so a fling runs for
+/// roughly four to five times this value before it is slow enough to stop.
+/// Larger glides further; smaller stops sooner. Has no effect unless
+/// `mouse-scroll-momentum` is enabled.
+///
+/// Successive flicks stack, and a stacked fling decays on the same constant,
+/// so raising this also makes repeated flicks build speed more readily.
+@"mouse-scroll-momentum-decay": f64 = 0.45,
+
+/// Animate scrolling that an application performs, rather than snapping.
+///
+/// When a program scrolls part of the screen -- tmux moving a pane in
+/// copy-mode, a pager, an editor -- the affected rows slide into place over a
+/// few frames instead of jumping. Only the rows the application actually
+/// scrolled move; anything outside the scrolling region, such as tmux's status
+/// line, stays put.
+///
+/// This trades a few milliseconds of latency for continuity: the content is
+/// shown arriving rather than already arrived. The duration is
+/// `scroll-animation-duration`.
+///
+/// Experimental. Currently only implemented on the OpenGL renderer.
+/// Draw sub-row scroll positions instead of snapping to whole rows.
+///
+/// A touchpad reports a fraction of a row at a time. Without this, that
+/// fraction is accumulated invisibly and the screen only moves once a whole
+/// row has built up, so scrolling half a row shows nothing and scrolling a
+/// bit more jumps a full line. With it, content is drawn where the gesture
+/// actually is.
+///
+/// This supersedes `scroll-animation` for scrolls you drive yourself: the
+/// position is already continuous, so there is nothing to ease afterwards.
+/// Replay a recorded list of touchpad scroll samples on startup, for testing.
+///
+/// The file holds one signed pixel delta per line, in the units GTK reports
+/// for a precision device, and they are fed through exactly the path a real
+/// touchpad takes -- multiplier, momentum, rounding, offset and all. Blank
+/// lines and `#` comments are skipped; a line of the form `@<n>` waits n
+/// frames, so gestures and the pauses between them can be reproduced.
+///
+/// This exists because the scroll harness drives applications, not the
+/// pointer, and every scrolling bug so far has lived in the input path it
+/// could not reach. See tools/scroll-harness.
+@"scroll-input-script": ?[]const u8 = null,
+
+/// Rows at the bottom of the screen that a scroll animation never moves.
+///
+/// Well-behaved full-screen applications reserve the rows they pin an
+/// interface on -- tmux and nvim both set scrolling margins that exclude their
+/// status lines, so those hold still without any help. Some do not: Claude
+/// Code scrolls its history with a region running to the very last row and
+/// then redraws its prompt box inside it, so the terminal is told the box is
+/// ordinary content and animates it along with everything else.
+///
+/// Nothing distinguishes the two cases from outside: after a scroll every row
+/// in the region is dirty, whether it moved or was rewritten. So this is a
+/// manual reservation for applications that do not make one themselves. Two is
+/// enough for a prompt box and its hint line.
+///
+/// Costs only that the reserved rows do not animate, which for a status bar or
+/// prompt box is what you want anyway.
+@"scroll-animation-reserve-bottom": u8 = 0,
+
+@"scroll-animation": bool = false,
+
+/// Emit a per-frame trace of the scroll animation to the debug log.
+///
+/// This exists so the scroll feel can be measured instead of eyeballed: each
+/// drawn frame logs a timestamp, the cumulative rows the model has scrolled
+/// and the current drawn offset, which is enough to reconstruct exactly where
+/// the content sat on screen at every frame. See tools/scroll-harness.
+///
+/// Debug builds only; it is very noisy.
+@"scroll-trace": bool = false,
+
+/// Most wheel events waiting on an application that acknowledges them
+/// (OSC 777;wheel-ack, this fork -- the user's nvim does). Past this many,
+/// further wheel events are dropped instead of queued.
+///
+/// A free-spinning wheel sends several times more scroll than nvim can draw
+/// on a long markdown file; the rest waited in the pty and tmux, and the
+/// text went on scrolling for seconds after the wheel stopped (10.5 s and
+/// 2800 rows, measured). Applications that never acknowledge are not
+/// affected. 0 turns it off.
+@"mouse-wheel-in-flight": u32 = 6,
+
+/// Above this many wheel notches a second, scroll without animating: plain
+/// row jumps, as stock Ghostty draws them, until the wheel slows again
+/// (this fork). For a free-spinning wheel, whose flick runs at hundreds of
+/// notches a second -- the MX Anywhere 3S peaks at 280-520 -- where nothing
+/// can be read anyway. A deliberate fast spin is ~20. Touchpads are never
+/// affected. 0 (the default) never snaps.
+@"scroll-animation-wheel-snap": f32 = 0,
+
+/// How long an application scroll takes to settle, in milliseconds.
+///
+/// The motion is eased, not constant speed: most of the travel happens in the
+/// first third and the rest decelerates into place, which is what a browser
+/// does and why a longer duration reads as smoother rather than slower. Past
+/// roughly 200ms it starts to feel like lag. Has no effect unless
+/// `scroll-animation` is enabled.
+@"scroll-animation-duration": u32 = 120,
+
+/// The shape of the scroll animation's motion.
+///
+/// Which curve reads best depends on how large one step is, so this is worth
+/// tasting rather than taking on trust. All of them travel the same distance
+/// in the same `scroll-animation-duration`; only the pacing differs.
+///
+///   * `ease-out-cubic` - most of the travel happens early, then
+///     it decelerates into place.
+///   * `ease-out-quint` - the same idea, more pronounced: leaves faster,
+///     settles more gently.
+///   * `ease-out-quad`  - `cubic-bezier(0.25, 0.46, 0.45, 0.94)`, a gentler
+///     ease-out closer to a plain ramp.
+///   * `material`       - `cubic-bezier(0.4, 0.0, 0.2, 1.0)`, what browsers
+///     and Material interfaces use to move something into place. It eases
+///     *in* as well as out, which reads as the content having weight.
+///   * `linear`         - constant speed. Arrives at full speed and stops
+///     dead; included mostly for comparison.
+///   * `spring`         - the default. Not a curve but a critically damped spring pulling
+///     the text onto its new position. Every curve above restarts on each
+///     scroll, so a held key or a spinning wheel speeds up at every row and
+///     sags between them; a spring keeps its speed across them, so steady
+///     scrolling looks steady. A single scroll behaves like an ease-out.
+///
+/// Has no effect unless `scroll-animation` is enabled.
+@"scroll-animation-easing": ScrollAnimationEasing = .spring,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.
@@ -3192,7 +3343,57 @@ keybind: Keybinds = .{},
 /// depending on the shader and your terminal usage.
 ///
 /// This can be changed at runtime and will affect all open terminals.
+///
+/// `cursor` (this fork) animates only for a moment after the cursor moves,
+/// changes style or colour, or an `OSC 777;cursor-pulse` arrives, and never
+/// otherwise: for shaders whose only motion is a cursor effect. Those events
+/// are also exposed as `iTimeCursorMove`, `iTimeCursorMode` and
+/// `iTimeCursorPulse`.
 @"custom-shader-animation": CustomShaderAnimation = .true,
+
+/// (This fork.) Cache the output of the custom shaders and redo only what
+/// changed, instead of running every shader over the whole window for every
+/// frame.
+///
+/// With this on, every `custom-shader` except the LAST is treated as a
+/// static, local filter of the terminal image: its output at a pixel may
+/// depend only on the terminal image within `custom-shader-cache-margin`
+/// pixels of it, and not on time, the cursor or any other uniform. Those
+/// shaders then run only over the rows that changed (plus the margin). The
+/// last shader is the animated one: it runs over the whole window while
+/// `custom-shader-animation` says an animation is live, and otherwise only
+/// over the rows that changed.
+///
+/// A terminal that redraws one line (a spinner, a clock, typing) then costs
+/// a strip of the window rather than all of it. Anything that moves the
+/// whole screen - a scroll animation, a resize, a Kitty image - still
+/// redraws everything.
+///
+/// Only implemented for OpenGL. Ignored with a single shader's worth of
+/// nothing to cache (no custom shaders at all).
+@"custom-shader-cache": bool = false,
+
+/// How far, in pixels, a static custom shader reaches (see
+/// `custom-shader-cache`): the largest blur radius in the chain, plus a few
+/// pixels for glyphs that overhang their cell. Too small shows as stale
+/// strips above and below a line that changed.
+@"custom-shader-cache-margin": u32 = 48,
+
+/// How far from the cursor the last (animated) custom shader can draw, in
+/// cell heights (see `custom-shader-cache`). Only used with
+/// `custom-shader-animation = cursor`: while a cursor effect is live the
+/// last shader then runs over a box around where the cursor was, went and
+/// last changed mode, grown by this much on every side, rather than over the
+/// whole window. Outside that box the shader must leave the image as it found
+/// it. 0 turns this off (the whole window, as before). Too small shows as
+/// effects clipped at the edge of a box.
+@"custom-shader-cache-fx-reach": f32 = 0,
+
+/// Debugging aids for `custom-shader-cache`. `stats` logs, every two seconds
+/// that frames were drawn, how many were drawn and how much of the window
+/// each redid. `verify` additionally draws every frame a second time the
+/// uncached way and logs any pixel that differs - slow, for testing only.
+@"custom-shader-cache-debug": CustomShaderCacheDebug = .off,
 
 /// Bell features to enable if bell support is available in your runtime. Not
 /// all features are available on all runtimes. The format of this is a list of
@@ -3694,6 +3895,18 @@ else
 /// surfaces.
 @"linux-cgroup-hard-fail": bool = false,
 
+/// Tell GTK which part of the terminal changed in each frame, so that it
+/// repaints, and hands the compositor, only that part instead of the whole
+/// window. Without it every frame costs a full-window copy in Ghostty and a
+/// full-window composite in the compositor, however little changed.
+///
+/// What "the part that changed" is comes from `custom-shader-cache`, so this
+/// only narrows frames drawn through it (that is, with at least one custom
+/// shader and the cache on); every other frame is the whole window, as before.
+///
+/// GTK only.
+@"gtk-damage-tracking": bool = false,
+
 /// Enable or disable GTK's OpenGL debugging logs. The default is `true` for
 /// debug builds, `false` for all others.
 ///
@@ -4118,6 +4331,16 @@ test "handle bom in config files" {
 }
 
 pub const OptionalFileAction = enum { loaded, not_found, @"error" };
+
+/// See scroll-animation-easing
+pub const ScrollAnimationEasing = enum {
+    linear,
+    @"ease-out-cubic",
+    @"ease-out-quint",
+    @"ease-out-quad",
+    material,
+    spring,
+};
 
 /// Load optional configuration file from `path`. All errors are ignored.
 ///
@@ -5437,6 +5660,13 @@ pub const ConfirmCloseSurface = enum(c_int) {
     always,
 };
 
+/// Valid values for custom-shader-cache-debug
+pub const CustomShaderCacheDebug = enum {
+    off,
+    stats,
+    verify,
+};
+
 /// Valid values for custom-shader-animation
 /// c_int because it needs to be extern compatible
 /// If this is changed, you must also update ghostty.h
@@ -5444,6 +5674,7 @@ pub const CustomShaderAnimation = enum(c_int) {
     false,
     true,
     always,
+    cursor,
 };
 
 /// Valid values for macos-non-native-fullscreen

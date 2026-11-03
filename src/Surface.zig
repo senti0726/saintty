@@ -98,6 +98,16 @@ renderer_thr: std.Thread,
 /// Mouse state.
 mouse: Mouse,
 
+/// Flow control for wheel events to an application that acknowledges
+/// them. See `WheelFlow`.
+wheel_flow: WheelFlow = .{},
+
+/// The wheel's recent speed, as notches in a bucket that drains with a
+/// time constant of `wheel_speed_tau_ms`; bucket / tau is notches per ms.
+/// For `scroll-animation-wheel-snap`. Not touchpads (precision scrolls).
+wheel_speed_bucket: f64 = 0,
+wheel_speed_ts: ?std.Io.Timestamp = null,
+
 /// Keyboard input state.
 keyboard: Keyboard,
 
@@ -316,6 +326,10 @@ const DerivedConfig = struct {
     mouse_hide_while_typing: bool,
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
+    scroll_trace: bool,
+    mouse_wheel_in_flight: u32,
+    scroll_animation_wheel_snap: f32,
+    scroll_input_script: ?[]const u8,
     mouse_shift_capture: configpkg.MouseShiftCapture,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
@@ -396,6 +410,10 @@ const DerivedConfig = struct {
             .mouse_hide_while_typing = config.@"mouse-hide-while-typing",
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
+            .scroll_trace = config.@"scroll-trace",
+            .mouse_wheel_in_flight = config.@"mouse-wheel-in-flight",
+            .scroll_animation_wheel_snap = config.@"scroll-animation-wheel-snap",
+            .scroll_input_script = config.@"scroll-input-script",
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
@@ -2665,6 +2683,12 @@ pub fn keyCallback(
 ) !InputEffect {
     // log.warn("text keyCallback event={}", .{event_orig});
 
+    if (self.config.scroll_trace and event_orig.action != .release) log.info("keyinput mono_us={d} key={s} action={s}", .{
+        @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
+        @tagName(event_orig.key),
+        @tagName(event_orig.action),
+    });
+
     // Apply key remappings to transform modifiers before any processing.
     // This allows users to remap modifier keys at the app level.
     var event = event_orig;
@@ -2844,6 +2868,38 @@ pub fn keyCallback(
         }
 
         if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+
+        // Tell the renderer a key produced input. Holding `j` or `k` in vim
+        // or a pager scrolls the screen exactly as a wheel does, but reaches
+        // none of the scroll plumbing, so the repaint detector would never
+        // run for it. Best effort: a dropped one costs a frame of animation,
+        // never correctness.
+        //
+        // A key that TYPED (text with no Ctrl/Alt, or Backspace/Delete/
+        // Enter/Tab) is marked apart: in an insert cursor that is text
+        // entry, never a scroll (see `renderer.Message.input_activity`).
+        // Enter sends `\r`, a control byte, so it used to count as a
+        // movement key: Enter mid-screen in nvim insert renumbers every
+        // relative line number above the cursor, the repaint detector read
+        // that gutter as the upper text scrolling a row, and it jumped up
+        // and slid back (screen-2026-11-01_21-36-59.mkv, backlog §6).
+        const typed = typed: {
+            switch (event.key) {
+                .backspace, .delete, .enter, .numpad_enter, .tab => {
+                    const m = event.effectiveMods();
+                    if (!m.ctrl and !m.alt) break :typed true;
+                },
+                else => {},
+            }
+            const mods = event.effectiveMods();
+            break :typed event.utf8.len > 0 and !mods.ctrl and !mods.alt and
+                event.utf8[0] >= 0x20 and event.utf8[0] != 0x7f;
+        };
+        _ = self.renderer_thread.mailbox.push(
+            global.io(),
+            .{ .input_activity = if (typed) rendererpkg.Message.input_typed else 0 },
+            .{ .instant = {} },
+        );
 
         try self.queueRender();
     }
@@ -3458,6 +3514,15 @@ pub fn scrollCallback(
     scroll_mods: input.ScrollMods,
 ) !void {
     // log.info("SCROLL: xoff={} yoff={} mods={}", .{ xoff, yoff, scroll_mods });
+    // Input side of the scroll trace: when each wheel/touchpad event reached
+    // us, on the same clock as the renderer's `scrolltrace` lines, so a
+    // harness can time input -> application -> frame end to end.
+    if (self.config.scroll_trace) log.info("scrollinput mono_us={d} yoff={d:.3} precision={} momentum={s}", .{
+        @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
+        yoff,
+        scroll_mods.precision,
+        @tagName(scroll_mods.momentum),
+    });
 
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
@@ -3514,14 +3579,41 @@ pub fn scrollCallback(
         // We scroll by the number of rows in the offset and save the remainder
         const amount = poff / cell_size;
         assert(@abs(amount) >= 1);
-        self.mouse.pending_scroll_y = poff - (amount * cell_size);
 
         // Round towards zero.
         const delta: isize = @intFromFloat(@trunc(amount));
         assert(@abs(delta) >= 1);
 
+        // Save the remainder. This has to use the *rounded* delta: `amount`
+        // is poff/cell_size unrounded, so `poff - amount * cell_size` is
+        // identically zero and the sub-cell remainder was being discarded on
+        // every scroll rather than carried into the next one.
+        self.mouse.pending_scroll_y = poff - (@as(f64, @floatFromInt(delta)) * cell_size);
+
         break :y .{ .delta = delta };
     };
+
+    // Tell the renderer the user just scrolled. The repaint detector only
+    // trusts a shift it can attribute to the user, and this is the wheel half
+    // of that; `keyCallback` sends the same message for the keyboard.
+    if (yoff != 0) {
+        // With the direction (see `renderer.Message.input_activity`): wheel
+        // up (yoff > 0) brings earlier output down the screen.
+        const dir: i8 = if (yoff > 0) -1 else 1;
+        const fast = !scroll_mods.precision and self.wheelFast(@abs(yoff));
+        _ = self.renderer_thread.mailbox.push(
+            global.io(),
+            .{ .input_activity = if (fast) dir * 2 else dir },
+            .{ .instant = {} },
+        );
+
+        // Wake the renderer, or the message sits in the mailbox until
+        // something else happens to wake the thread and the frame that should
+        // have animated has already gone by.
+        self.queueRender() catch |err| {
+            log.warn("error queueing render for scroll err={}", .{err});
+        };
+    }
 
     // For detailed comments see the y calculation above.
     const x: ScrollAmount = if (xoff == 0) .{} else x: {
@@ -3584,9 +3676,7 @@ pub fn scrollCallback(
                         .down_left => "\x1b[B",
                     };
                 };
-                for (0..y.magnitude()) |_| {
-                    self.queueIo(.{ .write_stable = seq }, .locked);
-                }
+                self.queueRepeatedWrite(seq, y.magnitude());
             }
 
             return;
@@ -3598,20 +3688,32 @@ pub fn scrollCallback(
 
         // If we're scrolling up or down, then send a mouse event.
         if (self.isMouseReporting()) {
-            for (0..@abs(y.delta)) |_| {
+            if (y.delta != 0) {
+                const want: u32 = @intCast(@min(@abs(y.delta), std.math.maxInt(u32)));
+                const n = self.wheel_flow.budget(
+                    .now(global.io(), .awake),
+                    self.io.terminal.wheel_acked,
+                    want,
+                    self.config.mouse_wheel_in_flight,
+                );
+                if (self.config.scroll_trace and n < want) log.info("wheeldrop mono_us={d} want={d} sent={d}", .{
+                    @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
+                    want,
+                    n,
+                });
                 const pos = try self.rt_surface.getCursorPos();
-                self.mouseReport(switch (y.direction()) {
+                self.mouseReportRepeat(switch (y.direction()) {
                     .up_right => .four,
                     .down_left => .five,
-                }, .press, self.mouse.mods, pos);
+                }, .press, self.mouse.mods, pos, n);
             }
 
-            for (0..@abs(x.delta)) |_| {
+            if (x.delta != 0) {
                 const pos = try self.rt_surface.getCursorPos();
-                self.mouseReport(switch (x.direction()) {
+                self.mouseReportRepeat(switch (x.direction()) {
                     .up_right => .six,
                     .down_left => .seven,
-                }, .press, self.mouse.mods, pos);
+                }, .press, self.mouse.mods, pos, @abs(x.delta));
             }
 
             // If mouse reporting is on, we do not want to scroll the
@@ -3680,13 +3782,88 @@ pub fn mouseReportingActive(self: *Surface) bool {
     return self.isMouseReporting();
 }
 
-fn mouseReport(
+/// A mouse event encoded to its wire bytes, so it can be encoded once and
+/// written many times.
+const EncodedMouse = struct {
+    data: termio.Message.WriteReq.Small.Array,
+    len: usize,
+
+    fn slice(self: *const EncodedMouse) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
+/// Queue `count` copies of `bytes` to the pty as a **single** message.
+///
+/// One wheel notch is one scroll report, and a hard flick with momentum
+/// produces a great many of them. Queued individually they are one mailbox
+/// message each, and the termio mailbox holds 64 (src/termio/mailbox.zig): a
+/// big flick overruns it, at which point `Mailbox.send` falls back to a
+/// blocking push -- on the GTK main thread, which is where this runs. The
+/// window then freezes until the application at the far end drains a queue the
+/// flick overfilled, and afterwards jumps to wherever the scroll ended up.
+///
+/// Coalescing keeps every report, so the scroll travels exactly as far as
+/// asked; it just costs one queue slot instead of hundreds.
+fn queueRepeatedWrite(self: *Surface, bytes: []const u8, count: usize) void {
+    if (bytes.len == 0 or count == 0) return;
+
+    const total = bytes.len * count;
+    if (total <= @typeInfo(termio.Message.WriteReq.Small.Array).array.len) {
+        var data: termio.Message.WriteReq.Small.Array = undefined;
+        for (0..count) |i| {
+            @memcpy(data[i * bytes.len ..][0..bytes.len], bytes);
+        }
+        self.queueIo(.{ .write_small = .{
+            .data = data,
+            .len = @intCast(total),
+        } }, .locked);
+        return;
+    }
+
+    const buf = self.alloc.alloc(u8, total) catch {
+        // Out of memory is not a reason to lose the scroll entirely; fall
+        // back to the one-message-per-report path.
+        for (0..count) |_| {
+            self.queueIo(.{ .write_small = small: {
+                var data: termio.Message.WriteReq.Small.Array = undefined;
+                @memcpy(data[0..bytes.len], bytes);
+                break :small .{ .data = data, .len = @intCast(bytes.len) };
+            } }, .locked);
+        }
+        return;
+    };
+    for (0..count) |i| @memcpy(buf[i * bytes.len ..][0..bytes.len], bytes);
+    self.queueIo(.{ .write_alloc = .{
+        .alloc = self.alloc,
+        .data = buf,
+    } }, .locked);
+}
+
+/// Encode a mouse event once and queue it `count` times. See
+/// `queueRepeatedWrite` for why the repeats share one message.
+fn mouseReportRepeat(
     self: *Surface,
     button: ?input.MouseButton,
     action: input.MouseAction,
     mods: input.Mods,
     pos: apprt.CursorPos,
+    count: usize,
 ) void {
+    if (count == 0) return;
+    if (count == 1) return self.mouseReport(button, action, mods, pos);
+
+    const encoded = self.mouseEncode(button, action, mods, pos) orelse return;
+    self.queueRepeatedWrite(encoded.slice(), count);
+}
+
+fn mouseEncode(
+    self: *Surface,
+    button: ?input.MouseButton,
+    action: input.MouseAction,
+    mods: input.Mods,
+    pos: apprt.CursorPos,
+) ?EncodedMouse {
     // Mouse reporting must be enabled by both config and terminal state
     assert(self.config.mouse_reporting);
     assert(self.io.terminal.flags.mouse_event != .none);
@@ -3732,15 +3909,26 @@ fn mouseReport(
             // does, let's log it and return. No need to crash upstreams.
             // In the future we may want to fall back to allocation.
             log.warn("failed to encode mouse event err={}", .{err});
-            return;
+            return null;
         },
     };
     const written = writer.buffered();
-    if (written.len == 0) return;
+    if (written.len == 0) return null;
 
+    return .{ .data = data, .len = written.len };
+}
+
+fn mouseReport(
+    self: *Surface,
+    button: ?input.MouseButton,
+    action: input.MouseAction,
+    mods: input.Mods,
+    pos: apprt.CursorPos,
+) void {
+    const encoded = self.mouseEncode(button, action, mods, pos) orelse return;
     self.queueIo(.{ .write_small = .{
-        .data = data,
-        .len = @intCast(written.len),
+        .data = encoded.data,
+        .len = @intCast(encoded.len),
     } }, .locked);
 }
 
@@ -6542,4 +6730,109 @@ test "queueIo frees allocated writes in readonly mode" {
         .alloc = testing.allocator,
         .data = data,
     } }, .unlocked);
+}
+
+const wheel_speed_tau_ms: f64 = 80;
+
+/// Is the wheel turning faster than `scroll-animation-wheel-snap`? Feeds
+/// `notches` (this report's distance) into the speed estimate.
+fn wheelFast(self: *Surface, notches: f64) bool {
+    const limit = self.config.scroll_animation_wheel_snap;
+    if (!(limit > 0)) return false;
+    const now: std.Io.Timestamp = .now(global.io(), .awake);
+    if (self.wheel_speed_ts) |t| {
+        const dt_ms: f64 = @floatFromInt(@divTrunc(now.nanoseconds - t.nanoseconds, std.time.ns_per_us));
+        self.wheel_speed_bucket *= @exp(-(dt_ms / 1000.0) / wheel_speed_tau_ms);
+    }
+    self.wheel_speed_ts = now;
+    self.wheel_speed_bucket += notches;
+    const per_s = self.wheel_speed_bucket / wheel_speed_tau_ms * 1000.0;
+    return per_s > limit;
+}
+
+/// Flow control for wheel events (this fork).
+///
+/// A free-spinning wheel sends several times more scroll than nvim can draw
+/// on a long markdown file. Each event is one escape sequence, the protocol
+/// has no way to say "scroll N rows", and the ones nvim had not got to waited
+/// in the pty and in tmux: the text went on scrolling for 10.5 s after the
+/// wheel stopped (2026-10-14, a recorded MX Anywhere 3S flick). Only the
+/// application knows how far it has got, so it says so: OSC 777;wheel-ack;N
+/// after handling N wheel events. While acks are arriving, at most
+/// `mouse-wheel-in-flight` events are left unacknowledged and the rest are
+/// dropped -- the scroll then goes as fast as the application can draw and
+/// stops when the wheel does.
+///
+/// An application that never acks is never limited. Neither, for long, is
+/// one that stops: no ack for `opt_in_ns` and it is treated as not acking,
+/// and events that seem lost (no ack for `lost_ns` while the budget is
+/// spent -- tmux delivered them to a pane that does not ack) are written
+/// off.
+const WheelFlow = struct {
+    sent: u32 = 0,
+    acked: u32 = 0,
+    ack_ts: ?std.Io.Timestamp = null,
+
+    const opt_in_ns: i96 = std.time.ns_per_s;
+    const lost_ns: i96 = 250 * std.time.ns_per_ms;
+
+    /// How many of `want` wheel events to send now, given the terminal's
+    /// running ack total.
+    fn budget(self: *WheelFlow, now: std.Io.Timestamp, acked_total: u32, want: u32, max: u32) u32 {
+        if (acked_total != self.acked) {
+            self.acked = acked_total;
+            self.ack_ts = now;
+        }
+        const since: ?i96 = if (self.ack_ts) |t| now.nanoseconds - t.nanoseconds else null;
+        const live = max > 0 and since != null and since.? < opt_in_ns;
+        var in_flight = self.sent -% self.acked;
+        // Not acking, or acked more than we sent (events from elsewhere,
+        // a restart): start counting afresh from here.
+        if (!live or in_flight > std.math.maxInt(i32) or
+            (in_flight >= max and since.? > lost_ns))
+        {
+            self.sent = self.acked;
+            in_flight = 0;
+        }
+        const n = if (live) @min(want, max -| in_flight) else want;
+        self.sent +%= n;
+        return n;
+    }
+};
+
+fn testTs(ms: i96) std.Io.Timestamp {
+    return .{ .nanoseconds = ms * std.time.ns_per_ms };
+}
+
+test "WheelFlow: an application that never acks is never limited" {
+    var f: WheelFlow = .{};
+    for (0..100) |i| try std.testing.expectEqual(@as(u32, 5), f.budget(testTs(@intCast(i)), 0, 5, 6));
+}
+
+test "WheelFlow: at most max unacknowledged while acks arrive" {
+    var f: WheelFlow = .{};
+    // Before any ack: unlimited. 5 go out.
+    try std.testing.expectEqual(@as(u32, 5), f.budget(testTs(0), 0, 5, 6));
+    // An ack makes it live: 5 sent, 1 acked, 4 in flight, 2 more may go.
+    try std.testing.expectEqual(@as(u32, 2), f.budget(testTs(5), 1, 5, 6));
+    try std.testing.expectEqual(@as(u32, 0), f.budget(testTs(10), 1, 5, 6));
+    // The application catches up to 5 of 7: 2 in flight, 4 may go.
+    try std.testing.expectEqual(@as(u32, 4), f.budget(testTs(20), 5, 5, 6));
+}
+
+test "WheelFlow: lost events are written off, silence ends it" {
+    var f: WheelFlow = .{};
+    _ = f.budget(testTs(0), 0, 6, 6);
+    _ = f.budget(testTs(1), 1, 6, 6);
+    try std.testing.expectEqual(@as(u32, 0), f.budget(testTs(100), 1, 6, 6));
+    // No ack for over 250 ms with the budget spent: written off.
+    try std.testing.expectEqual(@as(u32, 6), f.budget(testTs(300), 1, 6, 6));
+    // No ack for a second: not limited at all.
+    try std.testing.expectEqual(@as(u32, 50), f.budget(testTs(1500), 1, 50, 6));
+}
+
+test "WheelFlow: 0 turns it off" {
+    var f: WheelFlow = .{};
+    _ = f.budget(testTs(0), 0, 6, 0);
+    try std.testing.expectEqual(@as(u32, 50), f.budget(testTs(1), 1, 50, 0));
 }
