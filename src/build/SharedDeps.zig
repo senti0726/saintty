@@ -716,6 +716,7 @@ fn addGtkNg(
     if (gobject_) |gobject| {
         const gobject_imports = .{
             .{ "adw", "adw1" },
+            .{ "cairo", "cairo1" },
             .{ "gdk", "gdk4" },
             .{ "gio", "gio2" },
             .{ "glib", "glib2" },

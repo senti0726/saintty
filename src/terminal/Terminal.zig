@@ -66,6 +66,23 @@ height_px: u32 = 0,
 /// The current scrolling region.
 scrolling_region: ScrollingRegion,
 
+/// The most recent region scroll, for the renderer to animate.
+///
+/// Set by the scroll primitives and consumed (and cleared) by the renderer.
+/// Only the accumulated row count matters, so several scrolls landing between
+/// two frames coalesce rather than queueing: an animation can only ever chase
+/// the latest position anyway.
+///
+/// This is deliberately *not* a queue. Writes land during an animation --
+/// tmux emits the newly exposed row and its status bar in the same burst as
+/// the scroll -- so the model must always be current and the animation must
+/// only ever chase it.
+scroll_event: ?ScrollEvent = null,
+
+/// Set while SU/SD/RI delegate to insertLines/deleteLines, so the scroll is
+/// recorded once by the wrapper rather than twice. See noteScroll.
+scroll_note_suppress: bool = false,
+
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
 
@@ -87,6 +104,19 @@ cursor: Cursor = .{},
 
 /// The most recently set mouse shape for the terminal.
 mouse_shape: mouse.Shape = .text,
+
+/// Bumped by OSC 777;cursor-pulse (this fork). The renderer notices the
+/// change and stamps iTimeCursorPulse for custom shaders; wraps harmlessly.
+cursor_pulse: u32 = 0,
+
+/// Bumped by OSC 777;cursor-boom (this fork), with the last one's
+/// arguments beside it. Only the newest boom per frame plays.
+cursor_boom: u32 = 0,
+cursor_boom_last: @import("osc.zig").Command.CursorBoom = .{},
+
+/// Wheel events the application says it has handled, summed over every
+/// OSC 777;wheel-ack (this fork). Wraps. Read by `Surface.wheelBudget`.
+wheel_acked: u32 = 0,
 
 /// Per-session Glyph Protocol registrations.
 glyph_glossary: glyph.Glossary = .empty,
@@ -171,6 +201,87 @@ pub const Colors = struct {
 /// Unsupported dynamic and special colors return null. The cursor color
 /// follows xterm-style reporting and falls back to the foreground color when
 /// no explicit cursor color is set.
+pub const ScrollEvent = struct {
+    /// Rows scrolled. Positive means content moved up (new content appears at
+    /// the bottom), matching the sense of `scrollUp`.
+    rows: isize = 0,
+
+    /// The scrolling region the scroll applied to, inclusive. Rows outside it
+    /// do not move -- tmux keeps its status line outside the margins
+    /// precisely so it stays put -- so an animation that ignores this would
+    /// visibly jiggle the status bar.
+    top: usize = 0,
+    bottom: usize = 0,
+
+    /// The *true* top margin of the scrolling region.
+    ///
+    /// `top` above is where the scroll started, which for insert/delete lines
+    /// is the cursor row rather than the margin. Anything deciding which rows
+    /// may move on screen has to use this instead, or it will shift rows the
+    /// application deliberately parks outside the margins -- a status bar, a
+    /// prompt box.
+    region_top: usize = 0,
+
+    /// Which primitive produced this. `index` fires on every newline at the
+    /// bottom of the screen, so it is by far the most common and is the one
+    /// most likely to need separate treatment from deliberate scrolling.
+    source: Source = .index,
+
+    pub const Source = enum { index, scroll_up, scroll_down, insert_lines, delete_lines };
+};
+
+/// Record a region scroll for the renderer. Coalesces with any event not yet
+/// consumed, provided the region matches; a region change means the previous
+/// event describes a layout that no longer exists, so it is replaced.
+pub fn noteScroll(
+    self: *Terminal,
+    rows: isize,
+    top: usize,
+    source: ScrollEvent.Source,
+) void {
+    // SU/SD/RI are implemented on top of insertLines/deleteLines, but only
+    // on some paths -- scrollUp has a fast path for a full-screen region that
+    // does not delegate at all. Hooking only the primitives therefore misses
+    // full-screen SU; hooking both double-counts the margin case. The wrapper
+    // records, and suppresses whatever it delegates to.
+    if (self.scroll_note_suppress) return;
+    const bottom = self.scrolling_region.bottom;
+
+    // A region only a few rows tall is a decoration, not content anyone is
+    // scrolling: tmux repaints its status line by scrolling a two-row region,
+    // interleaved with the body scrolls.
+    //
+    // Dropping those matters more than it looks. There is one pending slot,
+    // and a region change *replaces* rather than coalesces, so a status
+    // repaint landing between two frames silently discards the body scroll
+    // that was waiting there and substitutes its own two-row displacement.
+    // The body then snaps instead of sliding, and when the repaint deletes
+    // rather than inserts, the drawn text visibly moves against the scroll.
+    //
+    // Measure the app's *scrolling region*, not the span from the cursor:
+    // `top` here is where the insert or delete started, so a legitimate
+    // scroll near the bottom of a large region looks tiny.
+    const region = &self.scrolling_region;
+    if (region.bottom >= region.top) {
+        const height = region.bottom - region.top + 1;
+        if (height * 4 < self.rows) return;
+    }
+    if (self.scroll_event) |*ev| {
+        if (ev.top == top and ev.bottom == bottom) {
+            ev.rows += rows;
+            ev.source = source;
+            return;
+        }
+    }
+    self.scroll_event = .{
+        .rows = rows,
+        .top = top,
+        .bottom = bottom,
+        .region_top = region.top,
+        .source = source,
+    };
+}
+
 pub fn colorForXterm(self: *const Terminal, target: osc.color.Target) ?color.RGB {
     return switch (target) {
         .palette => |i| self.colors.palette.current[i],
@@ -2617,6 +2728,10 @@ pub fn setLeftAndRightMargin(self: *Terminal, left_req: usize, right_req: usize)
 
 /// Scroll the text down by one row.
 pub fn scrollDown(self: *Terminal, count: usize) void {
+    self.noteScroll(-@as(isize, @intCast(count)), self.scrolling_region.top, .scroll_down);
+    self.scroll_note_suppress = true;
+    defer self.scroll_note_suppress = false;
+
     // Preserve our x/y to restore.
     const old_x = self.screens.active.cursor.x;
     const old_y = self.screens.active.cursor.y;
@@ -2657,6 +2772,10 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
 ///
 /// Does not change the (absolute) cursor position.
 pub fn scrollUp(self: *Terminal, count: usize) !void {
+    self.noteScroll(@intCast(count), self.scrolling_region.top, .scroll_up);
+    self.scroll_note_suppress = true;
+    defer self.scroll_note_suppress = false;
+
     // Preserve our x/y to restore.
     const old_x = self.screens.active.cursor.x;
     const old_y = self.screens.active.cursor.y;
@@ -2983,6 +3102,10 @@ pub fn insertLines(self: *Terminal, count: usize) void {
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
 
+    // Content moves down by adjusted_count, spanning the cursor row to the
+    // bottom margin -- not the region top, which is why start_y is passed.
+    self.noteScroll(-@as(isize, @intCast(adjusted_count)), start_y, .insert_lines);
+
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
     var cur_p = self.screens.active.pages.trackPin(
@@ -3155,6 +3278,10 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
     // We can only insert lines up to our remaining lines in the scroll
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
+
+    // Content moves up by adjusted_count, spanning the cursor row to the
+    // bottom margin -- not the region top, which is why start_y is passed.
+    self.noteScroll(@intCast(adjusted_count), start_y, .delete_lines);
 
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
@@ -4033,6 +4160,10 @@ pub fn resize(
     // Validate before changing any terminal state.
     if (opts.cols == 0 or opts.rows == 0) return error.InvalidValue;
 
+    // A pending scroll records row indices into the grid that is about to be
+    // replaced, so it cannot be animated meaningfully afterwards.
+    self.scroll_event = null;
+
     // Pixel geometry and synchronized output are updated on every valid
     // resize attempt, including one that doesn't change the grid dimensions.
     // Save their old values so later allocation failures can roll them back.
@@ -4326,6 +4457,140 @@ test "Terminal setScrollback only affects primary screen" {
     );
     try testing.expect(alternate.no_scrollback);
     try testing.expectEqual(alternate, t.screens.active);
+}
+
+test "Terminal: resize discards a pending scroll" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    try testing.expect(t.scroll_event != null);
+
+    // The recorded rows index a grid that no longer exists after this.
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 20 });
+    try testing.expect(t.scroll_event == null);
+}
+
+test "Terminal: switching screens discards a pending scroll" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    try testing.expect(t.scroll_event != null);
+
+    // Entering the alternate screen replaces the grid wholesale; animating the
+    // old scroll would slide unrelated content on entry to tmux or vim.
+    _ = try t.switchScreen(.alternate);
+    try testing.expect(t.scroll_event == null);
+}
+
+test "Terminal: noteScroll records rows and region" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(3, 8);
+    try t.scrollUp(2);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 2), ev.rows);
+    try testing.expectEqual(@as(usize, 2), ev.top);
+    try testing.expectEqual(@as(usize, 7), ev.bottom);
+    try testing.expectEqual(Terminal.ScrollEvent.Source.scroll_up, ev.source);
+}
+
+test "Terminal: noteScroll coalesces within a region" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    // Several scrolls between two frames accumulate rather than queue: an
+    // animation can only chase the latest position.
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    t.insertLines(2);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, -3), ev.rows);
+}
+
+test "Terminal: noteScroll opposing scrolls cancel" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    try t.scrollUp(2);
+    // scrollDown delegates to insertLines, which records -2 over the same
+    // region, so the pair nets to zero rather than double-counting.
+    t.scrollDown(2);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 0), ev.rows);
+}
+
+test "Terminal: noteScroll ignores decoration-sized regions" {
+    // tmux repaints its status line by scrolling a two-row region. With a
+    // single pending slot, letting that through discards whatever real scroll
+    // was waiting, which the eye sees as the text jumping back.
+    var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 40 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(1, 40);
+    try t.scrollUp(3);
+    try testing.expect(t.scroll_event != null);
+    const before = t.scroll_event.?;
+
+    // A two-row status region must not displace the body scroll waiting in
+    // the single pending slot.
+    t.setTopAndBottomMargin(39, 40);
+    try t.scrollUp(1);
+    try testing.expect(t.scroll_event != null);
+    try testing.expectEqual(before.rows, t.scroll_event.?.rows);
+    try testing.expectEqual(before.top, t.scroll_event.?.top);
+    try testing.expectEqual(before.bottom, t.scroll_event.?.bottom);
+}
+
+test "Terminal: noteScroll region change replaces rather than accumulates" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    try t.scrollUp(3);
+    // A different region means the pending event describes a layout that no
+    // longer exists, so it must be dropped, not added to.
+    t.setTopAndBottomMargin(2, 6);
+    try t.scrollUp(1);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 1), ev.rows);
+    try testing.expectEqual(@as(usize, 1), ev.top);
+    try testing.expectEqual(@as(usize, 5), ev.bottom);
+}
+
+test "Terminal: insertLines records from the cursor row, not the region top" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(2, 9);
+    t.setCursorPos(5, 1);
+    t.insertLines(1);
+
+    const ev = t.scroll_event.?;
+    // Content moves down, so rows is negative.
+    try testing.expectEqual(@as(isize, -1), ev.rows);
+    // Cursor row (0-indexed 4), NOT the region top of 1.
+    try testing.expectEqual(@as(usize, 4), ev.top);
+}
+
+test "Terminal: deleteLines clamps the recorded count to the region" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(1, 5);
+    t.setCursorPos(4, 1);
+    // Ask for far more than fits: rows 4..5 leaves 2.
+    t.deleteLines(50);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 2), ev.rows);
 }
 
 test "Terminal: resize resets synchronized output" {
@@ -4780,6 +5045,12 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
 
     // Mark our terminal as dirty to redraw the grid.
     self.flags.dirty.clear = true;
+
+    // Switching screens replaces the whole grid, so a scroll recorded against
+    // the old one describes content that is no longer displayed. Animating it
+    // would slide unrelated rows on entry to and exit from tmux, vim, and
+    // anything else that uses the alternate screen.
+    self.scroll_event = null;
 
     // Finalize the switch
     self.screens.switchTo(key);
