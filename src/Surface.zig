@@ -2875,11 +2875,22 @@ pub fn keyCallback(
         // run for it. Best effort: a dropped one costs a frame of animation,
         // never correctness.
         //
-        // A key that TYPED (text with no Ctrl/Alt, or Backspace/Delete) is
-        // marked apart: in an insert cursor that is text entry, never a
-        // scroll (see `renderer.Message.input_activity`).
+        // A key that TYPED (text with no Ctrl/Alt, or Backspace/Delete/
+        // Enter/Tab) is marked apart: in an insert cursor that is text
+        // entry, never a scroll (see `renderer.Message.input_activity`).
+        // Enter sends `\r`, a control byte, so it used to count as a
+        // movement key: Enter mid-screen in nvim insert renumbers every
+        // relative line number above the cursor, the repaint detector read
+        // that gutter as the upper text scrolling a row, and it jumped up
+        // and slid back (screen-2026-11-01_21-36-59.mkv, backlog §6).
         const typed = typed: {
-            if (event.key == .backspace or event.key == .delete) break :typed true;
+            switch (event.key) {
+                .backspace, .delete, .enter, .numpad_enter, .tab => {
+                    const m = event.effectiveMods();
+                    if (!m.ctrl and !m.alt) break :typed true;
+                },
+                else => {},
+            }
             const mods = event.effectiveMods();
             break :typed event.utf8.len > 0 and !mods.ctrl and !mods.alt and
                 event.utf8[0] >= 0x20 and event.utf8[0] != 0x7f;
