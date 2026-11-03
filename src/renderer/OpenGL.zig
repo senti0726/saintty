@@ -31,6 +31,10 @@ pub const custom_shader_y_is_down = false;
 /// sync, we have no need for multi-buffering.
 pub const swap_chain_count = 1;
 
+/// `custom-shader-cache` needs scissored render passes and textures that
+/// persist between frames (a swap chain of one).
+pub const custom_shader_cache_supported = true;
+
 const log = std.log.scoped(.opengl);
 
 /// We require at least OpenGL 4.3
@@ -44,6 +48,57 @@ blending: configpkg.Config.AlphaBlending,
 
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
+
+/// PARTIAL PRESENT (`gtk-damage-tracking`). Normally the apprt hands us a
+/// framebuffer whose contents are undefined, so `present` copies the whole
+/// target into it and the apprt shows (and the compositor repaints) the whole
+/// window, however little of it changed.
+///
+/// An apprt whose framebuffer still holds the frame presented before sets
+/// `present_persistent` for the draw. `present` then copies only
+/// `frame_damage` -- the rectangles the renderer says differ from the last
+/// frame -- and records what it wrote in `presented`, which the apprt takes
+/// afterwards to tell the toolkit how little there is to repaint.
+present_persistent: bool = false,
+/// What the frame being drawn changes in its target. The renderer narrows it
+/// (`setFrameDamage`); anything that does not is the whole frame.
+frame_damage: Damage = .everything,
+/// What `present` has written since the apprt last took it.
+presented: Damage = .nothing,
+/// A frame was drawn but not presented (GL error): the framebuffer is behind
+/// the target by more than the next frame's damage.
+present_stale: bool = false,
+/// `custom-shader-cache-debug = verify`: after every present, read back the
+/// framebuffer and the target and compare them. Partial presents that leave
+/// the framebuffer different from the target are counted and logged.
+present_verify: bool = false,
+present_verify_stats: struct { checked: u64 = 0, partial: u64 = 0, mismatched: u64 = 0 } = .{},
+
+/// A set of rectangles (x, y, width, height; GL coordinates, origin
+/// bottom-left), or the whole frame.
+pub const Damage = struct {
+    pub const max_rects = 12;
+    pub const everything: Damage = .{ .full = true };
+    pub const nothing: Damage = .{ .full = false };
+
+    full: bool,
+    n: usize = 0,
+    rects: [max_rects][4]u32 = undefined,
+
+    pub fn add(self: *Damage, r: [4]u32) void {
+        if (self.full or r[2] == 0 or r[3] == 0) return;
+        if (self.n == max_rects) {
+            self.* = .everything;
+            return;
+        }
+        self.rects[self.n] = r;
+        self.n += 1;
+    }
+
+    pub fn slice(self: *const Damage) []const [4]u32 {
+        return self.rects[0..self.n];
+    }
+};
 
 /// NOTE: This is an error{}!OpenGL instead of just OpenGL for parity with
 ///       Metal, since it needs to be fallible so does this, even though it
@@ -253,7 +308,31 @@ pub fn displayRealized(self: *const OpenGL) void {
 ///
 /// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameStart(self: *OpenGL) void {
-    _ = self;
+    // Until the renderer says otherwise the frame changes everything.
+    self.frame_damage = .everything;
+}
+
+/// The frame being drawn differs from the one before only inside `rects`
+/// (GL scissor rectangles). Only meaningful when every frame since the last
+/// full one went through here or was whole.
+pub fn setFrameDamage(self: *OpenGL, rects: []const ?[4]u32) void {
+    var d: Damage = .nothing;
+    for (rects) |r| d.add(r orelse {
+        self.frame_damage = .everything;
+        return;
+    });
+    self.frame_damage = d;
+}
+
+/// What has been presented since the last call, for the apprt.
+pub fn takePresented(self: *OpenGL) Damage {
+    defer self.presented = .nothing;
+    return self.presented;
+}
+
+/// A drawn frame was not presented.
+pub fn presentSkipped(self: *OpenGL) void {
+    self.present_stale = true;
 }
 
 /// Actions taken after `drawFrame` is done.
@@ -312,26 +391,234 @@ pub fn present(self: *OpenGL, target: Target) !void {
     const fbobind = try target.framebuffer.bind(.read);
     defer fbobind.unbind();
 
-    // Blit
-    gl.glad.context.BlitFramebuffer.?(
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
-        gl.c.GL_COLOR_BUFFER_BIT,
-        gl.c.GL_NEAREST,
-    );
+    // Blit: the rectangles that changed if the framebuffer still holds the
+    // last frame, everything otherwise.
+    const partial = self.present_persistent and !self.present_stale and
+        !self.frame_damage.full and self.last_target != null and
+        self.last_target.?.framebuffer.id == target.framebuffer.id;
+    if (partial) {
+        // GHOSTTY_PRESENT_BREAK=1 drops the first rectangle of every partial
+        // present, to show that `present_verify` can fail.
+        const skip: usize = if (self.present_verify and
+            std.c.getenv("GHOSTTY_PRESENT_BREAK") != null) 1 else 0;
+        for (self.frame_damage.slice(), 0..) |r, i| {
+            if (i < skip) continue;
+            const x0: gl.c.GLint = @intCast(@min(r[0], target.width));
+            const y0: gl.c.GLint = @intCast(@min(r[1], target.height));
+            const x1: gl.c.GLint = @intCast(@min(r[0] + r[2], target.width));
+            const y1: gl.c.GLint = @intCast(@min(r[1] + r[3], target.height));
+            if (x1 <= x0 or y1 <= y0) continue;
+            gl.glad.context.BlitFramebuffer.?(
+                x0,
+                y0,
+                x1,
+                y1,
+                x0,
+                y0,
+                x1,
+                y1,
+                gl.c.GL_COLOR_BUFFER_BIT,
+                gl.c.GL_NEAREST,
+            );
+            self.presented.add(.{
+                @intCast(x0),
+                @intCast(y0),
+                @intCast(x1 - x0),
+                @intCast(y1 - y0),
+            });
+        }
+    } else {
+        gl.glad.context.BlitFramebuffer.?(
+            0,
+            0,
+            @intCast(target.width),
+            @intCast(target.height),
+            0,
+            0,
+            @intCast(target.width),
+            @intCast(target.height),
+            gl.c.GL_COLOR_BUFFER_BIT,
+            gl.c.GL_NEAREST,
+        );
+        self.presented = .everything;
+        self.present_stale = false;
+    }
+    if (self.present_verify) self.verifyPresent(target, partial);
+
+    // Debugging aid: GHOSTTY_FRAME_DUMP=<file> appends every presented frame.
+    dumpFrame(target);
 
     // Keep track of this target in case we need to repeat it.
     self.last_target = target;
 }
 
+/// FRAME DUMP (debugging aid). With `GHOSTTY_FRAME_DUMP=<file>` in the
+/// environment, every presented frame is shrunk to a third on the GPU and
+/// appended to that file: a 16-byte header (u64 monotonic microseconds, u32
+/// width, u32 height) then RGBA rows, bottom row first. Screen recorders
+/// cannot be scripted here (OBS's PipeWire capture asks with a dialog every
+/// time) and sample at their own rate; this is exactly what Ghostty drew, one
+/// entry per frame, which is what visual scroll bugs needed (a figure torn for
+/// one frame). `tools/scroll-harness/fast/frames.py` unpacks it. Off unless
+/// set; the read-back stalls the GPU, so timing under it is not representative.
+const FrameDump = struct {
+    tried: bool = false,
+    fd: c_int = -1,
+    fbo: gl.c.GLuint = 0,
+    rbo: gl.c.GLuint = 0,
+    w: i32 = 0,
+    h: i32 = 0,
+    buf: []u8 = &.{},
+    // Two pixel-pack buffers: this frame's read-back goes into one while the
+    // other (last frame's) is mapped and written out, so the GPU never has
+    // to finish a frame before the next is drawn. A synchronous read-back
+    // cost enough to change the animation it was recording (smooth% 94 ->
+    // 64 on a fast wheel spin).
+    pbo: [2]gl.c.GLuint = .{ 0, 0 },
+    pbo_us: [2]u64 = .{ 0, 0 },
+    pbo_full: [2]bool = .{ false, false },
+    next: usize = 0,
+};
+var frame_dump: FrameDump = .{};
+
+fn dumpFrame(target: Target) void {
+    const d = &frame_dump;
+    if (!d.tried) {
+        d.tried = true;
+        const path = std.c.getenv("GHOSTTY_FRAME_DUMP") orelse return;
+        d.fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (d.fd < 0) log.warn("frame dump: cannot open {s}", .{path});
+    }
+    if (d.fd < 0) return;
+    const ctx = gl.glad.context;
+    const w: i32 = @intCast(@max(1, target.width / 3));
+    const h: i32 = @intCast(@max(1, target.height / 3));
+    var prev_draw: gl.c.GLint = 0;
+    var prev_read: gl.c.GLint = 0;
+    ctx.GetIntegerv.?(gl.c.GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+    ctx.GetIntegerv.?(gl.c.GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+    defer {
+        ctx.BindFramebuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, @intCast(prev_draw));
+        ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(prev_read));
+    }
+    if (d.fbo == 0) {
+        ctx.GenFramebuffers.?(1, &d.fbo);
+        ctx.GenRenderbuffers.?(1, &d.rbo);
+        ctx.GenBuffers.?(2, &d.pbo);
+    }
+    if (d.w != w or d.h != h) {
+        ctx.BindRenderbuffer.?(gl.c.GL_RENDERBUFFER, d.rbo);
+        ctx.RenderbufferStorage.?(gl.c.GL_RENDERBUFFER, gl.c.GL_RGBA8, w, h);
+        ctx.BindFramebuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, d.fbo);
+        ctx.FramebufferRenderbuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, gl.c.GL_COLOR_ATTACHMENT0, gl.c.GL_RENDERBUFFER, d.rbo);
+        if (d.buf.len > 0) std.heap.page_allocator.free(d.buf);
+        d.buf = std.heap.page_allocator.alloc(u8, 16) catch {
+            d.buf = &.{};
+            return;
+        };
+        for (d.pbo) |pbo| {
+            ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, pbo);
+            ctx.BufferData.?(gl.c.GL_PIXEL_PACK_BUFFER, @intCast(w * h * 4), null, gl.c.GL_STREAM_READ);
+        }
+        ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, 0);
+        d.pbo_full = .{ false, false };
+        d.w = w;
+        d.h = h;
+    }
+    if (d.buf.len == 0) return;
+    // The target is bound for reading (see `present`).
+    ctx.BindFramebuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, d.fbo);
+    ctx.BlitFramebuffer.?(0, 0, @intCast(target.width), @intCast(target.height), 0, 0, w, h, gl.c.GL_COLOR_BUFFER_BIT, gl.c.GL_LINEAR);
+    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, d.fbo);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    const us: u64 = @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1000;
+    // Start this frame's read-back into one buffer (returns at once)...
+    const i = d.next;
+    ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, d.pbo[i]);
+    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, null);
+    d.pbo_us[i] = us;
+    d.pbo_full[i] = true;
+    // ...and write out the other, filled a frame ago and long since done.
+    const o = 1 - i;
+    if (d.pbo_full[o]) {
+        ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, d.pbo[o]);
+        const ptr = ctx.MapBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, gl.c.GL_READ_ONLY);
+        if (ptr) |p| {
+            std.mem.writeInt(u64, d.buf[0..8], d.pbo_us[o], .little);
+            std.mem.writeInt(u32, d.buf[8..12], @intCast(w), .little);
+            std.mem.writeInt(u32, d.buf[12..16], @intCast(h), .little);
+            _ = std.c.write(d.fd, d.buf.ptr, 16);
+            _ = std.c.write(d.fd, @ptrCast(p), @intCast(w * h * 4));
+            _ = ctx.UnmapBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER);
+        }
+        d.pbo_full[o] = false;
+    }
+    ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, 0);
+    d.next = o;
+}
+
+/// Read a target back as RGBA8, for `custom-shader-cache-debug = verify`.
+/// `buf` must hold width * height * 4 bytes.
+pub fn readTarget(self: *OpenGL, target: Target, buf: []u8) !void {
+    _ = self;
+    const fbobind = try target.framebuffer.bind(.read);
+    defer fbobind.unbind();
+    gl.glad.context.ReadPixels.?(
+        0,
+        0,
+        @intCast(target.width),
+        @intCast(target.height),
+        gl.c.GL_RGBA,
+        gl.c.GL_UNSIGNED_BYTE,
+        buf.ptr,
+    );
+}
+
+/// `present_verify`: the framebuffer just presented into must equal the
+/// target, pixel for pixel. The target is still bound for reading.
+fn verifyPresent(self: *OpenGL, target: Target, partial: bool) void {
+    const alloc = std.heap.c_allocator;
+    const bytes = target.width * target.height * 4;
+    const want = alloc.alloc(u8, bytes * 2) catch return;
+    defer alloc.free(want);
+    const got = want[bytes..];
+    const ctx = &gl.glad.context;
+    const w: gl.c.GLsizei = @intCast(target.width);
+    const h: gl.c.GLsizei = @intCast(target.height);
+    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, want.ptr);
+    var draw: gl.c.GLint = 0;
+    var read: gl.c.GLint = 0;
+    ctx.GetIntegerv.?(gl.c.GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+    ctx.GetIntegerv.?(gl.c.GL_READ_FRAMEBUFFER_BINDING, &read);
+    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(draw));
+    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, got.ptr);
+    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(read));
+
+    const st = &self.present_verify_stats;
+    st.checked += 1;
+    if (partial) st.partial += 1;
+    if (!std.mem.eql(u8, want[0..bytes], got)) {
+        st.mismatched += 1;
+        var px: u64 = 0;
+        var i: usize = 0;
+        while (i < bytes) : (i += 4) {
+            if (!std.mem.eql(u8, want[i..][0..4], got[i..][0..4])) px += 1;
+        }
+        log.warn("present MISMATCH px={} partial={} rects={}", .{ px, partial, self.frame_damage.n });
+    }
+    if (st.checked % 200 == 0) log.info(
+        "present-verify checked={} partial={} mismatched={}",
+        .{ st.checked, st.partial, st.mismatched },
+    );
+}
+
 /// Present the last presented target again.
 pub fn presentLastTarget(self: *OpenGL) !void {
+    // A framebuffer that kept the last frame already shows it.
+    if (self.present_persistent and !self.present_stale and
+        self.last_target != null) return;
+    self.frame_damage = .everything;
     if (self.last_target) |target| try self.present(target);
 }
 
