@@ -63,8 +63,9 @@ pub fn complete(self: *const Self, sync: bool) void {
     if (health == .healthy) {
         self.renderer.api.present(self.target.*) catch |err| {
             log.err("Failed to present render target: err={}", .{err});
+            self.renderer.api.presentSkipped();
         };
-    }
+    } else self.renderer.api.presentSkipped();
 
     // Report the health to the renderer.
     self.renderer.frameCompleted(health);
