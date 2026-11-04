@@ -24,7 +24,6 @@ const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
 const ScrollAnim = @import("scroll_anim.zig");
 
-/// An inclusive row range that a scroll applies to.
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -340,7 +339,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// This frame's scroll event, animated once the frame has been read.
         /// See `applyPendingScroll`.
-        scroll_pending: ?struct { rows: isize, top: usize, bottom: usize, right: usize, limit: f32 } = null,
+        scroll_pending: ?struct { rows: isize, top: usize, bottom: usize, left: usize, right: usize, limit: f32 } = null,
         /// Set by `detectRepaintScroll` on an event frame: how far the
         /// content really moved, when that is further than the event said.
         scroll_event_total: ?isize = null,
@@ -1380,14 +1379,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// i.e. 120fps, and the floor for any animation wake delay.
         pub const draw_interval_ms: u64 = 8;
 
-        /// Rows that must agree before a shift is believed, as a count and as
-        /// a fraction of the rows compared.
-        ///
-        /// Blank and repeating rows match at many offsets at once, so a mostly
-        /// empty screen can "match" a shift of any size. Animating that
-        /// invents motion that never happened, so a shift has to be carried by
-        /// a substantial majority of the screen before it is acted on.
-        /// The same gate for the keyboard, kept shorter.
+        /// How long after a key the repaint detector's gate stays open.
         ///
         /// Key repeat when a key is held runs at roughly 30Hz, so a window
         /// this size stays continuously fresh while `j` is down and closes
@@ -1410,6 +1402,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// the slowest step of an eased glide (its last row, ~65 ms).
         pub const repaint_chain_ms: i64 = 100;
 
+        /// The longest the chain may hold the gate open after the last key
+        /// or wheel movement, however steadily scrolls keep arriving.
+        ///
+        /// Without a bound the chain never closed on its own. Enter opens the
+        /// gate like any key, and command output that starts inside it and
+        /// keeps scrolling a few rows a frame -- `make`, `tail -f`, a test
+        /// run -- re-armed it every frame, so the whole run slid as if the
+        /// user were scrolling it. Long enough for the slowest glide a key
+        /// starts (neoscroll's 450 ms, see above); a held key or a spinning
+        /// wheel keeps refreshing the input time, so it never cuts a real
+        /// gesture short.
+        pub const repaint_chain_max_ms: i64 = 600;
+
+        /// Rows that must agree before a shift is believed, as a count and as
+        /// a fraction of the rows compared.
+        ///
+        /// Blank and repeating rows match at many offsets at once, so a mostly
+        /// empty screen can "match" a shift of any size. Animating that
+        /// invents motion that never happened, so a shift has to be carried by
+        /// a substantial majority of the screen before it is acted on.
         pub const repaint_scroll_min_rows: usize = 6;
         pub const repaint_scroll_min_ratio: f32 = 0.6;
 
@@ -1533,10 +1545,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             self.scroll_anim_last = now;
 
-            const dt_ms: f32 = @floatFromInt(@divTrunc(
-                last.durationTo(now).nanoseconds,
-                std.time.ns_per_ms,
-            ));
+            // Exact, not truncated to whole milliseconds: `last` moves to
+            // `now` every frame, so a truncated remainder was lost for good
+            // -- 6.94 ms frames at 144 Hz integrated as 6, and every
+            // animation ran ~14% longer than configured.
+            const dt_ms: f32 = @as(f32, @floatFromInt(last.durationTo(now).nanoseconds)) /
+                @as(f32, @floatFromInt(std.time.ns_per_ms));
             self.scroll_anim.advance(
                 dt_ms,
                 @floatFromInt(self.config.scroll_animation_duration_ms),
@@ -1737,6 +1751,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Called from the render thread's mailbox.
         pub fn noteInputActivity(self: *Self, typed: bool) void {
+            // drawFrame reads `key_paced` on the app thread (GTK).
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
             self.input_activity_ts = .now(global.io(), .awake);
             self.input_typed = typed;
             // A wheel movement arrives as this AND `noteWheelActivity`,
@@ -1758,6 +1775,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Called from the render thread's mailbox.
         pub fn noteWheelActivity(self: *Self, dir: i8, fast: bool) void {
+            // drawFrame reads these on the app thread (GTK): `wheel_ts` for
+            // the cursor effects and `key_paced` for the spring.
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
             self.wheel_ts = .now(global.io(), .awake);
             if (fast) self.wheel_fast_ts = self.wheel_ts;
             self.wheel_dir = dir;
@@ -1794,12 +1815,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             const cell_h: f32 = @floatFromInt(self.size.cell.height);
             const was_idle = !self.scroll_anim.active();
-            self.keepScrollGhosts(rows, p.top, p.bottom, 0, p.right, null);
+            self.keepScrollGhosts(rows, p.top, p.bottom, p.left, p.right, null);
             self.scroll_anim.push(
                 @as(f32, @floatFromInt(rows)) * cell_h,
                 @floatFromInt(p.top),
                 @floatFromInt(p.bottom),
-                0,
+                @floatFromInt(p.left),
                 @floatFromInt(p.right),
                 p.limit,
             );
@@ -1918,9 +1939,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const typing = self.input_typed and
                 sinceMs(now, self.wheel_ts) > repaint_key_idle_ms and
                 self.terminal_state.cursor.visual_style == .bar;
-            if (typing or (sinceMs(now, self.input_activity_ts) > repaint_key_idle_ms and
-                sinceMs(now, self.scroll_chain_ts) > repaint_chain_ms))
-            {
+            // The chain only extends a gesture the user is still close to:
+            // see `repaint_chain_max_ms`.
+            const key_idle = sinceMs(now, self.input_activity_ts);
+            const chain_over = sinceMs(now, self.scroll_chain_ts) > repaint_chain_ms or
+                key_idle > repaint_chain_max_ms;
+            if (typing or (key_idle > repaint_key_idle_ms and chain_over)) {
                 self.scroll_chain_ts = null;
                 self.scroll_row_hashes.clearRetainingCapacity();
                 self.scroll_hashes_before.clearRetainingCapacity();
@@ -2014,7 +2038,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // The same direction, further, and across (nearly)
                         // the event's whole width: a tmux pane beside it
                         // moving on its own must not stretch this one.
-                        const wide = (whole.right - whole.left + 1) * 5 >= (pend.right + 1) * 4;
+                        const wide = (whole.right - whole.left + 1) * 5 >= (pend.right - pend.left + 1) * 4;
                         if (wide and (whole.rows > 0) == (pend.rows > 0) and @abs(whole.rows) > @abs(pend.rows))
                             self.scroll_event_total = whole.rows;
                     }
@@ -2400,10 +2424,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // band rows. A draw landing in between showed the old grid at the
             // new offset, or new image placements over the old grid -- for one
             // frame everything, or just a figure, sat a scroll's distance off
-            // and came back ("the image jumps up a line and back"). The draw
-            // thread waits at most one update for this.
-            self.draw_mutex.lockUncancelable(global.io());
-            var draw_held = true;
+            // and came back ("the image jumps up a line and back").
+            //
+            // It is taken at the first of those, never before: not before
+            // `lockDemand`. Waiting for the terminal while holding it made
+            // the GTK app thread wait out the IO thread too -- under heavy
+            // output (`cat` of a big file) every draw stalled for the length
+            // of the terminal wait, scroll animation on or off. The lock
+            // order terminal -> draw is the one upstream already uses for
+            // kittyUpdate, and drawFrame never takes the terminal lock.
+            var draw_held = false;
             defer if (draw_held) self.draw_mutex.unlock(global.io());
 
             // Update all our data as tightly as possible within the mutex.
@@ -2430,7 +2460,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Drain any region scroll the terminal recorded since the last
                 // frame. Left in place if we bail out above; it coalesces, so a
                 // skipped frame costs accuracy of timing, not of position.
-                const scroll_event = state.terminal.scroll_event;
+                //
+                // Its rows are rows of the ACTIVE area. With the viewport
+                // scrolled back into history those are not the rows on
+                // screen -- what is drawn did not move at all -- so the event
+                // is dropped, as the terminal already drops it on a resize or
+                // a screen switch.
+                const scroll_event = if (state.terminal.screens.active.pages.viewport == .active)
+                    state.terminal.scroll_event
+                else
+                    null;
                 state.terminal.scroll_event = null;
 
                 // If scroll-to-bottom on output is enabled, check if the final line
@@ -2517,7 +2556,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // kitty state on every frame because any cell change can move
                 // an image.
                 if (self.images.kittyRequiresUpdate(state.terminal)) {
-                    // The draw mutex is already held (see above).
+                    // Held from here to the rebuild (see above).
+                    if (!draw_held) {
+                        self.draw_mutex.lockUncancelable(global.io());
+                        draw_held = true;
+                    }
                     if (self.config.scroll_animation) {
                         self.scroll_prev_images.clearRetainingCapacity();
                         self.scroll_prev_images.appendSlice(self.alloc, self.images.kitty_placements.items) catch
@@ -2570,6 +2613,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             };
 
+            // The terminal is released; from here the scroll state drawFrame
+            // reads changes, so hold the draw mutex to the rebuild (see above).
+            if (!draw_held) {
+                self.draw_mutex.lockUncancelable(global.io());
+                draw_held = true;
+            }
+
             // Stage 2a of SPEC.md is detection only: prove we see the right
             // scrolls, with the right row counts and regions, before anything
             // visual depends on it. `index` is deliberately not yet hooked --
@@ -2586,7 +2636,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // the *region* top (not the cursor row `top`), whether it
                     // counted as narrowed, and the offset actually drawn.
                     log.info(
-                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} cell_h={d} mono_us={d}",
+                        "scroll event: rows={d} start={d} region={d}..{d} rows_total={d} src={s} cell_h={d} mono_us={d} cols={d}..{d}",
                         .{
                             ev.rows,
                             ev.top,
@@ -2596,6 +2646,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             @tagName(ev.source),
                             self.size.cell.height,
                             @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
+                            ev.left,
+                            ev.right,
                         },
                     );
                 } else {
@@ -2673,14 +2725,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :scroll;
                 }
 
-                // Displace by exactly the distance just scrolled, so the first
-                // animated frame reproduces the pre-scroll screen, and ease to
+                // `applyPendingScroll` displaces by exactly the distance just
+                // scrolled, so the first animated frame reproduces the
+                // pre-scroll screen, and eases to
                 // zero from there. The model is already current -- writes land
                 // during the animation and must not be delayed (SPEC stage 2)
                 // -- so this only ever moves what is drawn.
                 const cell_h: f32 = @floatFromInt(self.size.cell.height);
-                const rows: f32 = @floatFromInt(ev.rows);
-                const offset = rows * cell_h;
 
                 // Cap how far behind the model the drawn position may fall.
                 // Scrolls arrive faster than the ramp retires them during a
@@ -2735,15 +2786,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Applied after the frame is read (`applyPendingScroll`),
                 // not here: the frame may show the content moved FURTHER than
                 // this event says -- see "an event that undersells".
-                _ = offset;
+                //
+                // Across the columns the scroll moved: the whole width, or
+                // only between the left and right margins (DECSLRM) when the
+                // application set them -- tmux scrolls a pane beside another
+                // that way, and the pane next to it must hold still.
+                const last_col = self.size.grid().columns -| 1;
+                const right = @min(ev.right, last_col);
                 self.scroll_pending = .{
                     .rows = @intCast(ev.rows),
                     .top = ev.region_top,
                     .bottom = bottom,
-                    // An application that says it scrolled a region means the
-                    // whole width of it; only repaint detection can see a
-                    // scroll narrower than the screen.
-                    .right = self.size.grid().columns -| 1,
+                    .left = @min(ev.left, right),
+                    .right = right,
                     .limit = limit,
                 };
                 // (see applyPendingScroll)
@@ -3498,7 +3553,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // that frame is what paints over what it left behind.
             const volatile_now = self.scroll_anim.active() or
                 self.images.kitty_placements.items.len > 0 or
-                self.images.kitty_ghosts.items.len > 0 or
+                // Stale slices are never drawn (see `clearScrollGhosts`) and
+                // can sit here long after the animation that kept them.
+                (!self.scroll_image_ghosts_stale and self.images.kitty_ghosts.items.len > 0) or
                 self.overlay != null or
                 self.bg_image != null;
             const volatile_before = self.cache_last_volatile;

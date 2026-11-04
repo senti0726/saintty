@@ -29,6 +29,10 @@ struct Uniforms {
   // keep this struct byte-compatible with the Zig Uniforms; the Metal
   // shaders do not use it yet, so scroll animation is OpenGL-only.
   float4 scroll_anim;
+
+  // {left_col, right_col, unused, pin mask offset}. Unused here too, but
+  // declared for the same reason.
+  float4 scroll_anim_cols;
 };
 
 //-------------------------------------------------------------------
