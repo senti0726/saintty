@@ -2653,3 +2653,86 @@ already armed, hence "sometimes". Measured with `--scroll-trace` and nvim driven
 over `--listen`: i/Esc 2.5 s apart = 2 frames in the 0.6 s after each mode event;
 after the fix (updateFrame notes a `visual_style` / `colors.cursor` change and
 sets `cursor_fx_last_event`, like the pulse and boom paths) 25-32 frames.
+
+## 2026-11-04 — renderer ultrareview: four bugs, six nits
+
+### Why
+
+The branch was too big for one `/ultrareview` (72 files, 18.5k lines), so it
+was split into three pieces under `~/playground/ghostty-review/`
+(`renderer`, `core`, `harness`), each with a `review/<piece>-base` branch
+holding everything else. The renderer piece (21 files, `generic.zig`,
+`scroll_anim.zig`, shaders) came back with 10 findings, each verified by the
+reviewers against the code. Fixed in `92f160f99` on `review/renderer`.
+
+### Bugs (all fixed)
+
+1. **GTK draws stalled under heavy output, animation on or off.**
+   `updateFrame` took `draw_mutex` *before* `lockDemand`, so while the IO
+   thread held the terminal (`cat` of a big file, a build log) the GTK app
+   thread's draw waited out the IO thread as well as the update. Upstream only
+   took it around `kittyUpdate` and the rebuild. Now taken at `kittyUpdate`
+   (order terminal -> draw, as upstream) or right after the terminal is
+   released, and held to the rebuild as before -- the "image jumps a line
+   and back" reason for holding it is unchanged.
+2. **Scrolled-back history jumped.** `ScrollEvent` rows are active-area rows;
+   with the viewport in scrollback (`scroll-to-bottom` is keystroke-only by
+   default, so it stays there while Claude Code streams) the event was still
+   animated over viewport rows, sliding history that never moved. The event
+   is now dropped unless `pages.viewport == .active`, as the terminal already
+   drops it on resize and screen switch.
+3. **tmux side-by-side panes: the still pane slid.** Ghostty's terminfo
+   advertises `Cmg`/`Clmg`/`Enmg`, so tmux scrolls a pane with DECSLRM margins
+   and SU/SD/RI. `noteScroll` recorded rows only and the renderer pushed
+   columns `0..cols-1`. `ScrollEvent` now carries `left`/`right`, coalesces
+   only when they match, and `scroll_pending` -> `applyPendingScroll` ->
+   `keepScrollGhosts`/`push` use them (the "undersold event" width check too).
+4. **Command output slid as if scrolled.** Enter opens the repaint gate for
+   150 ms like any key; output that started inside it and kept shifting <= 8
+   rows a frame re-armed `scroll_chain_ts` every frame, so `make`, `tail -f`,
+   `pytest -v` slid (with ghost rows and per-frame hashing) for their whole
+   run. New `repaint_chain_max_ms` (600): the chain closes once the last key
+   or wheel movement is that old. Held keys and wheels refresh the input time,
+   and 600 covers neoscroll's 450 ms glide.
+
+### Nits
+
+- Fixed: `advanceScrollAnim` truncated `dt` to whole ms while moving
+  `scroll_anim_last` to `now`, so every animation ran 4% (60/120 Hz) to ~14%
+  (144 Hz) longer than `scroll-animation-duration`. Now exact.
+- Fixed: `takeCacheDamage` counted stale `kitty_ghosts` (marked by
+  `clearScrollGhosts`, emptied only by the next scroll) as volatile, so
+  `custom-shader-cache` redrew the whole window after an animation with an
+  image in it, until the next scroll.
+- Fixed: `noteInputActivity`/`noteWheelActivity` wrote `key_paced`,
+  `wheel_ts`, `wheel_fast_ts` and `wheel_dir` from the renderer mailbox while
+  GTK's `drawFrame` read them on the app thread. Both now take `draw_mutex`.
+- Fixed: Metal `Uniforms` lacked `scroll_anim_cols` though its comment claimed
+  byte compatibility with the Zig struct.
+- Fixed: dead `offset`/`_ = offset`; doc comments sitting on `assert`,
+  `repaint_key_idle_ms` and (in `Terminal.zig`) `ScrollEvent` instead of
+  their own declarations.
+- **Not done:** `detectRepaintScroll` allocates and frees an `n*cols` u64 hash
+  buffer every gated frame and copies it two or three times
+  (`scroll_row_hashes`, `scroll_hashes_before`, `scroll_pre_event_hashes`),
+  ~90 KB on a 55x210 grid. Rotating three retained buffers would remove the
+  churn; left because it touches every reader of those lists.
+
+### Verified
+
+- `zig build -Doptimize=ReleaseFast` clean; `zig build test` filters
+  `scroll` (355), `renderer` (205), `Terminal` (539) all pass. The stray
+  "failed command" line in the `Terminal` run is upstream's
+  `benchmark/TerminalFormatter.zig` test printing to stderr.
+- New test `Terminal: noteScroll records left and right margins`, shown to
+  fail when broken.
+- Live: the built binary with `--scroll-trace` (the trace line now ends in
+  `cols=L..R`, after `mono_us` so the harness regexes still match) ran six
+  SU under `CSI 1;40 s` and six without in an 80-column window: logged
+  `cols=0..39` and `cols=0..79`; 20k lines of `cat` afterwards, no crash.
+
+### Not verified
+
+Bugs 2 and 4 by hand: both need a person at the keyboard (scroll back, then
+let Claude Code stream; press Enter on `make`). The fix for each is a gate on
+a condition, read off the code, not a measured before/after.
