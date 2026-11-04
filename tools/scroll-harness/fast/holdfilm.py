@@ -44,18 +44,27 @@ import filmscan  # noqa: E402
 import run  # noqa: E402
 import scenarios  # noqa: E402
 
-W, H = 1920, 1200
-TOP, BOTTOM, LEFT = 40, 80, 70  # full-res crop: tmux bar, nvim status + tmux status, relative-number gutter
-CELL = 20  # px per text row at this display's font size
-REFRESH = 1 / 60.004
+# Defaults: eDP-1 1920x1200@60. For another output set HOLDFILM_OUTPUT,
+# HOLDFILM_SIZE=WxH (the size the film is SCALED to), HOLDFILM_CELL (px per row
+# at that size) and HOLDFILM_HZ, e.g. the 4K@120 monitor at scale 2.4:
+# HOLDFILM_OUTPUT=HDMI-A-1 HOLDFILM_SIZE=1920x1080 HOLDFILM_CELL=<cell_h/2> HOLDFILM_HZ=120
+OUTPUT = os.environ.get("HOLDFILM_OUTPUT", "eDP-1")
+W, H = (int(x) for x in os.environ.get("HOLDFILM_SIZE", "1920x1200").split("x"))
+CELL = float(os.environ.get("HOLDFILM_CELL", 20))  # px per text row at this display's font size
+# full-res crop: tmux bar, nvim status + tmux status, relative-number gutter
+TOP, BOTTOM, LEFT = int(CELL * 2), int(CELL * 4), int(CELL * 3.5)
+REFRESH = 1 / float(os.environ.get("HOLDFILM_HZ", 60.004))
+SCALE = os.environ.get("HOLDFILM_SIZE")  # set => let ffmpeg scale the capture
 
 
 class Film:
     """Every compositor frame of one output, gray, halved, stamped on arrival."""
 
-    def __init__(self, output="eDP-1"):
+    def __init__(self, output=OUTPUT):
         self.frames = []
         cmd = ["wf-recorder", "-y", "-o", output, "-c", "rawvideo", "-x", "gray", "-m", "rawvideo", "-f", "/dev/stdout"]
+        if SCALE:
+            cmd[-2:-2] = ["-F", f"scale={W}:{H}:flags=fast_bilinear"]
         self.rec = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         self.t = threading.Thread(target=self._read, daemon=True)
         self.t.start()
@@ -177,7 +186,7 @@ def analyse(frames, events, nv_us, name, png_dir=None, tag=""):
         film_skipped_refreshes=int(np.clip(np.round(dt) - 1, 0, None).sum()),
     )
     # torn frames: a duplicated row that neither neighbour frame has
-    dups = [len(filmscan.dup_rows(crop(f), CELL // 2)) for _, f in sel]
+    dups = [len(filmscan.dup_rows(crop(f), int(CELL // 2))) for _, f in sel]
     res["tears"] = sum(1 for i in range(1, len(dups) - 1) if dups[i] > max(dups[i - 1], dups[i + 1]))
     res["_tear_idx"] = [i for i in range(1, len(dups) - 1) if dups[i] > max(dups[i - 1], dups[i + 1])]
     res["tear_times"] = [round(float(t[i]), 4) for i in res["_tear_idx"]]
