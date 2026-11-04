@@ -47,7 +47,7 @@ TRACE = re.compile(r"scrolltrace t_us=-?\d+ model_rows=(-?\d+) off_px=(-?[\d.]+)
 EVENT = re.compile(r"scroll event: rows=(-?\d+) .*src=(\w+) cell_h=\d+ mono_us=(\d+)")
 REPAINT = re.compile(r"repaintscroll shift=(-?\d+) .* mono_us=(\d+)")
 SINPUT = re.compile(r"scrollinput mono_us=(\d+) yoff=(-?[\d.]+) precision=(\w+) momentum=(\w+)")
-KINPUT = re.compile(r"keyinput mono_us=(\d+) key=(\w+) action=(\w+)")
+KINPUT = re.compile(r"keyinput mono_us=(\d+) action=(\w+)")
 
 
 COLS = re.compile(r"cols=(\d+)\.\.(\d+) of \d+x(\d+)")
@@ -89,7 +89,7 @@ def load(run: Path, name: str):
     events = [(int(m[3]), int(m[1]), m[2]) for m in EVENT.finditer(g)]
     repaints = [(int(m[2]), int(m[1])) for m in REPAINT.finditer(g)]
     sin = [(int(m[1]), float(m[2]), m[3], m[4]) for m in SINPUT.finditer(g)]
-    kin = [(int(m[1]), m[2], m[3]) for m in KINPUT.finditer(g)]
+    kin = [(int(m[1]), m[2]) for m in KINPUT.finditer(g)]
     inp = []
     for line in (run / f"{name}.input.log").read_text().splitlines():
         t, k, v = line.split()

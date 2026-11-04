@@ -4486,6 +4486,20 @@ test "Terminal: switching screens discards a pending scroll" {
     try testing.expect(t.scroll_event == null);
 }
 
+test "Terminal: full reset discards a pending scroll" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    _ = try t.switchScreen(.alternate);
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    try testing.expect(t.scroll_event != null);
+
+    // RIS leaves the alternate screen without going through switchScreen.
+    t.fullReset();
+    try testing.expect(t.scroll_event == null);
+}
+
 test "Terminal: noteScroll records rows and region" {
     var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
     defer t.deinit(testing.allocator);
@@ -5178,6 +5192,11 @@ pub fn plainStringUnwrapped(self: *Terminal, alloc: Allocator) ![]const u8 {
 /// this will reuse the existing memory. In the latter case, memory may
 /// be wasted (since its unused) but it isn't leaked.
 pub fn fullReset(self: *Terminal) void {
+    // A pending scroll describes the grid being cleared; animated over the
+    // fresh screen it would slide the new prompt in from rows away. This
+    // goes through screens.switchTo, not switchScreen, so clear it here too.
+    self.scroll_event = null;
+
     // Ensure we're back on primary screen
     self.screens.switchTo(.primary);
     self.screens.remove(

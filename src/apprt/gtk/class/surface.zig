@@ -1932,6 +1932,13 @@ pub const Surface = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
 
+        // The replay timer holds a bare pointer to us, so it must not outlive
+        // the widget: closing a surface mid-replay was a use-after-free.
+        if (priv.replay_timer != 0) {
+            _ = glib.Source.remove(priv.replay_timer);
+            priv.replay_timer = 0;
+        }
+
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
@@ -2024,6 +2031,7 @@ pub const Surface = extern struct {
             glib.free(@ptrCast(@constCast(v)));
             priv.mouse_hover_url = null;
         }
+        self.freeScrollReplay();
         if (priv.default_size) |v| {
             ext.boxedFree(Size, v);
             priv.default_size = null;
@@ -3117,9 +3125,13 @@ pub const Surface = extern struct {
     }
 
     /// Remove the tick but keep the velocity, so it can be stacked onto.
+    ///
+    /// Only a running fling is paused. Every scroll event lands here, and
+    /// re-stamping the pause time on each one kept a stopped fling's velocity
+    /// "fresh" forever, so a flick minutes later stacked all of it.
     fn momentumPause(self: *Self) void {
         const priv = self.private();
-        if (priv.momentum_tick == null and priv.momentum_velocity == 0.0) return;
+        if (priv.momentum_tick == null) return;
         self.momentumCancelTick();
         priv.momentum_paused_us = self.momentumNowUs();
     }
@@ -3341,6 +3353,14 @@ pub const Surface = extern struct {
         priv.replay_timer = glib.timeoutAdd(8, scrollReplayTick, self);
     }
 
+    fn freeScrollReplay(self: *Self) void {
+        const priv = self.private();
+        if (priv.replay) |v| {
+            Application.default().allocator().free(v);
+            priv.replay = null;
+        }
+    }
+
     fn scrollReplayTick(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
         const priv = self.private();
@@ -3349,6 +3369,7 @@ pub const Surface = extern struct {
         if (priv.replay_idx >= samples.len) {
             log.info("scroll replay: done", .{});
             priv.replay_timer = 0;
+            self.freeScrollReplay();
             return 0;
         }
 
@@ -3362,6 +3383,10 @@ pub const Surface = extern struct {
             // sets the precision flag, so go through the same entry point
             // rather than a shortcut, or the test stops testing the thing that
             // breaks.
+            // Put the flag back afterwards: left set, every later notch of a
+            // real wheel would be treated as a touchpad.
+            const was_precision = priv.precision_scroll;
+            defer priv.precision_scroll = was_precision;
             priv.precision_scroll = true;
             _ = ecMouseScrollVertical(undefined, 0, dy, self);
         }
