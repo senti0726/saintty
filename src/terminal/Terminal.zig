@@ -196,11 +196,6 @@ pub const Colors = struct {
     };
 };
 
-/// Returns the current color for an xterm OSC color target.
-///
-/// Unsupported dynamic and special colors return null. The cursor color
-/// follows xterm-style reporting and falls back to the foreground color when
-/// no explicit cursor color is set.
 pub const ScrollEvent = struct {
     /// Rows scrolled. Positive means content moved up (new content appears at
     /// the bottom), matching the sense of `scrollUp`.
@@ -221,6 +216,12 @@ pub const ScrollEvent = struct {
     /// application deliberately parks outside the margins -- a status bar, a
     /// prompt box.
     region_top: usize = 0,
+
+    /// The left and right margins (DECSLRM), inclusive. With left/right
+    /// margins set, a scroll moves only these columns -- tmux scrolls a
+    /// pane beside another this way -- and the columns outside hold still.
+    left: usize = 0,
+    right: usize = 0,
 
     /// Which primitive produced this. `index` fires on every newline at the
     /// bottom of the screen, so it is by far the most common and is the one
@@ -267,7 +268,9 @@ pub fn noteScroll(
         if (height * 4 < self.rows) return;
     }
     if (self.scroll_event) |*ev| {
-        if (ev.top == top and ev.bottom == bottom) {
+        if (ev.top == top and ev.bottom == bottom and
+            ev.left == region.left and ev.right == region.right)
+        {
             ev.rows += rows;
             ev.source = source;
             return;
@@ -278,10 +281,17 @@ pub fn noteScroll(
         .top = top,
         .bottom = bottom,
         .region_top = region.top,
+        .left = region.left,
+        .right = region.right,
         .source = source,
     };
 }
 
+/// Returns the current color for an xterm OSC color target.
+///
+/// Unsupported dynamic and special colors return null. The cursor color
+/// follows xterm-style reporting and falls back to the foreground color when
+/// no explicit cursor color is set.
 pub fn colorForXterm(self: *const Terminal, target: osc.color.Target) ?color.RGB {
     return switch (target) {
         .palette => |i| self.colors.palette.current[i],
@@ -4498,6 +4508,32 @@ test "Terminal: noteScroll records rows and region" {
     try testing.expectEqual(@as(usize, 2), ev.top);
     try testing.expectEqual(@as(usize, 7), ev.bottom);
     try testing.expectEqual(Terminal.ScrollEvent.Source.scroll_up, ev.source);
+    try testing.expectEqual(@as(usize, 0), ev.left);
+    try testing.expectEqual(@as(usize, 9), ev.right);
+}
+
+test "Terminal: noteScroll records left and right margins" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    // tmux scrolls a pane beside another with DECSLRM set: only the pane's
+    // columns move, and the event has to say which.
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(1, 5);
+    try t.scrollUp(1);
+
+    const ev = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 1), ev.rows);
+    try testing.expectEqual(@as(usize, 0), ev.left);
+    try testing.expectEqual(@as(usize, 4), ev.right);
+
+    // Another pane's scroll does not coalesce into this one.
+    t.setLeftAndRightMargin(7, 10);
+    try t.scrollUp(1);
+    const ev2 = t.scroll_event.?;
+    try testing.expectEqual(@as(isize, 1), ev2.rows);
+    try testing.expectEqual(@as(usize, 6), ev2.left);
+    try testing.expectEqual(@as(usize, 9), ev2.right);
 }
 
 test "Terminal: noteScroll coalesces within a region" {
