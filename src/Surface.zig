@@ -2683,11 +2683,20 @@ pub fn keyCallback(
 ) !InputEffect {
     // log.warn("text keyCallback event={}", .{event_orig});
 
-    if (self.config.scroll_trace and event_orig.action != .release) log.info("keyinput mono_us={d} key={s} action={s}", .{
-        @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
-        @tagName(event_orig.key),
-        @tagName(event_orig.action),
-    });
+    // Only the time and the action: the trace goes to the log in release
+    // builds too, and the key would make it a keylogger. Nothing at all while
+    // a password is being typed, since even the timing says something.
+    if (self.config.scroll_trace and event_orig.action != .release) trace: {
+        {
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+            if (self.io.terminal.flags.password_input) break :trace;
+        }
+        log.info("keyinput mono_us={d} action={s}", .{
+            @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us),
+            @tagName(event_orig.action),
+        });
+    }
 
     // Apply key remappings to transform modifiers before any processing.
     // This allows users to remap modifier keys at the app level.
@@ -6772,6 +6781,7 @@ const WheelFlow = struct {
     sent: u32 = 0,
     acked: u32 = 0,
     ack_ts: ?std.Io.Timestamp = null,
+    last_ts: ?std.Io.Timestamp = null,
 
     const opt_in_ns: i96 = std.time.ns_per_s;
     const lost_ns: i96 = 250 * std.time.ns_per_ms;
@@ -6779,9 +6789,17 @@ const WheelFlow = struct {
     /// How many of `want` wheel events to send now, given the terminal's
     /// running ack total.
     fn budget(self: *WheelFlow, now: std.Io.Timestamp, acked_total: u32, want: u32, max: u32) u32 {
+        // An ack is only seen here, on the next wheel event, so its time is
+        // the time it was noticed. After a pause that is no time at all: the
+        // last acks of a scroll arrive after its last event, and stamping
+        // them "now" on the next scroll -- maybe minutes later, maybe in an
+        // application that never acks -- made the limiter live and dropped
+        // its notches. An ack first seen after `opt_in_ns` of quiet is old.
+        const fresh = if (self.last_ts) |t| now.nanoseconds - t.nanoseconds < opt_in_ns else false;
+        self.last_ts = now;
         if (acked_total != self.acked) {
             self.acked = acked_total;
-            self.ack_ts = now;
+            if (fresh) self.ack_ts = now;
         }
         const since: ?i96 = if (self.ack_ts) |t| now.nanoseconds - t.nanoseconds else null;
         const live = max > 0 and since != null and since.? < opt_in_ns;
@@ -6829,6 +6847,18 @@ test "WheelFlow: lost events are written off, silence ends it" {
     try std.testing.expectEqual(@as(u32, 6), f.budget(testTs(300), 1, 6, 6));
     // No ack for a second: not limited at all.
     try std.testing.expectEqual(@as(u32, 50), f.budget(testTs(1500), 1, 50, 6));
+}
+
+test "WheelFlow: acks left over from an earlier scroll do not limit the next" {
+    var f: WheelFlow = .{};
+    _ = f.budget(testTs(0), 0, 3, 6);
+    _ = f.budget(testTs(5), 1, 3, 6);
+    // The last acks land after the scroll's final event. The next scroll,
+    // a minute later in an application that does not ack, is not limited.
+    for (0..5) |i| try std.testing.expectEqual(
+        @as(u32, 3),
+        f.budget(testTs(60_000 + @as(i96, @intCast(i)) * 10), 4, 3, 6),
+    );
 }
 
 test "WheelFlow: 0 turns it off" {

@@ -1032,29 +1032,6 @@ palette: Palette = .{},
 /// so raising this also makes repeated flicks build speed more readily.
 @"mouse-scroll-momentum-decay": f64 = 0.45,
 
-/// Animate scrolling that an application performs, rather than snapping.
-///
-/// When a program scrolls part of the screen -- tmux moving a pane in
-/// copy-mode, a pager, an editor -- the affected rows slide into place over a
-/// few frames instead of jumping. Only the rows the application actually
-/// scrolled move; anything outside the scrolling region, such as tmux's status
-/// line, stays put.
-///
-/// This trades a few milliseconds of latency for continuity: the content is
-/// shown arriving rather than already arrived. The duration is
-/// `scroll-animation-duration`.
-///
-/// Experimental. Currently only implemented on the OpenGL renderer.
-/// Draw sub-row scroll positions instead of snapping to whole rows.
-///
-/// A touchpad reports a fraction of a row at a time. Without this, that
-/// fraction is accumulated invisibly and the screen only moves once a whole
-/// row has built up, so scrolling half a row shows nothing and scrolling a
-/// bit more jumps a full line. With it, content is drawn where the gesture
-/// actually is.
-///
-/// This supersedes `scroll-animation` for scrolls you drive yourself: the
-/// position is already continuous, so there is nothing to ease afterwards.
 /// Replay a recorded list of touchpad scroll samples on startup, for testing.
 ///
 /// The file holds one signed pixel delta per line, in the units GTK reports
@@ -1086,6 +1063,19 @@ palette: Palette = .{},
 /// prompt box is what you want anyway.
 @"scroll-animation-reserve-bottom": u8 = 0,
 
+/// Animate scrolling that an application performs, rather than snapping.
+///
+/// When a program scrolls part of the screen -- tmux moving a pane in
+/// copy-mode, a pager, an editor -- the affected rows slide into place over a
+/// few frames instead of jumping. Only the rows the application actually
+/// scrolled move; anything outside the scrolling region, such as tmux's status
+/// line, stays put.
+///
+/// This trades a few milliseconds of latency for continuity: the content is
+/// shown arriving rather than already arrived. The duration is
+/// `scroll-animation-duration`.
+///
+/// Experimental. Currently only implemented on the OpenGL renderer.
 @"scroll-animation": bool = false,
 
 /// Emit a per-frame trace of the scroll animation to the debug log.
@@ -1095,7 +1085,10 @@ palette: Palette = .{},
 /// and the current drawn offset, which is enough to reconstruct exactly where
 /// the content sat on screen at every frame. See tools/scroll-harness.
 ///
-/// Debug builds only; it is very noisy.
+/// Also logs the time of each key press and the wheel events dropped by
+/// `mouse-wheel-in-flight`, never which key, and nothing while a password is
+/// being typed. Logged at info level, so release builds write it too; it is
+/// very noisy, so leave it off outside measurement.
 @"scroll-trace": bool = false,
 
 /// Most wheel events waiting on an application that acknowledges them
