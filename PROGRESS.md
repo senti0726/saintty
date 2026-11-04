@@ -2736,3 +2736,79 @@ reviewers against the code. Fixed in `92f160f99` on `review/renderer`.
 Bugs 2 and 4 by hand: both need a person at the keyboard (scroll back, then
 let Claude Code stream; press Enter on `make`). The fix for each is a gate on
 a condition, read off the code, not a measured before/after.
+
+## 2026-11-04 — core ultrareview: three bugs, six nits
+
+### Why
+
+Second of the three `/ultrareview` pieces (see the renderer entry above):
+`core`, 13 files, 1.6k lines -- `Surface.zig`, the GTK surface, `Config.zig`,
+`Terminal.zig`, the OSC parser. 10 findings came back, each verified by the
+reviewers against the code. Fixed in `ce5993cd0` on `review/core`,
+cherry-picked here as `9265faf63`.
+
+### Bugs (all fixed)
+
+1. **Closing a tab mid-replay was a use-after-free.** `scroll-input-script`
+   starts an 8 ms `glib.timeoutAdd` holding a bare `self`; nothing removed
+   it, so closing the surface before the replay ended left it firing on the
+   freed widget. The sample slice also leaked. `dispose` now removes the
+   timer; the samples are freed when the replay ends and in `finalize`.
+2. **`scroll-trace` was a keylogger.** `keyCallback` logged
+   `key=<physical key>` for every press at info level -- which release
+   builds write (stderr/journald), password prompts included, despite the
+   doc saying "Debug builds only". The line is now
+   `keyinput mono_us=N action=press|repeat`, skipped entirely while
+   `password_input` is set. `fast/analyse.py` only ever counted these lines,
+   so its regex just lost the key group. The option's doc now says what it
+   logs and that release builds log it.
+3. **A stopped fling came back at full speed.** `momentumPause` runs on every
+   scroll event and re-stamped `momentum_paused_us` each time, so the decay
+   in `::decelerate` always saw a gap of a few ms: stop a 3000 px/s fling,
+   flick gently minutes later, and it went off at 3000. Only a *running*
+   fling is paused (stamped) now. Only with `mouse-scroll-momentum` on.
+
+### Nits
+
+- Fixed: the replay set `precision_scroll = true` and never put it back, so
+  a real wheel afterwards was treated as a touchpad. Restored per sample.
+- Fixed: `WheelFlow.budget` stamped an ack with the time it *noticed* it.
+  The last acks of an nvim scroll land after its last wheel event, so the
+  next scroll -- even minutes later, in htop or tmux copy-mode that never
+  ack -- saw a "fresh" ack, armed the limiter and dropped notches for up to
+  250 ms. An ack first seen after `opt_in_ns` (1 s) without a wheel event is
+  now stale. New test `WheelFlow: acks left over from an earlier scroll do
+  not limit the next`.
+- Fixed: RIS (`reset`, `ESC c`) left a pending `scroll_event`, because
+  `fullReset` uses `screens.switchTo`, not `switchScreen`; the new prompt
+  slid in from rows away. Cleared there too; new test `Terminal: full reset
+  discards a pending scroll`.
+- Fixed: `osc.h` had no constants for the fork's OSC command types; added
+  `CURSOR_PULSE = 27`, `CURSOR_BOOM = 28`, `WHEEL_ACK = 29` and manifest
+  test entries.
+- Fixed: `scroll-animation`'s doc was glued onto `scroll-input-script`
+  together with the doc of `scroll-pixel-perfect` (removed in `ed2ac7fdc`);
+  split back, orphan dropped.
+- **Already fixed by the renderer review:** DECSLRM margins ignored by
+  `noteScroll` (renderer bug 3) and `ScrollEvent` sitting under
+  `colorForXterm`'s doc. Not touched again.
+- **Not done:** horizontal precision scroll still throws away its sub-cell
+  remainder (`pending_scroll_x = poff - amount * cell_size` with the
+  unrounded `amount`). Pre-existing upstream, not this branch's.
+
+### Verified
+
+- `zig build` clean on `review/core` and here; `zig build test` filters
+  `WheelFlow`, `Terminal`, `scroll` and `test-lib-vt` `manifest` pass.
+- Both new tests shown to fail with their fix removed (`expected 3, found
+  1`; `TestUnexpectedResult`).
+- Live, bug 1: the built binary with a 1200-sample (~10 s) replay and
+  `-e sh -c 'sleep 2'`: the surface closed 2 s in, mid-replay, and the app
+  ran on 3 s more and exited 0 with no crash. Not shown to crash *without*
+  the fix -- whether freed memory faults is luck.
+
+### Not verified
+
+Bugs 2 and 3 and the precision nit by hand: no key-press trace was captured
+under a password prompt, and the fling fix needs a touchpad. Each is read
+off the code.
