@@ -96,6 +96,10 @@ class Rig:
                 name = k[1].strip()
                 if "scroll-state.conf" in name:
                     continue
+                # HARNESS_DROP_INCLUDES=a.conf,b.conf leaves those includes out
+                # too (an include beats an appended override, see above)
+                if any(x and x in name for x in os.environ.get("HARNESS_DROP_INCLUDES", "").split(",")):
+                    continue
                 opt = name.startswith("?")
                 name = name.lstrip("?")
                 line = f"config-file = {'?' if opt else ''}{d / name}"

@@ -62,6 +62,14 @@ class Film:
 
     def __init__(self, output=OUTPUT):
         self.frames = []
+        if os.environ.get("HOLDFILM_NOFILM"):
+            # Trace-only runs: at 4K@120 the recorder's own screencopy costs
+            # the compositor ~30 % GPU and slows what it films.
+            cmd = ["sleep", "infinity"]
+            self.rec = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+            self.t = threading.Thread(target=lambda: None)
+            self.t.start()
+            return
         cmd = ["wf-recorder", "-y", "-o", output, "-c", "rawvideo", "-x", "gray", "-m", "rawvideo", "-f", "/dev/stdout"]
         if SCALE:
             cmd[-2:-2] = ["-F", f"scale={W}:{H}:flags=fast_bilinear"]
