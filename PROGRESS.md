@@ -2812,3 +2812,24 @@ cherry-picked here as `9265faf63`.
 Bugs 2 and 3 and the precision nit by hand: no key-press trace was captured
 under a password prompt, and the fling fix needs a touchpad. Each is read
 off the code.
+
+## 2026-11-04 — icon columns ride on the moved rows, not the whole screen
+
+yazi's folder icons stood still while names slid: bare now and then, a tmux
+pane 7/12, the `<p> e` popup every step. `rides` (ca97bda0c) needed 80 % of a
+column's still cells to match the shift, counted down the WHOLE screen; the
+rows around the list (yazi's bars, the popup border, the pane behind it) are
+still and match nothing, so in the popup the icon column read 19/27 = 0.70,
+became a divider, and the region began at the names' first digit
+(`cols=43..68`, icon at 34). Now `rides` is judged on rows where at least
+`moved_row_cells` (1) cell moved with the shift; the old whole-screen rule is
+kept as a fallback. 3 cells missed the tail of a near-identical list
+(`file-NN.txt` changes one digit a row). Live (headless cage, 70 j): bare and
+tmux 12/12 `20..68`, popup 10/10 `32..68`. New test from a dumped popup
+frame; 110 detectShift / 359 scroll tests pass.
+
+Debug aid: `GHOSTTY_HASH_DUMP=<file>` appends `u32 rows, u32 cols, prev,
+cur` cell keys for every detected repaint scroll. Plain `capture-pane`
+replays gave the RIGHT answer here (no styles, no mid-redraw frames), so
+dump from Ghostty itself when a detector decision looks wrong.
+Installed; rollback `~/tools/ghostty/bin/ghostty.pre-icons`.

@@ -2156,6 +2156,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (was_idle) self.scroll_anim_last = null;
             self.scroll_chain_ts = now;
 
+            // Debugging aid: GHOSTTY_HASH_DUMP=<file> appends the two cell-key
+            // grids of every detected repaint scroll (u32 rows, u32 cols, prev, cur),
+            // for replaying `detectShift` offline.
+            if (std.c.getenv("GHOSTTY_HASH_DUMP")) |dp| {
+                const fd = std.c.open(dp, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(c_uint, 0o644));
+                if (fd >= 0) {
+                    defer _ = std.c.close(fd);
+                    const hdr = [2]u32{ @intCast(n), @intCast(cols) };
+                    const pb = std.mem.sliceAsBytes(prev);
+                    const cb = std.mem.sliceAsBytes(cur);
+                    _ = std.c.write(fd, std.mem.asBytes(&hdr), 8);
+                    _ = std.c.write(fd, pb.ptr, pb.len);
+                    _ = std.c.write(fd, cb.ptr, cb.len);
+                }
+            }
             if (self.config.scroll_trace) log.info(
                 "repaintscroll shift={d} rows={d}..{d} clamped={d}..{d} cols={d}..{d} of {d}x{d} mono_us={d}",
                 .{ shift.rows, shift.top, shift.bottom, top, bottom, shift.left, shift.right, n, cols, @divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us) },

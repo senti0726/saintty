@@ -1387,6 +1387,16 @@ const edge_bridge_cols: usize = 2;
 /// that really scrolls is wider than any gutter.
 const min_region_cols: usize = 6;
 
+/// A row counts as having moved with a shift (for `rides`) when this many of
+/// its cells did. One is enough: a pane holding still changes no glyph, so
+/// it testifies to nothing, and near-identical names (`file-07.txt`,
+/// `file-08.txt`) change only a digit or two per row.
+const moved_row_cells: usize = 1;
+
+/// The tallest screen whose moved rows are tracked for `rides`; taller ones
+/// fall back to judging the whole screen.
+const max_detect_rows_judged: usize = 512;
+
 /// A scroll starting this close to the left edge takes the edge with it: the
 /// strip is a line-number gutter. See `detectShift`.
 const gutter_cols: usize = 5;
@@ -1662,23 +1672,65 @@ pub fn detectShiftDir(
     // that merely held still -- see the gutter rule below.
     var ruled: [max_detect_cols]bool = undefined;
     const judged = cols <= max_detect_cols;
+    // Whether a column rides is judged on the rows that MOVED only. Counted
+    // down the whole screen, the rows around a list that does not fill it --
+    // yazi's header and status bar, a tmux popup's border, and the pane
+    // behind the popup -- are still cells that match no shift, and they sank
+    // an icon column under the 0.8 below: in a `<p> e` popup (35 rows, list
+    // 22) the folder icons and the `folder-` prefix every name shared read
+    // 19 of 27 (0.70), counted as dividers, and the scroll began at the first
+    // digit -- names slid while their icons stood still (2026-11-04). Bare
+    // yazi passed only just, so it failed now and then. A row moved when at
+    // least `moved_row_cells` of its cells moved with the shift.
+    var moved: [max_detect_rows_judged]bool = undefined;
+    var n_moved: usize = 0;
+    const rows_judged = rows <= max_detect_rows_judged;
+    if (judged and rows_judged) for (0..rows) |i_| {
+        moved[i_] = false;
+        const j_ = @as(isize, @intCast(i_)) + best_shift;
+        if (j_ < 0 or j_ >= n) continue;
+        const src = @as(usize, @intCast(j_)) * cols;
+        var hits: usize = 0;
+        for (0..cols) |c| {
+            if (movedWith(cur[i_ * cols + c], prev[i_ * cols + c], prev[src + c])) hits += 1;
+        }
+        moved[i_] = hits >= moved_row_cells;
+        if (moved[i_]) n_moved += 1;
+    };
     if (judged) for (0..cols) |c| {
         verdicts[c] = columnVerdict(Verdict, cur, prev, rows, cols, c, best_shift, min_rows, min_ratio);
         var still: usize = 0;
         var same: usize = 0;
         var rules: usize = 0;
+        var still_m: usize = 0;
+        var same_m: usize = 0;
+        var rules_m: usize = 0;
         for (0..rows) |i_| {
             const k = cur[i_ * cols + c];
             if (k == prev[i_ * cols + c] and glyphOf(k) != blank_glyph) {
+                const in_moved = rows_judged and moved[i_];
                 still += 1;
-                if (isVerticalRule(k)) rules += 1;
+                if (in_moved) still_m += 1;
+                if (isVerticalRule(k)) {
+                    rules += 1;
+                    if (in_moved) rules_m += 1;
+                }
                 const j_ = @as(isize, @intCast(i_)) + best_shift;
-                if (j_ >= 0 and j_ < n and prev[@as(usize, @intCast(j_)) * cols + c] == k) same += 1;
+                if (j_ >= 0 and j_ < n and prev[@as(usize, @intCast(j_)) * cols + c] == k) {
+                    same += 1;
+                    if (in_moved) same_m += 1;
+                }
             }
         }
         const is_still = @as(f32, @floatFromInt(still)) >= divider_ratio * @as(f32, @floatFromInt(rows));
-        rides[c] = is_still and rules * 2 < still and
-            @as(f32, @floatFromInt(same)) >= 0.8 * @as(f32, @floatFromInt(still));
+        // On the moved rows: still down most of them, not drawn as a border,
+        // and what the shift would have put there.
+        const rides_moved = n_moved >= min_rows and
+            @as(f32, @floatFromInt(still_m)) >= divider_ratio * @as(f32, @floatFromInt(n_moved)) and
+            rules_m * 2 < still_m and
+            @as(f32, @floatFromInt(same_m)) >= 0.8 * @as(f32, @floatFromInt(still_m));
+        rides[c] = rides_moved or (is_still and rules * 2 < still and
+            @as(f32, @floatFromInt(same)) >= 0.8 * @as(f32, @floatFromInt(still)));
         divider[c] = is_still and !rides[c];
         ruled[c] = is_still and rules * 2 >= still;
     };
@@ -3631,3 +3683,27 @@ test "detectShift: the cursor walking a list too short to scroll is not a scroll
 }
 
 
+
+test "detectShift: an icon column in a popup rides with the names" {
+    // yazi in a tmux popup (`<p> e`, 35x139, list rows 6..27), one `j` that
+    // scrolls, cell keys dumped by GHOSTTY_HASH_DUMP (2026-11-04). The folder
+    // icons (col 34) and the `folder-` prefix every name shares (36..42) are
+    // identical down the list; judged over the whole screen -- popup border,
+    // the pane behind it, yazi's own bars -- they read as dividers and the
+    // region began at the first digit, `cols=43..68`: the names slid and
+    // their icons stood still. Judged on the moved rows they ride.
+    const data = @embedFile("testdata/yazi-popup-icons.dump");
+    const rows = std.mem.readInt(u32, data[0..4], .little);
+    const cols = std.mem.readInt(u32, data[4..8], .little);
+    const sz = rows * cols * 8;
+    const prev = try testing.allocator.alloc(u64, rows * cols);
+    defer testing.allocator.free(prev);
+    const cur = try testing.allocator.alloc(u64, rows * cols);
+    defer testing.allocator.free(cur);
+    @memcpy(std.mem.sliceAsBytes(prev), data[8..][0..sz]);
+    @memcpy(std.mem.sliceAsBytes(cur), data[8 + sz ..][0..sz]);
+    const s_ = detectShift(cur, prev, rows, cols, 6, 0.6) orelse return error.NoShift;
+    try testing.expectEqual(@as(isize, 1), s_.rows);
+    try testing.expectEqual(@as(usize, 32), s_.left); // after the gutter, icon included
+    try testing.expectEqual(@as(usize, 68), s_.right);
+}
