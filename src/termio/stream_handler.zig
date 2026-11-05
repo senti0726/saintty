@@ -1457,6 +1457,7 @@ pub const StreamHandler = struct {
             .fresh_line_new_prompt,
             .new_command,
             .prompt_start,
+            .redraw_prompt,
             => {},
         }
 

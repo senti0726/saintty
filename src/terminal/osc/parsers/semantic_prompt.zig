@@ -29,6 +29,13 @@ pub const Command = struct {
         end_prompt_start_input_terminate_eol, // 'I'
         end_input_start_output, // 'C'
         end_command, // 'D'
+        /// Fork-private, the same sequence our patched tmux understands
+        /// (install/tmux-sync-combine.patch in the dotfiles, release
+        /// .sync2): the shell is about to redraw its prompt after a
+        /// resize, so blank from the first row of the prompt the cursor
+        /// is in down to the bottom and park the cursor at that row's
+        /// start. ble.sh sends it in place of its clear-screen.
+        redraw_prompt, // 'R'
     };
 
     pub fn init(action: Action) Command {
@@ -394,6 +401,11 @@ pub fn parse(parser: *Parser, _: ?u8) ?*OSCCommand {
                 parser.command.semantic_prompt.options_unvalidated = data[2..];
             },
 
+            'R' => {
+                if (data.len > 1) break :valid;
+                parser.command = .{ .semantic_prompt = .init(.redraw_prompt) };
+            },
+
             else => break :valid,
         }
 
@@ -403,6 +415,16 @@ pub fn parse(parser: *Parser, _: ?u8) ?*OSCCommand {
     // Any fallthroughs are invalid
     parser.state = .invalid;
     return null;
+}
+
+test "OSC 133: redraw_prompt" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+    for ("133;R") |ch| p.next(ch);
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .semantic_prompt);
+    try testing.expect(cmd.semantic_prompt.action == .redraw_prompt);
 }
 
 test "OSC 133: end_input_start_output" {

@@ -2318,7 +2318,51 @@ pub fn semanticPrompt(
             // state but the spec doesn't really say what to do.
             self.screens.active.cursorSetSemanticContent(.output);
         },
+
+        .redraw_prompt => self.semanticPromptRedraw(),
     }
+}
+
+// OSC 133;R (fork-private). After a resize the reflowed prompt can sit
+// anywhere: starship pads its top line to the full width, so a narrower
+// window wraps it onto extra rows. A shell that redraws relative to where
+// it THINKS the prompt is (ble.sh) then draws a row or three too low on
+// every resize and the prompt walks down the screen. With this the shell
+// asks for a clean area that starts exactly at the prompt and draws there.
+// Nothing happens unless the cursor is in a prompt (not command output).
+fn semanticPromptRedraw(self: *Terminal) void {
+    const screen: *Screen = self.screens.active;
+    if (screen.cursor.semantic_content == .output and
+        screen.cursor.page_row.semantic_prompt == .none) return;
+
+    var it = screen.cursor.page_pin.promptIterator(.left_up, null);
+    var start = it.next() orelse return;
+
+    // Reflow copies a row's prompt mark onto the rows its text wraps into
+    // (PageList copyRowMetadata), so a wrapped top line reads as a prompt
+    // starting on its LAST row. Walk back through soft wraps to the first.
+    while (start.up(1)) |prior| {
+        const row = prior.rowAndCell().row;
+        if (!row.wrap or row.semantic_prompt == .none) break;
+        start = prior;
+    }
+
+    // Blank from the prompt's first row down (as the resize-time clear
+    // does): cells only, the rows stay, so output above is untouched.
+    var rows = start.rowIterator(.right_down, null);
+    while (rows.next()) |pin| {
+        const page = pin.node.page();
+        const row = pin.rowAndCell().row;
+        screen.clearCells(page, row, page.getCells(row));
+    }
+
+    // The prompt's first row may have scrolled into history (a tall
+    // prompt in a short window): draw from the top of the screen then.
+    const y: usize = if (screen.pages.pointFromPin(.active, start)) |pt|
+        pt.active.y
+    else
+        0;
+    self.setCursorPos(y + 1, 1);
 }
 
 // OSC 133;L
@@ -16828,4 +16872,70 @@ test "Terminal: eraseDisplay complete ignores stale prompt on recycled row" {
     t.eraseDisplay(.complete, false);
 
     try testing.expectEqual(t.screens.active.pages.rows, t.screens.active.pages.total_rows);
+}
+
+test "Terminal: semantic prompt redraw (133;R) parks at the prompt start" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // Some command output, then a two-line prompt whose top line is padded
+    // to the full width (starship's right-aligned clock).
+    try t.printString("out");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.init(.prompt_start));
+    try t.printString("~     1807");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("> ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+
+    // A narrower window wraps the top line onto an extra row: the cursor
+    // now sits one row lower than a shell that saw two rows expects.
+    try t.resize(alloc, .{ .cols = 5, .rows = 6 });
+    try testing.expect(t.screens.active.cursor.y > 2);
+
+    try t.semanticPrompt(.init(.redraw_prompt));
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("out", str);
+    }
+
+    // The shell redraws there; doing it again lands in the same place.
+    try t.semanticPrompt(.init(.prompt_start));
+    try t.printString("~");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("> ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.resize(alloc, .{ .cols = 10, .rows = 6 });
+    try t.semanticPrompt(.init(.redraw_prompt));
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+}
+
+test "Terminal: semantic prompt redraw (133;R) ignored in command output" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 4 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.prompt_start));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("output");
+    try t.semanticPrompt(.init(.redraw_prompt));
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 6), t.screens.active.cursor.x);
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("$ \noutput", str);
+    }
 }

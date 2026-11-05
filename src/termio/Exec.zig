@@ -754,6 +754,12 @@ const Subprocess = struct {
         try env.put("TERM_PROGRAM", "ghostty");
         try env.put("TERM_PROGRAM_VERSION", build_config.version_string);
 
+        // Fork: this build understands OSC 133;R (wipe from the prompt's
+        // first row and park the cursor there), the same private sequence
+        // our patched tmux advertises with TMUX_PROMPT_REDRAW. ble.sh's
+        // resize redraw uses it only when told it is there.
+        try env.put("GHOSTTY_PROMPT_REDRAW", "1");
+
         // VTE_VERSION is set by gnome-terminal and other VTE-based terminals.
         // We don't want our child processes to think we're running under VTE.
         // This is not apprt-specific, so we do it here.
