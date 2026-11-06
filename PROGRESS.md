@@ -2833,3 +2833,27 @@ cur` cell keys for every detected repaint scroll. Plain `capture-pane`
 replays gave the RIGHT answer here (no styles, no mid-redraw frames), so
 dump from Ghostty itself when a detector decision looks wrong.
 Installed; rollback `~/tools/ghostty/bin/ghostty.pre-icons`.
+
+## 2026-11-06 — OSC 777;cursor-target: cursor effects follow a hidden cursor's selection
+
+The cursor effects (smear, tmux focus pulse, C-a scope and lock-on) only knew
+the cursor the renderer DRAWS. yazi and Claude Code's menus hide it, so in
+those panes every effect stayed where the cursor was last seen, in the pane
+you came from. New `OSC 777;cursor-target;col;row` (bare = forget): parsed
+as a CursorBoom of power 0 (a real `cursor-boom;0` is now clamped to 1, so
+the two cannot collide), stored as `Terminal.cursor_fx_target` + a sequence
+number, copied at updateFrame. While no cursor glyph is drawn, a target sent
+since the last drawn cursor is fed to updateCursorFx as a cell-sized block,
+so the smear flies to it; booms without a cell and the pulse now take
+`cursor_move_to` (= the cursor when shown, the target when hidden). A drawn
+cursor retires every target so far, so a blink or a later hidden spell never
+jumps back. A new OSC name rather than `cursor-boom;0` so an older build
+ignores it instead of popping there. The cell comes from dotfiles
+`tm target` (reads yazi's hover / Claude's `❯` off the pane).
+
+Verified: OSC 777 parser tests (3 new cases) pass; headless cage +
+`scroll-trace`: hide, target (20,10), target (30,3), show, hide-without-target
+logged smears (0,5)->(20,10)->(30,3)->(0,5) and nothing for the last hide;
+through tmux with the real hook, a Claude-style `❯ 2.` menu pane gave
+(0,1)->(68,4)->(0,1) and real yazi (0,1)->(77,3)->(0,1) (its hovered row).
+Installed; rollback `~/tools/ghostty/bin/ghostty.pre-target`.

@@ -32,7 +32,7 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
         var boom: Command.CursorBoom = .{};
         var it = std.mem.splitScalar(u8, data[0 .. data.len - 1], ';');
         _ = it.next();
-        if (it.next()) |s| boom.power = std.fmt.parseInt(u8, s, 10) catch 1;
+        if (it.next()) |s| boom.power = @max(std.fmt.parseInt(u8, s, 10) catch 1, 1);
         const col = if (it.next()) |s| std.fmt.parseInt(u16, s, 10) catch null else null;
         const row = if (it.next()) |s| std.fmt.parseInt(u16, s, 10) catch null else null;
         if (col != null and row != null) {
@@ -40,6 +40,26 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
             boom.row = row;
         }
         parser.command = .{ .cursor_boom = boom };
+        return &parser.command;
+    }
+    // `cursor-target;col;row` (this fork): where cursor effects go while the
+    // cursor is hidden; bare `cursor-target` forgets it. Carried as a boom of
+    // power 0, which `cursor-boom` itself can never produce (see above), so
+    // it needs no plumbing of its own. A new name rather than `cursor-boom;0`
+    // so a Ghostty without this ignores it instead of playing a pop there.
+    if (std.mem.eql(u8, std.mem.sliceTo(data, ';'), "cursor-target\x00") or
+        std.mem.startsWith(u8, data, "cursor-target;"))
+    {
+        var target: Command.CursorBoom = .{ .power = 0 };
+        var it = std.mem.splitScalar(u8, data[0 .. data.len - 1], ';');
+        _ = it.next();
+        const col = if (it.next()) |s| std.fmt.parseInt(u16, s, 10) catch null else null;
+        const row = if (it.next()) |s| std.fmt.parseInt(u16, s, 10) catch null else null;
+        if (col != null and row != null) {
+            target.col = col;
+            target.row = row;
+        }
+        parser.command = .{ .cursor_boom = target };
         return &parser.command;
     }
     if (std.mem.startsWith(u8, data, "wheel-ack;")) {
@@ -111,6 +131,9 @@ test "OSC: OSC 777 cursor boom" {
         .{ .in = "777;cursor-boom;2", .power = 2, .col = null, .row = null },
         .{ .in = "777;cursor-boom;2;10;5", .power = 2, .col = 10, .row = 5 },
         .{ .in = "777;cursor-boom;x;10", .power = 1, .col = null, .row = null },
+        .{ .in = "777;cursor-boom;0;3;4", .power = 1, .col = 3, .row = 4 },
+        .{ .in = "777;cursor-target;7;9", .power = 0, .col = 7, .row = 9 },
+        .{ .in = "777;cursor-target", .power = 0, .col = null, .row = null },
     }) |c| {
         var p: Parser = .init(null);
         for (c.in) |ch| p.next(ch);

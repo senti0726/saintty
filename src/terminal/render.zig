@@ -195,6 +195,10 @@ pub const RenderState = struct {
         boom: u32 = 0,
         boom_last: @import("osc.zig").Command.CursorBoom = .{},
 
+        /// Terminal.cursor_fx_target and its sequence number.
+        fx_target: ?[2]u16 = null,
+        fx_target_seq: u32 = 0,
+
         pub const Viewport = struct {
             /// The x/y position of the cursor within the viewport.
             x: size.CellCountInt,
@@ -434,6 +438,8 @@ pub const RenderState = struct {
         self.cursor.pulse = t.cursor_pulse;
         self.cursor.boom = t.cursor_boom;
         self.cursor.boom_last = t.cursor_boom_last;
+        self.cursor.fx_target = t.cursor_fx_target;
+        self.cursor.fx_target_seq = t.cursor_fx_target_seq;
 
         // Always reset the cursor viewport position. In the future we can
         // probably cache this by comparing the cursor pin and viewport pin

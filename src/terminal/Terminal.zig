@@ -114,6 +114,14 @@ cursor_pulse: u32 = 0,
 cursor_boom: u32 = 0,
 cursor_boom_last: @import("osc.zig").Command.CursorBoom = .{},
 
+/// OSC 777;cursor-target;col;row (this fork): the cell cursor effects
+/// (smear, pulse, booms without a cell) treat as the cursor while the real
+/// one is hidden -- yazi's hovered row, a TUI menu's selection. The renderer
+/// uses it only until it next draws a visible cursor; `seq` is bumped on
+/// every OSC so a repeat of the same cell still counts as new.
+cursor_fx_target: ?[2]u16 = null,
+cursor_fx_target_seq: u32 = 0,
+
 /// Wheel events the application says it has handled, summed over every
 /// OSC 777;wheel-ack (this fork). Wraps. Read by `Surface.wheelBudget`.
 wheel_acked: u32 = 0,

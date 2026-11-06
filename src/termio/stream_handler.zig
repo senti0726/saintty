@@ -335,8 +335,16 @@ pub const StreamHandler = struct {
             .decaln => try self.decaln(),
             .cursor_pulse => self.terminal.cursor_pulse +%= 1,
             .cursor_boom => {
-                self.terminal.cursor_boom +%= 1;
-                self.terminal.cursor_boom_last = value;
+                if (value.power == 0) {
+                    self.terminal.cursor_fx_target = if (value.col != null and value.row != null)
+                        .{ value.col.?, value.row.? }
+                    else
+                        null;
+                    self.terminal.cursor_fx_target_seq +%= 1;
+                } else {
+                    self.terminal.cursor_boom +%= 1;
+                    self.terminal.cursor_boom_last = value;
+                }
             },
             .wheel_ack => self.terminal.wheel_acked +%= value,
             .window_title => try self.windowTitle(value.title),

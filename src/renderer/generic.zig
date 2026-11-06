@@ -367,6 +367,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// boom waiting for the next frame's uniforms.
         cursor_fx_boom_seen: u32 = 0,
         cursor_fx_boom_pending: ?terminal.osc.Command.CursorBoom = null,
+        /// OSC 777;cursor-target (this fork), copied at updateFrame: the
+        /// cell effects treat as the cursor while none is drawn, and the
+        /// target's sequence number. `used` is the sequence number when a
+        /// cursor was last drawn: a target only counts if it was sent after
+        /// that, so it lasts exactly one hidden-cursor spell (yazi, a menu)
+        /// and a blink or a later hidden spell never jumps back to it.
+        cursor_fx_target: ?[2]u16 = null,
+        cursor_fx_target_seq: u32 = 0,
+        cursor_fx_target_used: u32 = 0,
         cursor_fx_last_event: ?std.Io.Timestamp = null,
         /// The cursor's style and colour at the last updateFrame, to see a
         /// mode change there (see updateFrame) and not only at draw time.
@@ -2836,6 +2845,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.cursor_fx_boom_pending = self.terminal_state.cursor.boom_last;
                 self.cursor_fx_last_event = .now(global.io(), .awake);
             }
+            if (self.terminal_state.cursor.fx_target_seq != self.cursor_fx_target_seq) {
+                self.cursor_fx_target_seq = self.terminal_state.cursor.fx_target_seq;
+                self.cursor_fx_target = self.terminal_state.cursor.fx_target;
+                // Like a pulse it changes no cell: ask for frames, so the
+                // smear to it plays.
+                self.cursor_fx_last_event = .now(global.io(), .awake);
+            }
 
             // A mode change (cursor style or colour, e.g. nvim i / Esc / v)
             // is only recorded when the frame is DRAWN (updateCursorFx), and
@@ -4522,6 +4538,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cursor_fx_mode = .{ .style = style, .color = color };
         }
 
+        /// A cell as a cell-sized rect in the cursor uniforms' convention
+        /// (left, +Y edge, w, h): where booms and cursor-targets play.
+        fn cellFxRect(self: *const Self, col: u16, row: u16) [4]f32 {
+            const cell = self.size.cell;
+            const padding = self.size.padding;
+            const x: f32 = @floatFromInt(@as(u32, col) * cell.width + padding.left);
+            var y: f32 = @floatFromInt(@as(u32, row) * cell.height + padding.top);
+            if (GraphicsAPI.custom_shader_y_is_down) {
+                y += @floatFromInt(cell.height);
+            } else {
+                y = @as(f32, @floatFromInt(self.size.screen.height)) - y;
+            }
+            return .{ x, y, @floatFromInt(cell.width), @floatFromInt(cell.height) };
+        }
+
         /// Update per-frame custom shader uniforms.
         ///
         /// This should be called exactly once per frame, inside `drawFrame`.
@@ -4638,6 +4669,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     cursor_color,
                     now,
                 );
+                // A drawn cursor retires every target sent so far.
+                self.cursor_fx_target_used = self.cursor_fx_target_seq;
+            } else if (self.cursor_fx_target) |cell_pos| {
+                // No cursor drawn (an app hid it): effects go to the target
+                // the app's tmux side reported, as a cell-sized block in
+                // the cursor's rect convention, so the smear flies there
+                // and pulses / booms without a cell play there.
+                if (self.cursor_fx_target_seq != self.cursor_fx_target_used) {
+                    const rect = self.cellFxRect(cell_pos[0], cell_pos[1]);
+                    self.updateCursorFx(cell_pos, rect, uniforms.current_cursor_color, now);
+                }
             }
 
             if (self.cursor_fx_pulse_pending) {
@@ -4648,7 +4690,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     0,
                     uniforms.current_cursor_style,
                     uniforms.current_cursor_color,
-                    uniforms.current_cursor,
+                    uniforms.cursor_move_to,
                 );
             }
 
@@ -4657,16 +4699,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // At the named cell, as a cell-sized rect in the same
                 // convention as the cursor's (left, +Y edge, w, h); else at
                 // the cursor.
-                const rect: [4]f32 = if (boom.col != null and boom.row != null) r: {
-                    const x: f32 = @floatFromInt(@as(u32, boom.col.?) * cell.width + padding.left);
-                    var y: f32 = @floatFromInt(@as(u32, boom.row.?) * cell.height + padding.top);
-                    if (GraphicsAPI.custom_shader_y_is_down) {
-                        y += @floatFromInt(cell.height);
-                    } else {
-                        y = @as(f32, @floatFromInt(screen.height)) - y;
-                    }
-                    break :r .{ x, y, @floatFromInt(cell.width), @floatFromInt(cell.height) };
-                } else uniforms.current_cursor;
+                // cursor_move_to is the cursor, or the cursor-target
+                // while the cursor is hidden.
+                const rect: [4]f32 = if (boom.col != null and boom.row != null)
+                    self.cellFxRect(boom.col.?, boom.row.?)
+                else
+                    uniforms.cursor_move_to;
                 self.pushCursorFxEvent(
                     2,
                     @floatFromInt(@max(boom.power, 1)),

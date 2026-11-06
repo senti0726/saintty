@@ -187,7 +187,9 @@ pub const Command = union(Key) {
     pub const WheelAck = struct { n: u32 };
 
     pub const CursorBoom = struct {
-        /// 1 = a small pop, 2 = a big blast.
+        /// 1 = a small pop, 2 = a big blast. 0 is OSC 777;cursor-target:
+        /// not a boom but where cursor effects go while the cursor is
+        /// hidden (null cell = forget it). See Terminal.cursor_fx_target.
         power: u8 = 1,
         col: ?u16 = null,
         row: ?u16 = null,
