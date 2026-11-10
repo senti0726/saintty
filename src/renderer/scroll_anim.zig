@@ -3494,7 +3494,7 @@ test "ghosts: copies of a pinned label are dropped, the rest kept" {
 test "pins: the edge rows of a tall coloured block are not pinned" {
     const rows = 12;
     const cols = 20;
-    var prev = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    var prev: [rows * cols][4]u8 = @splat(.{ 0, 0, 0, 0 });
     var now = prev;
     // A green block over rows 3..8 moves down 2 (content down, shift -2).
     for (3..9) |r| for (2..18) |c| {
@@ -3503,7 +3503,7 @@ test "pins: the edge rows of a tall coloured block are not pinned" {
     for (5..11) |r| for (2..18) |c| {
         now[r * cols + c] = .{ 0, 99, 0, 255 };
     };
-    var pins = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    var pins: [rows * cols][4]u8 = @splat(.{ 0, 0, 0, 0 });
     computePins([4]u8, &pins, &prev, &now, cols, -2, 0, rows - 1, 0, cols - 1);
     for (pins) |v| try testing.expectEqual(@as(u8, 0), v[0]);
 }
@@ -3511,11 +3511,11 @@ test "pins: the edge rows of a tall coloured block are not pinned" {
 test "pins: a bar as wide as the hovered name keeps its left end" {
     const rows = 6;
     const cols = 30;
-    var prev = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    var prev: [rows * cols][4]u8 = @splat(.{ 0, 0, 0, 0 });
     var now = prev;
     for (3..8) |c| prev[4 * cols + c] = .{ 9, 9, 9, 255 }; // "tools"
     for (3..12) |c| now[4 * cols + c] = .{ 9, 9, 9, 255 }; // "video-use"
-    var pins = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    var pins: [rows * cols][4]u8 = @splat(.{ 0, 0, 0, 0 });
     computePins([4]u8, &pins, &prev, &now, cols, 1, 0, rows - 1, 0, cols - 1);
     for (0..cols) |c| try testing.expectEqual(@as(u8, if (c >= 3 and c < 12) 255 else 0), pins[4 * cols + c][0]);
 }
@@ -3553,7 +3553,7 @@ test "pins: a bar that changes colour with the file under it is still held" {
 test "pins: a selection bar that stays while the list scrolls under it" {
     const rows = 10;
     const cols = 30;
-    var prev = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    var prev: [rows * cols][4]u8 = @splat(.{ 0, 0, 0, 0 });
     var now = prev;
     // Bar on row 6, columns 2..21, in both frames; an inline-code highlight
     // of 3 cells on row 2 that coincides; a code block of rows 3..4 that
@@ -3572,7 +3572,7 @@ test "pins: a selection bar that stays while the list scrolls under it" {
         now[2 * cols + c] = if (c >= 5 and c < 8) .{ 5, 5, 5, 255 } else .{ 7, 7, 7, 255 };
         now[3 * cols + c] = .{ 7, 7, 7, 255 };
     }
-    var pins = [_][4]u8{.{ 0, 0, 0, 0 }} ** (rows * cols);
+    var pins: [rows * cols][4]u8 = @splat(.{ 0, 0, 0, 0 });
     computePins([4]u8, &pins, &prev, &now, cols, 1, 0, rows - 1, 0, cols - 1);
     for (0..rows) |r| for (0..cols) |c| {
         const want: u8 = if (r == 6 and c >= 2 and c < 22) 255 else 0;
@@ -3585,7 +3585,7 @@ test "ghost bg: a row leaving the top keeps its colours above the region" {
     const cols = 4;
     var bg: [rows * cols]u32 = undefined;
     for (&bg, 0..) |*v, i| v.* = @intCast(100 + i);
-    var ext = [_]u32{0} ** ghostBgLen(rows, cols);
+    var ext: [ghostBgLen(rows, cols)]u32 = @splat(0);
     // Content up by 2 over rows 1..4, columns 1..2: rows 1 and 2 leave.
     shiftGhostBg(u32, &ext, cols, 2, 1, 4);
     captureGhostBg(u32, &ext, &bg, cols, 2, 1, 4, 1, 2);
@@ -3604,7 +3604,7 @@ test "ghost bg: a row leaving the top keeps its colours above the region" {
 test "ghost bg: control -- without a capture the band has no colour" {
     const rows = 6;
     const cols = 4;
-    var ext = [_]u32{0} ** ghostBgLen(rows, cols);
+    var ext: [ghostBgLen(rows, cols)]u32 = @splat(0);
     shiftGhostBg(u32, &ext, cols, 2, 1, 4);
     for (ext) |v| try testing.expectEqual(@as(u32, 0), v);
 }
@@ -3681,8 +3681,6 @@ test "detectShift: the cursor walking a list too short to scroll is not a scroll
     try captureKeys(rows, cols, @embedFile("testdata/yazi-short-list-1.txt"), &cur);
     try testing.expectEqual(@as(?Shift, null), detectShift(&cur, &prev, rows, cols, 6, 0.6));
 }
-
-
 
 test "detectShift: an icon column in a popup rides with the names" {
     // yazi in a tmux popup (`<p> e`, 35x139, list rows 6..27), one `j` that

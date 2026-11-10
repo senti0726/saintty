@@ -59,10 +59,13 @@ pub const LogFn = *const fn (
 
 /// C: GhosttySysOption
 pub const Option = enum(c_int) {
-    userdata = 0,
-    decode_png = 1,
-    log = 2,
-    random_secure = 3,
+    invalid = 0,
+    userdata = 1,
+    decode_png = 2,
+    log = 3,
+    random_secure = 4,
+
+    _,
 
     pub fn InType(comptime self: Option) type {
         return switch (self) {
@@ -70,6 +73,7 @@ pub const Option = enum(c_int) {
             .decode_png => ?DecodePngFn,
             .log => ?LogFn,
             .random_secure => ?RandomSecureFn,
+            .invalid, _ => void,
         };
     }
 };
@@ -89,6 +93,9 @@ var global: Global = .{};
 /// Zig-compatible wrapper that calls through to the stored C callback.
 /// The C callback allocates the pixel data through the provided allocator,
 /// so we can take ownership directly.
+///
+/// Returns `error.InvalidData` if no callback is installed, if the callback
+/// returns false, or if it returns true without setting `data`.
 fn decodePngWrapper(
     alloc: std.mem.Allocator,
     data: []const u8,
@@ -96,8 +103,14 @@ fn decodePngWrapper(
     const func = global.decode_png orelse return error.InvalidData;
 
     const c_alloc = CAllocator.fromZig(&alloc);
-    var out: Image = undefined;
-    if (!func(global.userdata, &c_alloc, data.ptr, data.len, &out)) return error.InvalidData;
+
+    // Hand the callback a zeroed struct instead of an undefined one. The
+    // callback stores a pointer into it, and runtimes that track pointers
+    // (Go, for example) require the memory to be initialized first. It
+    // also means a callback that returns true without setting `data` is
+    // caught by the null check below. The header documents this guarantee.
+    var out: Image = std.mem.zeroes(Image);
+    if (!func(global.userdata, &c_alloc, lib.String.init(data).ptr, data.len, &out)) return error.InvalidData;
 
     const result_data = out.data orelse return error.InvalidData;
 
@@ -118,13 +131,9 @@ pub fn set(
     option: Option,
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
-    if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(Option, @intFromEnum(option)) orelse {
-            return .invalid_value;
-        };
-    }
-
     return switch (option) {
+        .invalid => .invalid_value,
+        _ => .unsupported,
         inline else => |comptime_option| setTyped(
             comptime_option,
             @ptrCast(@alignCast(value)),
@@ -147,6 +156,7 @@ fn setTyped(
             global.random_secure = value;
             terminal_sys.random_secure = if (value != null) &randomSecureWrapper else null;
         },
+        .invalid, _ => comptime unreachable,
     }
     return .success;
 }
@@ -261,9 +271,9 @@ pub fn logStderr(
     // Large enough for a full logFn chunk plus the level/scope prefix.
     var buffer: [LogEmitter.buffer_size + 128]u8 = undefined;
     const line: ?[]const u8 = if (scope.len > 0)
-        std.fmt.bufPrint(&buffer, "[{s}]({s}): {s}\n", .{ level_text, scope, message }) catch null
+        std.mem.print(&buffer, "[{s}]({s}): {s}\n", .{ level_text, scope, message }) catch null
     else
-        std.fmt.bufPrint(&buffer, "[{s}]: {s}\n", .{ level_text, message }) catch null;
+        std.mem.print(&buffer, "[{s}]: {s}\n", .{ level_text, message }) catch null;
     if (line) |v| {
         stderr.write(v);
         return;
@@ -312,6 +322,33 @@ test "set decode_png installs wrapper" {
     // Clear it again.
     try std.testing.expectEqual(Result.success, set(.decode_png, null));
     try std.testing.expect(terminal_sys.decode_png == null);
+}
+
+test "decode_png output is zeroed before the callback" {
+    const S = struct {
+        var seen: ?Image = null;
+        fn decode(_: ?*anyopaque, _: *const CAllocator, _: [*]const u8, _: usize, out: *Image) callconv(lib.calling_conv) bool {
+            // Record what we were given, then report success without
+            // filling anything in.
+            seen = out.*;
+            return true;
+        }
+    };
+
+    try std.testing.expectEqual(Result.success, set(
+        .decode_png,
+        @ptrCast(&S.decode),
+    ));
+    defer _ = set(.decode_png, null);
+
+    // Success with no data is rejected rather than read as garbage.
+    try std.testing.expectError(
+        error.InvalidData,
+        decodePngWrapper(std.testing.allocator, "png"),
+    );
+
+    // The callback saw an all-zero struct.
+    try std.testing.expectEqual(std.mem.zeroes(Image), S.seen.?);
 }
 
 test "set log with null clears" {
@@ -392,7 +429,7 @@ test "logFn message exceeding chunk size is split" {
 
     // Format a message larger than the 2048-byte buffer.
     // 'A' repeated 3000 times via a fill format.
-    const fill: [3000]u8 = .{0x41} ** 3000;
+    const fill: [3000]u8 = @splat(0x41);
     logFn(.info, .default, "{s}", .{@as([]const u8, &fill)});
 
     try std.testing.expect(S.call_count >= 2);
@@ -420,7 +457,7 @@ test "logFn message exactly at chunk boundary" {
     }
 
     // Exactly 2048 bytes — should emit one full chunk, no remainder.
-    const fill: [2048]u8 = .{0x42} ** 2048;
+    const fill: [2048]u8 = @splat(0x42);
     logFn(.info, .default, "{s}", .{@as([]const u8, &fill)});
 
     try std.testing.expectEqual(@as(usize, 1), S.call_count);
@@ -448,7 +485,7 @@ test "logFn message exactly double chunk size" {
     }
 
     // Exactly 4096 bytes — should emit exactly two full chunks.
-    const fill: [4096]u8 = .{0x43} ** 4096;
+    const fill: [4096]u8 = @splat(0x43);
     logFn(.info, .default, "{s}", .{@as([]const u8, &fill)});
 
     try std.testing.expectEqual(@as(usize, 2), S.call_count);

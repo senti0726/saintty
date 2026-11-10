@@ -40,6 +40,10 @@ class ClipboardConfirmationController: NSWindowController {
     override func windowDidLoad() {
         guard let window = window else { return }
 
+        // AppKit otherwise ignores quit requests, including those from logout
+        // and shutdown, for as long as this window is presented as a sheet.
+        window.preventsApplicationTerminationWhenModal = false
+
         configure(window)
     }
 
@@ -54,7 +58,6 @@ class ClipboardConfirmationController: NSWindowController {
         window.contentView = NSHostingView(rootView: ClipboardConfirmationView(
             contents: confirmation.contents,
             request: confirmation.kind,
-            programName: confirmation.programName,
             canRemember: confirmation.canRemember,
             previewImage: confirmation.previewImage,
             delegate: delegate

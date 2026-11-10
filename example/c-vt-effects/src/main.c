@@ -30,9 +30,9 @@ void on_bell(GhosttyTerminal terminal, void* userdata) {
 //! [effects-title-changed]
 void on_title_changed(GhosttyTerminal terminal, void* userdata) {
   (void)userdata;
-  // Query the cursor position to confirm the terminal processed the
-  // title change (the title itself is tracked by the embedder via the
-  // OSC parser or its own state).
+  // The new title is already set, so you can read it here with
+  // GHOSTTY_TERMINAL_DATA_TITLE. This example reads the cursor position
+  // to show that the terminal can be queried from a callback.
   uint16_t col = 0;
   ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_CURSOR_X, &col);
   printf("  title changed (cursor at col %u)\n", col);
@@ -139,6 +139,22 @@ void on_unknown_sequence(
     printf("\n");
     break;
   }
+  case GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_OSC: {
+    // The content starts with the OSC number, for example
+    // "7400;status=busy". A real application would check for the
+    // numbers it implements and ignore the rest. If it replies, it should
+    // end the reply with the same terminator the program used.
+    const GhosttyTerminalUnknownOscSequence* osc = &sequence->value.osc;
+    printf("  unknown OSC (truncated=%s, terminator=%s, content=%zu bytes): ",
+           osc->truncated ? "yes" : "no",
+           osc->terminator == GHOSTTY_OSC_TERMINATOR_BEL ? "BEL" : "ST",
+           osc->content.len);
+    if (osc->content.len > 0) {
+      fwrite(osc->content.ptr, 1, osc->content.len, stdout);
+    }
+    printf("\n");
+    break;
+  }
   default:
     break;
   }
@@ -216,6 +232,11 @@ int main() {
   const char* unknown_apc = "\x1B_private-command;payload\x1B\\";
   ghostty_terminal_vt_write(terminal, (const uint8_t*)unknown_apc,
                             strlen(unknown_apc));
+
+  printf("Sending unknown OSC:\n");
+  const char* unknown_osc = "\x1B]7400;status=busy\x07";
+  ghostty_terminal_vt_write(terminal, (const uint8_t*)unknown_osc,
+                            strlen(unknown_osc));
 
   // 7. Another bell to show the counter increments
   printf("Sending another BEL:\n");

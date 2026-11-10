@@ -3,14 +3,16 @@ pub const OpenGL = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const builtin = @import("builtin");
 const gl = @import("opengl");
+const egl = gl.egl;
 const shadertoy = @import("shadertoy.zig");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
+const Dmabuf = @import("Dmabuf.zig");
+pub const Device = @import("opengl/Device.zig");
 
 pub const GraphicsAPI = OpenGL;
 pub const Target = @import("opengl/Target.zig");
@@ -27,9 +29,9 @@ pub const custom_shader_target: shadertoy.Target = .glsl;
 // The fragCoord for OpenGL shaders is +Y = up.
 pub const custom_shader_y_is_down = false;
 
-/// Because OpenGL's frame completion is always
-/// sync, we have no need for multi-buffering.
-pub const swap_chain_count = 1;
+/// Triple-buffering gives the GPU room to pipeline renders without
+/// having to wait on the apprt consuming previous frames.
+pub const swap_chain_count = 3;
 
 /// `custom-shader-cache` needs scissored render passes and textures that
 /// persist between frames (a swap chain of one).
@@ -46,71 +48,81 @@ alloc: std.mem.Allocator,
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
 
-/// The most recently presented target, in case we need to present it again.
-last_target: ?Target = null,
+/// The shared render device.
+device: *const Device,
 
-/// PARTIAL PRESENT (`gtk-damage-tracking`). Normally the apprt hands us a
-/// framebuffer whose contents are undefined, so `present` copies the whole
-/// target into it and the apprt shows (and the compositor repaints) the whole
-/// window, however little of it changed.
+egl_context: *gl.egl.Context,
+
+/// PARTIAL PRESENT (`gtk-damage-tracking`, `custom-shader-cache`).
 ///
-/// An apprt whose framebuffer still holds the frame presented before sets
-/// `present_persistent` for the draw. `present` then copies only
-/// `frame_damage` -- the rectangles the renderer says differ from the last
-/// frame -- and records what it wrote in `presented`, which the apprt takes
-/// afterwards to tell the toolkit how little there is to repaint.
-present_persistent: bool = false,
-/// What the frame being drawn changes in its target. The renderer narrows it
-/// (`setFrameDamage`); anything that does not is the whole frame.
+/// Each frame is drawn into one of `swap_chain_count` targets and exported
+/// by blitting the target into its export texture. Two things narrow that:
+///
+///   `frame_damage`: where this frame differs from the frame before it. It
+///   rides on the exported DMABUF so the apprt can hand the toolkit the new
+///   texture as an update of the last one, changed only there.
+///
+///   `slot_damage`: where this frame differs from what this target's export
+///   texture last held (the frame drawn into the same slot, a few frames
+///   ago). The export blit copies only that, when the export texture is
+///   known to hold that frame (`export_current`).
+///
+/// Both are the whole frame unless the renderer says otherwise
+/// (`setFrameDamage`) for the frame being drawn.
 frame_damage: Damage = .everything,
-/// What `present` has written since the apprt last took it.
-presented: Damage = .nothing,
-/// A frame was drawn but not presented (GL error): the framebuffer is behind
-/// the target by more than the next frame's damage.
+slot_damage: Damage = .everything,
+/// A drawn frame never reached the apprt: the next one exported differs
+/// from what the apprt last saw by more than its own damage.
 present_stale: bool = false,
-/// `custom-shader-cache-debug = verify`: after every present, read back the
-/// framebuffer and the target and compare them. Partial presents that leave
-/// the framebuffer different from the target are counted and logged.
-present_verify: bool = false,
-present_verify_stats: struct { checked: u64 = 0, partial: u64 = 0, mismatched: u64 = 0 } = .{},
+/// Export textures whose contents are the last frame drawn into their
+/// target, by GL texture id. Anything else is exported in full.
+export_current: [swap_chain_count]gl.c.GLuint = @splat(0),
 
-/// A set of rectangles (x, y, width, height; GL coordinates, origin
-/// bottom-left), or the whole frame.
-pub const Damage = struct {
-    pub const max_rects = 12;
-    pub const everything: Damage = .{ .full = true };
-    pub const nothing: Damage = .{ .full = false };
+pub const Damage = Dmabuf.Damage;
 
-    full: bool,
-    n: usize = 0,
-    rects: [max_rects][4]u32 = undefined,
+pub fn init(
+    alloc: Allocator,
+    device: *const Device,
+    opts: rendererpkg.Options,
+) !OpenGL {
+    const display = device.display;
 
-    pub fn add(self: *Damage, r: [4]u32) void {
-        if (self.full or r[2] == 0 or r[3] == 0) return;
-        if (self.n == max_rects) {
-            self.* = .everything;
-            return;
-        }
-        self.rects[self.n] = r;
-        self.n += 1;
-    }
+    // Bind to OpenGL API explicitly before we create the context,
+    // as otherwise it might fallback to OpenGL ES
+    try egl.bindApi(egl.c.EGL_OPENGL_API);
 
-    pub fn slice(self: *const Damage) []const [4]u32 {
-        return self.rects[0..self.n];
-    }
-};
+    // Create our context. Contexts are surface-scoped because a
+    // context can only be current on one thread at a time.
+    const context = egl.Context.create(display, device.config, null, &.{
+        egl.c.EGL_CONTEXT_MAJOR_VERSION,       MIN_VERSION_MAJOR,
+        egl.c.EGL_CONTEXT_MINOR_VERSION,       MIN_VERSION_MINOR,
+        egl.c.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+    }) catch |err| {
+        log.warn("failed to create EGL context err={}", .{err});
+        return err;
+    };
+    errdefer context.destroy(display) catch {};
 
-/// NOTE: This is an error{}!OpenGL instead of just OpenGL for parity with
-///       Metal, since it needs to be fallible so does this, even though it
-///       can't actually fail.
-pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
+    display.makeCurrent(null, null, context) catch |err| {
+        log.warn("failed to make EGL context current err={}", .{err});
+        return err;
+    };
+
+    // Release current so that the main thread
+    // doesn't hold onto the GL context forever.
+    defer display.releaseCurrent();
+
     return .{
         .alloc = alloc,
         .blending = opts.config.blending,
+        .device = device,
+        .egl_context = context,
     };
 }
 
 pub fn deinit(self: *OpenGL) void {
+    self.device.display.releaseCurrent();
+    self.egl_context.destroy(self.device.display) catch {};
     self.* = undefined;
 }
 
@@ -122,7 +134,7 @@ const gl_debug_proc_callconv =
                 gl.c.GLDEBUGPROC,
             ).optional.child,
         ).pointer.child,
-    ).@"fn".calling_convention;
+    ).@"fn".attrs.@"callconv";
 
 fn glDebugMessageCallback(
     src: gl.c.GLenum,
@@ -213,126 +225,91 @@ fn prepareContext(getProcAddress: anytype) !void {
     try gl.enable(gl.c.GL_FRAMEBUFFER_SRGB);
 }
 
-/// This is called early right after surface creation.
-pub fn surfaceInit(surface: *apprt.Surface) !void {
+/// Callback called by renderer.Thread when it begins. Called on the render
+/// thread. The EGL context was created at `init` time on the main thread;
+/// here we (re)bind it to this thread and load the thread-local glad
+/// function pointers so all subsequent GL work on this thread is valid.
+pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
     _ = surface;
-
-    switch (apprt.runtime) {
-        else => @compileError("unsupported app runtime for OpenGL"),
-
-        // GTK uses global OpenGL context so we load from null.
-        apprt.gtk,
-        => try prepareContext(null),
-
-        apprt.embedded => {
-            // TODO(mitchellh): this does nothing today to allow libghostty
-            // to compile for OpenGL targets but libghostty is strictly
-            // broken for rendering on this platforms.
-        },
-    }
-
-    // These are very noisy so this is commented, but easy to uncomment
-    // whenever we need to check the OpenGL extension list
-    // if (builtin.mode == .Debug) {
-    //     var ext_iter = try gl.ext.iterator();
-    //     while (try ext_iter.next()) |ext| {
-    //         log.debug("OpenGL extension available name={s}", .{ext});
-    //     }
-    // }
+    try self.device.display.makeCurrent(null, null, self.egl_context);
+    // Load our function pointers for this thread's threadlocal.
+    try prepareContext(&gl.egl.getProcAddress);
 }
 
-/// This is called just prior to spinning up the renderer
-/// thread for final main thread setup requirements.
-pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
-    _ = self;
-    _ = surface;
+/// Callback called by renderer.Thread when it exits. Called on the render
+/// thread; unbinds the context from this thread so it can be destroyed on
+/// the main thread.
+pub fn threadExit(self: *OpenGL) void {
+    self.device.display.releaseCurrent();
+    gl.glad.unload();
 }
 
-/// Callback called by renderer.Thread when it begins.
-pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
+/// Get the current size of the runtime surface.
+pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
     _ = self;
-    _ = surface;
-
-    switch (apprt.runtime) {
-        else => @compileError("unsupported app runtime for OpenGL"),
-
-        apprt.gtk => {
-            // GTK doesn't support threaded OpenGL operations as far as I can
-            // tell, so we use the renderer thread to setup all the state
-            // but then do the actual draws and texture syncs and all that
-            // on the main thread. As such, we don't do anything here.
-        },
-
-        apprt.embedded => {
-            // TODO(mitchellh): this does nothing today to allow libghostty
-            // to compile for OpenGL targets but libghostty is strictly
-            // broken for rendering on this platforms.
-        },
-    }
+    var viewport: [4]gl.c.GLint = undefined;
+    gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
+    return .{
+        .width = @intCast(viewport[2]),
+        .height = @intCast(viewport[3]),
+    };
 }
 
-/// Callback called by renderer.Thread when it exits.
-pub fn threadExit(self: *const OpenGL) void {
+/// Set the GL viewport to cover the given size in device pixels.
+///
+/// This used to be automatically called by the GtkGLArea upon resizing,
+/// but now we need to do this manually.
+pub fn setViewport(self: *const OpenGL, width: u32, height: u32) void {
     _ = self;
-
-    switch (apprt.runtime) {
-        else => @compileError("unsupported app runtime for OpenGL"),
-
-        apprt.gtk => {
-            // We don't need to do any unloading for GTK because we may
-            // be sharing the global bindings with other windows.
-        },
-
-        apprt.embedded => {
-            // TODO: see threadEnter
-        },
-    }
-}
-
-pub fn displayRealized(self: *const OpenGL) void {
-    _ = self;
-
-    switch (apprt.runtime) {
-        apprt.gtk => prepareContext(null) catch |err| {
-            log.warn(
-                "Error preparing GL context in displayRealized, err={}",
-                .{err},
-            );
-        },
-
-        else => @compileError("only GTK should be calling displayRealized"),
-    }
+    gl.viewport(0, 0, @intCast(width), @intCast(height)) catch |err| {
+        log.warn("failed to set OpenGL viewport err={}", .{err});
+    };
 }
 
 /// Actions taken before doing anything in `drawFrame`.
-///
-/// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameStart(self: *OpenGL) void {
     // Until the renderer says otherwise the frame changes everything.
     self.frame_damage = .everything;
+    self.slot_damage = .everything;
 }
 
-/// The frame being drawn differs from the one before only inside `rects`
-/// (GL scissor rectangles). Only meaningful when every frame since the last
-/// full one went through here or was whole.
-pub fn setFrameDamage(self: *OpenGL, rects: []const ?[4]u32) void {
-    var d: Damage = .nothing;
-    for (rects) |r| d.add(r orelse {
-        self.frame_damage = .everything;
-        return;
-    });
-    self.frame_damage = d;
-}
-
-/// What has been presented since the last call, for the apprt.
-pub fn takePresented(self: *OpenGL) Damage {
-    defer self.presented = .nothing;
-    return self.presented;
+/// The frame being drawn differs from the frame before it only inside
+/// `own`, and from the frame last drawn into the same target only inside
+/// `slot` (GL rectangles, origin bottom-left).
+pub fn setFrameDamage(self: *OpenGL, own: Damage, slot: Damage) void {
+    self.frame_damage = own;
+    self.slot_damage = slot;
 }
 
 /// A drawn frame was not presented.
 pub fn presentSkipped(self: *OpenGL) void {
     self.present_stale = true;
+}
+
+fn exportIsCurrent(self: *const OpenGL, id: gl.c.GLuint) bool {
+    return id != 0 and std.mem.indexOfScalar(gl.c.GLuint, &self.export_current, id) != null;
+}
+
+fn setExportCurrent(self: *OpenGL, id: gl.c.GLuint, current: bool) void {
+    if (std.mem.indexOfScalar(gl.c.GLuint, &self.export_current, id)) |i| {
+        if (!current) self.export_current[i] = 0;
+        return;
+    }
+    if (!current) return;
+    // A free slot, else forget the oldest (GL reuses ids of deleted
+    // textures, so stale ids must not pile up).
+    const i = std.mem.indexOfScalar(gl.c.GLuint, &self.export_current, 0) orelse 0;
+    if (i == 0 and self.export_current[0] != 0) {
+        std.mem.copyForwards(gl.c.GLuint, self.export_current[0 .. swap_chain_count - 1], self.export_current[1..]);
+        self.export_current[swap_chain_count - 1] = id;
+        return;
+    }
+    self.export_current[i] = id;
+}
+
+/// Forget every export texture: targets were rebuilt or released.
+pub fn exportsInvalidated(self: *OpenGL) void {
+    self.export_current = @splat(0);
 }
 
 /// Actions taken after `drawFrame` is done.
@@ -354,103 +331,84 @@ pub fn initShaders(
     );
 }
 
-/// Get the current size of the runtime surface.
-pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
-    _ = self;
-    var viewport: [4]gl.c.GLint = undefined;
-    gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
-    return .{
-        .width = @intCast(viewport[2]),
-        .height = @intCast(viewport[3]),
-    };
-}
-
 /// Initialize a new render target which can be presented by this API.
 pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
+    _ = self;
     return Target.init(.{
-        .internal_format = if (self.blending.isLinear()) .srgba else .rgba,
         .width = width,
         .height = height,
     });
 }
 
-/// Present the provided target.
-pub fn present(self: *OpenGL, target: Target) !void {
-    // In order to present a target we blit it to the default framebuffer.
-
-    // We disable GL_FRAMEBUFFER_SRGB while doing this blit, otherwise the
-    // values may be linearized as they're copied, but even though the draw
-    // framebuffer has a linear internal format, the values in it should be
-    // sRGB, not linear!
-    try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
-    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
-        log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
-    };
-
-    // Bind the target for reading.
-    const fbobind = try target.framebuffer.bind(.read);
-    defer fbobind.unbind();
-
-    // Blit: the rectangles that changed if the framebuffer still holds the
-    // last frame, everything otherwise.
-    const partial = self.present_persistent and !self.present_stale and
-        !self.frame_damage.full and self.last_target != null and
-        self.last_target.?.framebuffer.id == target.framebuffer.id;
-    if (partial) {
-        // GHOSTTY_PRESENT_BREAK=1 drops the first rectangle of every partial
-        // present, to show that `present_verify` can fail.
-        const skip: usize = if (self.present_verify and
-            std.c.getenv("GHOSTTY_PRESENT_BREAK") != null) 1 else 0;
-        for (self.frame_damage.slice(), 0..) |r, i| {
-            if (i < skip) continue;
-            const x0: gl.c.GLint = @intCast(@min(r[0], target.width));
-            const y0: gl.c.GLint = @intCast(@min(r[1], target.height));
-            const x1: gl.c.GLint = @intCast(@min(r[0] + r[2], target.width));
-            const y1: gl.c.GLint = @intCast(@min(r[1] + r[3], target.height));
-            if (x1 <= x0 or y1 <= y0) continue;
-            gl.glad.context.BlitFramebuffer.?(
-                x0,
-                y0,
-                x1,
-                y1,
-                x0,
-                y0,
-                x1,
-                y1,
-                gl.c.GL_COLOR_BUFFER_BIT,
-                gl.c.GL_NEAREST,
-            );
-            self.presented.add(.{
-                @intCast(x0),
-                @intCast(y0),
-                @intCast(x1 - x0),
-                @intCast(y1 - y0),
-            });
-        }
-    } else {
-        gl.glad.context.BlitFramebuffer.?(
-            0,
-            0,
-            @intCast(target.width),
-            @intCast(target.height),
-            0,
-            0,
-            @intCast(target.width),
-            @intCast(target.height),
-            gl.c.GL_COLOR_BUFFER_BIT,
-            gl.c.GL_NEAREST,
-        );
-        self.presented = .everything;
-        self.present_stale = false;
-    }
-    if (self.present_verify) self.verifyPresent(target, partial);
-
+/// Export a rendered target. Caller takes ownership
+/// of the frame and is responsible for freeing it.
+///
+/// This runs on the render thread.
+pub fn present(
+    self: *OpenGL,
+    target: Target,
+    presentation_health: rendererpkg.Health,
+) !ExportedFrame {
     // Debugging aid: GHOSTTY_FRAME_DUMP=<file> appends every presented frame.
     dumpFrame(target);
 
-    // Keep track of this target in case we need to repeat it.
-    self.last_target = target;
+    const export_id = target.export_texture.id;
+
+    // We only export DMABUFs when the apprt can present them.
+    // Otherwise, use CPU buffers.
+    if (presentation_health == .healthy) {
+        // Copy only what changed since this export texture was last
+        // filled, when it holds exactly that frame.
+        const rects: ?[]const [4]u32 = if (!self.slot_damage.full and
+            self.exportIsCurrent(export_id)) self.slot_damage.slice() else null;
+        if (target.exportDmabuf(self.device.display, self.egl_context, rects)) |dmabuf_| {
+            var dmabuf = dmabuf_;
+            dmabuf.damage = if (self.present_stale) .everything else self.frame_damage;
+            self.present_stale = false;
+            self.setExportCurrent(export_id, true);
+            return .{ .dmabuf = dmabuf };
+        } else |_| {
+            log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
+        }
+    }
+
+    // The export texture was not (fully) written.
+    self.setExportCurrent(export_id, false);
+    self.present_stale = false;
+
+    return .{ .memory = .{
+        .width = @intCast(target.width),
+        .height = @intCast(target.height),
+        .pixels = try target.readPixelsAlloc(self.alloc),
+        .alloc = self.alloc,
+    } };
 }
+
+/// A finished frame exported for presentation by the apprt.
+pub const ExportedFrame = union(enum) {
+    dmabuf: Dmabuf,
+    memory: Memory,
+
+    /// RGBA8 pixel data with premultiplied alpha, tightly packed
+    /// (`width * 4` bytes per row), in CPU memory.
+    pub const Memory = struct {
+        width: u32,
+        height: u32,
+        pixels: []u8,
+        alloc: Allocator,
+
+        pub fn deinit(self: Memory) void {
+            self.alloc.free(self.pixels);
+        }
+    };
+
+    pub fn deinit(self: ExportedFrame) void {
+        switch (self) {
+            .dmabuf => |v| v.deinit(),
+            .memory => |v| v.deinit(),
+        }
+    }
+};
 
 /// FRAME DUMP (debugging aid). With `GHOSTTY_FRAME_DUMP=<file>` in the
 /// environment, every presented frame is shrunk to a third on the GPU and
@@ -479,7 +437,8 @@ const FrameDump = struct {
     pbo_full: [2]bool = .{ false, false },
     next: usize = 0,
 };
-var frame_dump: FrameDump = .{};
+// Per render thread: each surface draws on its own.
+threadlocal var frame_dump: FrameDump = .{};
 
 fn dumpFrame(target: Target) void {
     const d = &frame_dump;
@@ -526,7 +485,10 @@ fn dumpFrame(target: Target) void {
         d.h = h;
     }
     if (d.buf.len == 0) return;
-    // The target is bound for reading (see `present`).
+    // Copy the stored (sRGB-encoded) values verbatim, as the export does.
+    gl.disable(gl.c.GL_FRAMEBUFFER_SRGB) catch {};
+    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch {};
+    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, target.framebuffer.id);
     ctx.BindFramebuffer.?(gl.c.GL_DRAW_FRAMEBUFFER, d.fbo);
     ctx.BlitFramebuffer.?(0, 0, @intCast(target.width), @intCast(target.height), 0, 0, w, h, gl.c.GL_COLOR_BUFFER_BIT, gl.c.GL_LINEAR);
     ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, d.fbo);
@@ -575,59 +537,6 @@ pub fn readTarget(self: *OpenGL, target: Target, buf: []u8) !void {
     );
 }
 
-/// `present_verify`: the framebuffer just presented into must equal the
-/// target, pixel for pixel. The target is still bound for reading.
-fn verifyPresent(self: *OpenGL, target: Target, partial: bool) void {
-    const alloc = std.heap.c_allocator;
-    const bytes = target.width * target.height * 4;
-    const want = alloc.alloc(u8, bytes * 2) catch return;
-    defer alloc.free(want);
-    const got = want[bytes..];
-    const ctx = &gl.glad.context;
-    const w: gl.c.GLsizei = @intCast(target.width);
-    const h: gl.c.GLsizei = @intCast(target.height);
-    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, want.ptr);
-    var draw: gl.c.GLint = 0;
-    var read: gl.c.GLint = 0;
-    ctx.GetIntegerv.?(gl.c.GL_DRAW_FRAMEBUFFER_BINDING, &draw);
-    ctx.GetIntegerv.?(gl.c.GL_READ_FRAMEBUFFER_BINDING, &read);
-    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(draw));
-    ctx.ReadPixels.?(0, 0, w, h, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, got.ptr);
-    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(read));
-
-    const st = &self.present_verify_stats;
-    st.checked += 1;
-    if (partial) st.partial += 1;
-    if (!std.mem.eql(u8, want[0..bytes], got)) {
-        st.mismatched += 1;
-        var px: u64 = 0;
-        var i: usize = 0;
-        while (i < bytes) : (i += 4) {
-            if (!std.mem.eql(u8, want[i..][0..4], got[i..][0..4])) px += 1;
-        }
-        log.warn("present MISMATCH px={} partial={} rects={}", .{ px, partial, self.frame_damage.n });
-    }
-    if (st.checked % 200 == 0) log.info(
-        "present-verify checked={} partial={} mismatched={}",
-        .{ st.checked, st.partial, st.mismatched },
-    );
-}
-
-/// Present the last presented target again.
-pub fn presentLastTarget(self: *OpenGL) !void {
-    // A framebuffer that kept the last frame already shows it.
-    if (self.present_persistent and !self.present_stale and
-        self.last_target != null) return;
-    self.frame_damage = .everything;
-    if (self.last_target) |target| try self.present(target);
-}
-
-/// Called when the renderer released its GPU resources; the last
-/// presented target is deinited with them so we must drop our copy.
-pub fn gpuResourcesReleased(self: *OpenGL) void {
-    self.last_target = null;
-}
-
 /// Returns the options to use when constructing buffers.
 pub inline fn bufferOptions(self: OpenGL) bufferpkg.Options {
     _ = self;
@@ -650,7 +559,7 @@ pub inline fn textureOptions(self: OpenGL) Texture.Options {
     return .{
         .format = .rgba,
         .internal_format = .srgba,
-        .target = .@"2D",
+        .target = .@"2d",
         .min_filter = .linear,
         .mag_filter = .linear,
         .wrap_s = .clamp_to_edge,
@@ -697,7 +606,7 @@ pub inline fn imageTextureOptions(
     return .{
         .format = format.toPixelFormat(),
         .internal_format = if (srgb) .srgba else .rgba,
-        .target = .@"2D",
+        .target = .@"2d",
         // TODO: Generate mipmaps for image textures and use
         //       linear_mipmap_linear filtering so that they
         //       look good even when scaled way down.
@@ -728,7 +637,7 @@ pub fn initAtlasTexture(
         .{
             .format = format,
             .internal_format = internal_format,
-            .target = .Rectangle,
+            .target = .rectangle,
             .min_filter = .nearest,
             .mag_filter = .nearest,
             .wrap_s = .clamp_to_edge,

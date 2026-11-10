@@ -48,7 +48,7 @@ extension Ghostty {
             self.configPath = configPath
             // Initialize the global configuration.
             self.config = Config(at: configPath)
-            if self.config.config == nil {
+            guard let cConfig = self.config.config else {
                 readiness = .error
                 return
             }
@@ -59,7 +59,7 @@ extension Ghostty {
                 userdata: Unmanaged.passUnretained(self).toOpaque(),
                 supports_selection_clipboard: true,
                 wakeup_cb: { userdata in App.wakeup(userdata) },
-                action_cb: { app, target, action in App.action(app!, target: target, action: action) },
+                action_cb: { app, target, action in App.action(app, target: target, action: action) },
                 read_clipboard_cb: { userdata, loc, state, mimes, mimesLen, list in
                     App.readClipboard(
                         userdata,
@@ -80,7 +80,7 @@ extension Ghostty {
             )
 
             // Create the ghostty app.
-            guard let app = ghostty_app_new(&runtime_cfg, config.config) else {
+            guard let app = ghostty_app_new(&runtime_cfg, cConfig) else {
                 logger.critical("ghostty_app_new failed")
                 readiness = .error
                 return
@@ -131,11 +131,11 @@ extension Ghostty {
             let str = configPath ?? Ghostty.AllocatedString(ghostty_config_open_path()).string
             guard !str.isEmpty else { return }
             let fileURL = URL(fileURLWithPath: str).absoluteString
-            var action = ghostty_action_open_url_s()
-            action.kind = GHOSTTY_ACTION_OPEN_URL_KIND_TEXT
             fileURL.withCString { cStr in
-                action.url = cStr
-                action.len = UInt(fileURL.count)
+                let action = ghostty_action_open_url_s(
+                    kind: GHOSTTY_ACTION_OPEN_URL_KIND_TEXT,
+                    url: cStr,
+                    len: UInt(fileURL.count))
                 _ = App.openURL(action)
             }
         }
@@ -298,8 +298,8 @@ extension Ghostty {
         static func readClipboard(
             _ userdata: UnsafeMutableRawPointer?,
             location: ghostty_clipboard_e,
-            state: UnsafeMutableRawPointer?,
-            mimes: UnsafePointer<UnsafePointer<CChar>?>?,
+            state: UnsafeMutableRawPointer,
+            mimes: UnsafePointer<UnsafePointer<CChar>>,
             mimesLen: Int,
             list: Bool
         ) -> ghostty_clipboard_read_result_e {
@@ -319,15 +319,12 @@ extension Ghostty {
             // contents are never loaded.
             var contents: [Ghostty.ClipboardContent] = []
             var seen = Set<String>()
-            if let mimes {
-                for i in 0..<mimesLen {
-                    guard let ptr = mimes[i] else { continue }
-                    let mime = String(cString: ptr)
-                    guard !seen.contains(mime) else { continue }
-                    seen.insert(mime)
-                    guard let data = pasteboard.ghosttyData(forMime: mime) else { continue }
-                    contents.append(.init(mime: mime, data: data))
-                }
+            for i in 0..<mimesLen {
+                let mime = String(cString: mimes[i])
+                guard !seen.contains(mime) else { continue }
+                seen.insert(mime)
+                guard let data = pasteboard.ghosttyData(forMime: mime) else { continue }
+                contents.append(.init(mime: mime, data: data))
             }
 
             // The listing of available types, only gathered when requested.
@@ -349,14 +346,13 @@ extension Ghostty {
 
         static func confirmReadClipboard(
             _ userdata: UnsafeMutableRawPointer?,
-            confirm: UnsafePointer<ghostty_clipboard_confirm_s>?,
-            state: UnsafeMutableRawPointer?,
+            confirm: UnsafePointer<ghostty_clipboard_confirm_s>,
+            state: UnsafeMutableRawPointer,
             request: ghostty_clipboard_request_e
         ) {
             let surfaceView = self.surfaceUserdata(from: userdata)
             guard let surface = surfaceView.surface else { return }
-            guard let confirm,
-                  let kind = Ghostty.ClipboardRequest.from(request: request) else {
+            guard let kind = Ghostty.ClipboardRequest.from(request: request) else {
                 ghostty_surface_deny_clipboard_request(surface, state)
                 return
             }
@@ -365,23 +361,15 @@ extension Ghostty {
             // Copy the borrowed C representations: the confirmation is
             // asynchronous and completes with exactly what the user
             // approved, so the clipboard is never re-read.
-            var reps: [Ghostty.ClipboardContent] = []
-            if let contents = c.contents {
-                for i in 0..<c.contents_len {
-                    let content = contents[i]
-                    let data: Data = if content.len > 0 {
-                        Data(bytes: content.data, count: content.len)
-                    } else {
-                        Data()
-                    }
-                    reps.append(.init(mime: String(cString: content.mime), data: data))
-                }
+            let reps: [Ghostty.ClipboardContent] = if let contents = c.contents {
+                (0..<c.contents_len).map { Ghostty.ClipboardContent.from(content: contents[$0]) }
+            } else {
+                []
             }
             var avail: [String] = []
             if let available = c.available {
                 for i in 0..<c.available_len {
-                    guard let ptr = available[i] else { continue }
-                    avail.append(String(cString: ptr))
+                    avail.append(String(cString: available[i]))
                 }
             }
 
@@ -405,7 +393,6 @@ extension Ghostty {
                 surface: surfaceView,
                 contents: display,
                 kind: kind,
-                programName: c.name.map { String(cString: $0) },
                 canRemember: c.can_remember,
                 previewImage: previewImage
             ) { surfaceView, confirmed, remember in
@@ -429,7 +416,7 @@ extension Ghostty {
             _ surface: ghostty_surface_t,
             contents: [Ghostty.ClipboardContent],
             available: [String],
-            state: UnsafeMutableRawPointer?,
+            state: UnsafeMutableRawPointer,
             confirmed: Bool = false,
             remember: Bool = false
         ) {
@@ -460,7 +447,7 @@ extension Ghostty {
                     len: entry.data.count))
             }
 
-            var cAvailable: [UnsafePointer<CChar>?] = []
+            var cAvailable: [UnsafePointer<CChar>] = []
             for mime in available {
                 guard let str = strdup(mime) else { continue }
                 cStrings.append(str)
@@ -484,19 +471,18 @@ extension Ghostty {
         static func writeClipboard(
             _ userdata: UnsafeMutableRawPointer?,
             location: ghostty_clipboard_e,
-            content: UnsafePointer<ghostty_clipboard_content_s>?,
+            content: UnsafePointer<ghostty_clipboard_content_s>,
             len: Int,
             confirm: Bool
         ) {
             let surfaceView = self.surfaceUserdata(from: userdata)
             guard let pasteboard = NSPasteboard.ghostty(location) else { return }
-            guard let content = content, len > 0 else { return }
+            guard len > 0 else { return }
 
             // Convert the C array to Swift array
-            let contentArray = (0..<len).compactMap { i in
+            let contentArray = (0..<len).map { i in
                 Ghostty.ClipboardContent.from(content: content[i])
             }
-            guard !contentArray.isEmpty else { return }
 
             // Assert there is only one text/plain entry. For security reasons we need
             // to guarantee this for now since our confirmation dialog only shows one.
@@ -567,8 +553,7 @@ extension Ghostty {
         /// Returns the GhosttyState from the given userdata value.
         static private func appState(fromView view: SurfaceView) -> App? {
             guard let surface = view.surface else { return nil }
-            guard let app = ghostty_surface_app(surface) else { return nil }
-            guard let app_ud = ghostty_app_userdata(app) else { return nil }
+            guard let app_ud = ghostty_app_userdata(ghostty_surface_app(surface)) else { return nil }
             return Unmanaged<App>.fromOpaque(app_ud).takeUnretainedValue()
         }
 
@@ -620,6 +605,9 @@ extension Ghostty {
 
             case GHOSTTY_ACTION_MOVE_TAB:
                 return moveTab(app, target: target, move: action.action.move_tab)
+
+            case GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW:
+                return moveTabToNewWindow(app, target: target)
 
             case GHOSTTY_ACTION_GOTO_TAB:
                 return gotoTab(app, target: target, tab: action.action.goto_tab)
@@ -687,6 +675,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_RESET_WINDOW_SIZE:
                 resetWindowSize(app, target: target)
 
+            case GHOSTTY_ACTION_RESIZE_WINDOW:
+                return resizeWindow(app, target: target, v: action.action.resize_window)
+
             case GHOSTTY_ACTION_CELL_SIZE:
                 setCellSize(app, target: target, v: action.action.cell_size)
 
@@ -722,6 +713,9 @@ extension Ghostty {
 
             case GHOSTTY_ACTION_RELOAD_CONFIG:
                 configReload(app, target: target, v: action.action.reload_config)
+
+            case GHOSTTY_ACTION_SET_WINDOW_THEME:
+                setWindowTheme(action.action.set_window_theme)
 
             case GHOSTTY_ACTION_COLOR_CHANGE:
                 colorChange(app, target: target, change: action.action.color_change)
@@ -826,6 +820,18 @@ extension Ghostty {
                 url = URL(filePath: expandedPath)
             }
 
+            // Unknown URLs are as untrusted as OSC 8 but may be plain paths,
+            // which UntrustedURL rejects, so check the file URL built above.
+            // Values with unsafe characters are passed unchanged so they are
+            // rejected before percent-encoding hides them.
+            if action.kind == .unknown {
+                let hasScheme = URL(string: action.url)?.scheme != nil
+                let target = hasScheme || UntrustedURL.containsUnsafeCharacters(action.url)
+                    ? action.url
+                    : url.absoluteString
+                return openUntrustedURL(target)
+            }
+
             switch action.kind {
             case .text:
                 // Open with the default editor for `*.ghostty` file or just system text editor
@@ -839,11 +845,8 @@ extension Ghostty {
                 // The extension will be HTML and we do the right thing automatically.
                 break
 
-            case .unknown:
-                break
-
-            case .osc8:
-                assertionFailure("OSC 8 URLs must use the safe-opening policy")
+            case .osc8, .unknown:
+                assertionFailure("Untrusted URLs must use the safe-opening policy")
                 return true
             }
 
@@ -1278,6 +1281,31 @@ extension Ghostty {
                 return true
         }
 
+        private static func moveTabToNewWindow(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) -> Bool {
+                switch target.tag {
+                case GHOSTTY_TARGET_APP:
+                    Ghostty.logger.warning("move tab to new window does nothing with an app target")
+                    return false
+
+                case GHOSTTY_TARGET_SURFACE:
+                    guard let surface = target.target.surface else { return false }
+                    guard let surfaceView = self.surfaceView(from: surface) else { return false }
+
+                    // See gotoTab for notes on this check. A lone tab is already
+                    // a window of its own, so there is nothing to move.
+                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+
+                    surfaceView.window?.moveTabToNewWindow(nil)
+
+                default:
+                    assertionFailure()
+                }
+
+                return true
+        }
+
         private static func gotoTab(
             _ app: ghostty_app_t,
             target: ghostty_target_s,
@@ -1530,13 +1558,12 @@ extension Ghostty {
             guard target.tag == GHOSTTY_TARGET_SURFACE,
                   let surface = target.target.surface,
                   let surfaceView = self.surfaceView(from: surface),
-                  let window = surfaceView.window,
-                  let contents = v.contents
+                  let window = surfaceView.window
             else { return false }
 
             // The action data is borrowed for the duration of this callback,
             // so copy it before presenting the asynchronous save panel.
-            let data = Data(bytes: contents, count: v.len)
+            let data = Data(bytes: v.contents, count: v.len)
             DispatchQueue.main.async {
                 let panel = NSSavePanel()
                 panel.allowedContentTypes = [.plainText]
@@ -1569,8 +1596,8 @@ extension Ghostty {
             case GHOSTTY_TARGET_SURFACE:
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
-                guard let title = String(cString: n.title!, encoding: .utf8) else { return }
-                guard let body = String(cString: n.body!, encoding: .utf8) else { return }
+                guard let title = String(cString: n.title, encoding: .utf8) else { return }
+                guard let body = String(cString: n.body, encoding: .utf8) else { return }
                 showDesktopNotification(surfaceView, title: title, body: body)
 
             default:
@@ -1789,7 +1816,7 @@ extension Ghostty {
             case GHOSTTY_TARGET_SURFACE:
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
-                guard let title = String(cString: v.title!, encoding: .utf8) else { return }
+                guard let title = String(cString: v.title, encoding: .utf8) else { return }
                 surfaceView.setTitle(title)
 
             default:
@@ -1808,7 +1835,7 @@ extension Ghostty {
                 return false
 
             case GHOSTTY_TARGET_SURFACE:
-                guard let title = String(cString: v.title!, encoding: .utf8) else { return false }
+                guard let title = String(cString: v.title, encoding: .utf8) else { return false }
                 let titleOverride = title.isEmpty ? nil : title
                 guard let surface = target.target.surface else { return false }
                 guard let surfaceView = self.surfaceView(from: surface) else { return false }
@@ -1923,7 +1950,7 @@ extension Ghostty {
             case GHOSTTY_TARGET_SURFACE:
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
-                guard let pwd = String(cString: v.pwd!, encoding: .utf8) else { return }
+                guard let pwd = String(cString: v.pwd, encoding: .utf8) else { return }
                 surfaceView.pwd = pwd
 
             default:
@@ -1995,7 +2022,7 @@ extension Ghostty {
                     return
                 }
 
-                let buffer = Data(bytes: v.url!, count: v.len)
+                let buffer = Data(bytes: v.url, count: v.len)
                 surfaceView.hoverUrl = String(data: buffer, encoding: .utf8)
 
             default:
@@ -2040,6 +2067,30 @@ extension Ghostty {
 
             default:
                 assertionFailure()
+            }
+        }
+
+        private static func resizeWindow(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_resize_window_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("resize window does nothing with an app target")
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let controller = surfaceView.window?.windowController as? TerminalController else { return false }
+                return controller.resizeWindow(
+                    surfaceView,
+                    to: NSSize(width: Double(v.width), height: Double(v.height))
+                )
+
+            default:
+                assertionFailure()
+                return false
             }
         }
 
@@ -2250,8 +2301,8 @@ extension Ghostty {
                 let startSearch = Ghostty.Action.StartSearch(c: v)
                 DispatchQueue.main.async {
                     if let searchState = surfaceView.searchState {
-                        if let needle = startSearch.needle, !needle.isEmpty {
-                            searchState.setNeedle(needle)
+                        if !startSearch.needle.isEmpty {
+                            searchState.setNeedle(startSearch.needle)
                         }
                     } else {
                         surfaceView.searchState = Ghostty.SurfaceView.SearchState(from: startSearch)
@@ -2330,6 +2381,23 @@ extension Ghostty {
 
             default:
                 assertionFailure()
+            }
+        }
+
+        private static func setWindowTheme(_ theme: ghostty_action_window_theme_e) {
+            guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return }
+
+            switch theme {
+            case GHOSTTY_ACTION_WINDOW_THEME_CONFIG:
+                appDelegate.setAppearance(nil)
+            case GHOSTTY_ACTION_WINDOW_THEME_SYSTEM:
+                appDelegate.setAppearance(.system)
+            case GHOSTTY_ACTION_WINDOW_THEME_LIGHT:
+                appDelegate.setAppearance(.light)
+            case GHOSTTY_ACTION_WINDOW_THEME_DARK:
+                appDelegate.setAppearance(.dark)
+            default:
+                Ghostty.logger.warning("unknown window theme=\(theme.rawValue, privacy: .public)")
             }
         }
 
