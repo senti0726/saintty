@@ -69,6 +69,9 @@ pub const RenderSurface = extern struct {
         /// is relative to it (`gtk-damage-tracking`).
         texture_updatable: bool = false,
 
+        /// Frame clock tick that paces the renderer (FrameLink), 0 if none.
+        frame_tick: c_uint = 0,
+
         /// `notify::scale` handler id on `scale_surface`.
         scale_notify_id: c_ulong = 0,
 
@@ -116,6 +119,11 @@ pub const RenderSurface = extern struct {
         const priv = self.private();
 
         self.disconnectScaleNotify();
+
+        if (priv.frame_tick != 0) {
+            self.as(gtk.Widget).removeTickCallback(priv.frame_tick);
+            priv.frame_tick = 0;
+        }
 
         if (priv.texture) |tex| {
             tex.as(gobject.Object).unref();
@@ -306,6 +314,52 @@ pub const RenderSurface = extern struct {
                 widget.getScaleFactor(),
             },
         );
+    }
+
+    /// Start the frame clock tick that paces the renderer, if the renderer
+    /// uses one (FrameLink) and it is not already running. Called on every
+    /// redraw request; the tick stops itself once no frame is wanted.
+    pub fn ensureFrameTick(self: *Self) void {
+        const priv = self.private();
+        if (priv.frame_tick != 0) return;
+        const core = priv.core_surface orelse return;
+        if (!core.renderer.frame_link.enabled.load(.acquire)) return;
+        const widget = self.as(gtk.Widget);
+        if (widget.getRealized() == 0) return;
+        priv.frame_tick = widget.addTickCallback(frameTickCallback, null, null);
+    }
+
+    fn frameTickCallback(
+        widget: *gtk.Widget,
+        clock: *gdk.FrameClock,
+        _: ?*anyopaque,
+    ) callconv(.c) c_int {
+        const self = gobject.ext.cast(Self, widget) orelse return 0;
+        const priv = self.private();
+        const core = priv.core_surface orelse {
+            priv.frame_tick = 0;
+            return 0;
+        };
+        // GTK's frame time is its prediction of when this refresh is
+        // presented (µs, CLOCK_MONOTONIC). The frame we ask for now is
+        // finished during this refresh and shown on the next one, so
+        // animations sample that: frames drawn at uneven moments still
+        // advance by exactly one refresh each.
+        const frame_us = clock.getFrameTime();
+        var interval_us: i64 = 0;
+        var presentation_us: i64 = 0;
+        clock.getRefreshInfo(frame_us, &interval_us, &presentation_us);
+        const present_us = frame_us + @max(interval_us, 0);
+        if (!core.renderer.frame_link.tick(
+            @intCast(@max(present_us, 1) * std.time.ns_per_us),
+        )) {
+            priv.frame_tick = 0;
+            return 0;
+        }
+        // Paint the latest finished frame (the one asked for on the
+        // previous tick). The one asked for now pushes its own redraw.
+        widget.queueDraw();
+        return 1;
     }
 
     /// Set the core surface to pull presents from. Nothing will

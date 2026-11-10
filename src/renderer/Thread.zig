@@ -471,7 +471,11 @@ fn drawFrame(self: *Thread, now: bool) void {
 
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`.
-    if (!now and self.renderer.hasVsync()) return;
+    if (!now and self.renderer.hasVsync()) {
+        // GTK: the frame link draws it on the next frame clock tick.
+        self.renderer.requestFrame();
+        return;
+    }
 
     self.renderer.drawFrame(false) catch |err|
         log.warn("error drawing err={}", .{err});

@@ -864,6 +864,7 @@ pub const Surface = extern struct {
     /// then we should force a redraw.
     pub fn redraw(self: *Self) void {
         const priv = self.private();
+        priv.render_surface.ensureFrameTick();
         priv.render_surface.as(gtk.Widget).queueDraw();
     }
 

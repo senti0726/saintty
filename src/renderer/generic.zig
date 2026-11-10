@@ -48,6 +48,10 @@ const DisplayLink = switch (builtin.target.os.tag) {
     else => void,
 };
 
+/// Vsync where the apprt composites exported frames on its own frame clock
+/// (GTK): draws wait for the apprt's tick. See FrameLink.zig.
+const FrameLink = @import("FrameLink.zig");
+
 const log = std.log.scoped(.generic_renderer);
 
 /// Create a renderer type with the provided graphics API wrapper.
@@ -131,6 +135,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Unused if the renderer does not need to export frames to
         /// present its rendered frame.
         latest_frame: LatestFrame = .{},
+
+        /// Paces draws to the apprt's frame clock when frames are
+        /// exported and there is no DisplayLink. See FrameLink.zig.
+        frame_link: FrameLink = .{},
 
         /// Current font metrics defining our grid.
         grid_metrics: font.Metrics,
@@ -1380,6 +1388,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.loopEnter();
             }
 
+            if (comptime DisplayLink == void and ExportedFrame != void) {
+                self.frame_link.draw_now = &thr.draw_now;
+                self.frame_link.enabled.store(self.config.vsync, .release);
+            }
+
             // If we don't support a display link we have no work to do.
             if (comptime DisplayLink == void) return;
 
@@ -1391,6 +1404,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If our API has to do things on loop exit, let it.
             if (@hasDecl(GraphicsAPI, "loopExit")) {
                 self.api.loopExit();
+            }
+
+            // Stop pacing: later ticks see the link disabled and stop.
+            if (comptime DisplayLink == void and ExportedFrame != void) {
+                self.frame_link.enabled.store(false, .release);
             }
 
             // If we don't support a display link we have no work to do.
@@ -1714,7 +1732,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn advanceScrollAnim(self: *Self) void {
             if (!self.scroll_anim.active()) return;
 
-            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            // Under the GTK frame link, the refresh this frame is shown on
+            // (see FrameLink.present_ns), not when the draw started.
+            const now: std.Io.Timestamp = self.frame_link.animTime() orelse
+                .now(global.io(), .awake);
             const last = self.scroll_anim_last orelse {
                 // First frame of this animation: no interval to integrate yet.
                 self.scroll_anim_last = now;
@@ -2384,6 +2405,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             );
         }
 
+        /// The render thread wants a frame but `hasVsync` says it must not
+        /// draw on its own: mark it wanted for the next frame-link tick,
+        /// and wake the apprt if it had stopped ticking.
+        ///
+        /// Must be called on the render thread.
+        pub fn requestFrame(self: *Self) void {
+            if (comptime DisplayLink != void or ExportedFrame == void) return;
+            if (self.frame_link.want()) {
+                _ = self.surface_mailbox.push(.redraw, .{ .forever = {} });
+            }
+        }
+
         /// Returns true if the display link is running, meaning frames
         /// are paced by display refresh. In that case the render thread
         /// must only draw when the display link wakes it through
@@ -2394,7 +2427,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// until the main thread starts it, and the render thread draws
         /// immediately in the meantime.
         pub fn hasVsync(self: *const Self) bool {
-            if (comptime DisplayLink == void) return false;
+            if (comptime DisplayLink == void) {
+                if (comptime ExportedFrame == void) return false;
+                return self.frame_link.enabled.load(.acquire);
+            }
             const display_link = self.display_link orelse return false;
             return display_link.isRunning();
         }
@@ -3337,6 +3373,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
+            // Keep the frame-link ticks coming while anything animates.
+            defer if (comptime DisplayLink == void and ExportedFrame != void) {
+                if (self.frame_link.enabled.load(.acquire))
+                    // A sync draw runs on the main thread: animation state
+                    // is the render thread's, and its next draw decides.
+                    self.frame_link.frameDone(!sync and self.animationWake() != null);
+            };
+
             // Everything that touches draw state happens under the draw
             // mutex. The display link is synced after the mutex is
             // released. It doesn't need the lock, and this keeps the
