@@ -2910,3 +2910,18 @@ Installed with `zig-0.17 build -Doptimize=ReleaseFast --prefix
 binary path afterwards (the build writes a bare `ghostty`). Rollback:
 `~/tools/ghostty/bin/ghostty.pre-upstream1110` and
 `~/tools/ghostty/share.pre-upstream1110.tar.gz`.
+
+## 2026-11-11 — ghost trail: image ghost slices captured from a stale snapshot
+
+**Symptom:** scrolling up CSAPP ch. 2 in nvim+tmux stamped a copy of a display-maths picture (e.g. `314,156 : 314,156 = 19,634·16 − 12 (C)`) at every row it passed; the copies piled up in the rows above nvim's status line.
+
+**Cause:** since the upstream merge (`7327e9207`) Kitty placements are rebuilt only when their generation changes. The fork's scroll animation captures the image slices that leave the region as ghost slices from `scroll_prev_images`, a snapshot taken only on updates that rebuild. On a scroll captured without a rebuild the snapshot is from an older frame, so slices were copied from where the picture USED to be — once per scroll step.
+
+**Fix:** `f535c7f0c` captures from `kitty_placements` (what was last drawn) when this update did not rebuild (`scroll_prev_images_fresh`); the scroll trace logs `imgghost stale-snapshot avoided`. Installed as `1.4.1-smooth-scroll+f535c7f0c`; previous build `~/tools/ghostty/bin/ghostty.pre-ghosttrail`.
+
+**Verified:** real 4K screen, scale 2.4, harness wheel-up 4 notches/s from line 175 to the top, 2 A/B pairs in both orders, judged on `GHOSTTY_FRAME_DUMP` frames: installed build trails both times, fixed build clean both times (156 avoided-lines in one run). `zig-0.17 build test` exit 0. The user's own repro dump (their window, touchpad) showed the trail in Ghostty's OWN frames, which ruled out the presentation side.
+
+**Ruled out / lessons:**
+- Presentation (DMA-BUF export, swap-chain slots, GTK damage): screen grabs matched Ghostty's dumped frames to JPEG noise in every run, and the user's dump had the trail itself.
+- The cage rig and the first real-screen runs could not reproduce because they never had a display-maths PICTURE on screen: `hold_k_maths` at 1330 and Figure 2.5 regions show inline maths as `%%INLINE%%` text. The pictures are Unicode-placeholder images (`config/math-images.lua`). Any image-related scroll bug needs a scenario over display maths (lines ~120–175).
+- The recording's `0 0 0 0 3 0 3 9` read as the Figure 2.5 table, but the stale gutter number `4591` is `459` + stale digit; the identification from a filmed frame was misleading — the dump was decisive.
