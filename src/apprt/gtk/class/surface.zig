@@ -3222,11 +3222,34 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
-        if (priv.core_surface == null) return;
+        const surface = priv.core_surface orelse return;
 
         // Respect the config. Off by default while this is experimental.
         const enabled = if (priv.config) |c| c.get().@"mouse-scroll-momentum" else false;
         if (!enabled) return;
+
+        // A slow lift is the end of a careful scroll, not a flick: stop right
+        // here, as if the fingers were still on the pad. Without this every
+        // lift flung, so a slow scroll lurched a row or two on release.
+        // Measured in rows/s through the same path a fling takes (scaled,
+        // x10, precision multiplier) so the threshold means the same thing
+        // at any font size or display scale.
+        {
+            const cell_h: f64 = @floatFromInt(@max(1, surface.size.cell.height));
+            const dev_px_s = @abs(self.scaledCoordinates(0, vel_y).y) * 10.0 *
+                surface.config.mouse_scroll_multiplier.precision;
+            const rows_s = dev_px_s / cell_h;
+            const min_speed = if (priv.config) |c| c.get().@"mouse-scroll-momentum-min-speed" else 0;
+            const fling = rows_s >= min_speed;
+            if (surface.config.scroll_trace) log.info(
+                "scrollmomentum rows_s={d:.1} min={d:.1} fling={}",
+                .{ rows_s, min_speed, fling },
+            );
+            if (!fling) {
+                self.momentumStop();
+                return;
+            }
+        }
 
         const tau = self.momentumTau();
 

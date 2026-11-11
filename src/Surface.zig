@@ -261,6 +261,13 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
+    /// Touchpad (precision) finger speed, device px per ms, smoothed over
+    /// recent events, and when the last one came. Sent to the renderer so
+    /// a slow scroll can drift at the finger's pace between rows. See
+    /// `ScrollAnim.touch_rate`.
+    touch_rate: f64 = 0,
+    touch_last_us: i64 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -3745,6 +3752,7 @@ pub fn scrollCallback(
             .{ .input_activity = if (fast) dir * 2 else dir },
             .{ .instant = {} },
         );
+        if (scroll_mods.precision) self.noteTouchSpeed(yoff);
 
         // Wake the renderer, or the message sits in the mailbox until
         // something else happens to wake the thread and the frame that should
@@ -6892,6 +6900,40 @@ test "queueIo frees allocated writes in readonly mode" {
 }
 
 const wheel_speed_tau_ms: f64 = 80;
+
+/// Measure the finger's speed on a touchpad and hand it to the renderer.
+///
+/// Rows only reach the screen when a whole cell of travel has built up, so
+/// a slow scroll (2 rows/s) was drawn as a row sliding in and then nothing
+/// for a third of a second: "snaps, stop, snaps, stop" (2026-11-11). The
+/// renderer can only glide between rows at the finger's pace if it knows
+/// that pace, and the rows themselves are too sparse to measure it from.
+fn noteTouchSpeed(self: *Surface, yoff: f64) void {
+    const now_us: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(global.io(), .awake).nanoseconds, std.time.ns_per_us));
+    const px = @abs(yoff * self.config.mouse_scroll_multiplier.precision);
+    const prev_us = self.mouse.touch_last_us;
+    const gap_us = now_us - prev_us;
+    self.mouse.touch_last_us = now_us;
+    // A new gesture: the first event's gap says nothing about speed.
+    if (prev_us == 0 or gap_us <= 0 or gap_us > 100 * std.time.us_per_ms) {
+        self.mouse.touch_rate = 0;
+        return;
+    }
+    const gap_ms: f64 = @as(f64, @floatFromInt(gap_us)) / std.time.us_per_ms;
+    const sample = px / gap_ms;
+    // ~80 ms of averaging: GTK delivers a touchpad every ~16 ms, and single
+    // events range 0.2-3 px at a steady slow drag.
+    const a = 1.0 - @exp(-gap_ms / 80.0);
+    self.mouse.touch_rate = if (self.mouse.touch_rate == 0)
+        sample
+    else
+        self.mouse.touch_rate + (sample - self.mouse.touch_rate) * a;
+    _ = self.renderer_thread.mailbox.push(
+        global.io(),
+        .{ .touch_speed = @floatCast(self.mouse.touch_rate) },
+        .{ .instant = {} },
+    );
+}
 
 /// Is the wheel turning faster than `scroll-animation-wheel-snap`? Feeds
 /// `notches` (this report's distance) into the speed estimate.

@@ -264,6 +264,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The last wheel movement past `scroll-animation-wheel-snap`.
         wheel_fast_ts: ?std.Io.Timestamp = null,
 
+        /// The finger's speed on the touchpad (device px per ms) and when it
+        /// was last reported. See `noteTouchSpeed`.
+        touch_rate: f32 = 0,
+        touch_ts: ?std.Io.Timestamp = null,
+
         /// When a scroll last arrived inside an open gate: a real scroll
         /// event, or a shift the repaint detector recovered.
         ///
@@ -1758,6 +1763,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // animation ran ~14% longer than configured.
             const dt_ms: f32 = @as(f32, @floatFromInt(last.durationTo(now).nanoseconds)) /
                 @as(f32, @floatFromInt(std.time.ns_per_ms));
+            self.scroll_anim.touch_rate = touch: {
+                const ts = self.touch_ts orelse break :touch 0;
+                const since_ns = ts.durationTo(.now(global.io(), .awake)).nanoseconds;
+                if (since_ns > touch_live_ms * std.time.ns_per_ms) break :touch 0;
+                const cell_h: f32 = @floatFromInt(@max(1, self.size.cell.height));
+                if (self.touch_rate * 1000 / cell_h > touch_glide_max_rows_s) break :touch 0;
+                break :touch self.touch_rate;
+            };
+            self.scroll_anim.touch_row_px = @floatFromInt(self.size.cell.height);
             self.scroll_anim.advance(
                 dt_ms,
                 @floatFromInt(self.config.scroll_animation_duration_ms),
@@ -1998,6 +2012,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.wheel_dir = dir;
             self.scroll_anim.key_paced = false;
         }
+
+        /// Record the finger's speed on a touchpad, for the touch glide
+        /// (`ScrollAnim.touch_rate`).
+        ///
+        /// Called from the render thread's mailbox.
+        pub fn noteTouchSpeed(self: *Self, px_per_ms: f32) void {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            self.touch_rate = px_per_ms;
+            self.touch_ts = .now(global.io(), .awake);
+        }
+
+        /// A touchpad counts as still moving this long after its last
+        /// report. GTK sends one every ~16 ms while the fingers move; a gap
+        /// this long is a pause or a lift.
+        pub const touch_live_ms: i64 = 80;
+
+        /// The touch glide is for slow scrolling. Faster than this the rows
+        /// come several a frame apart and the spring already reads as
+        /// continuous (touchpad drag smooth% 99-100), so it is left alone.
+        pub const touch_glide_max_rows_s: f32 = 15;
 
         /// The wheel is spinning too fast to animate (`scroll-animation-wheel-snap`):
         /// a scroll arriving now is drawn as a plain jump. Holds for a short
@@ -2406,7 +2441,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             const t_us = @divTrunc(base.durationTo(now).nanoseconds, std.time.ns_per_us);
             log.info(
-                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} top={d} bot={d} cell_h={d} mono_us={d} left={d} right={d}",
+                "scrolltrace t_us={d} model_rows={d} off_px={d:.3} top={d} bot={d} cell_h={d} mono_us={d} left={d} right={d} touch={d:.4}",
                 .{
                     t_us,
                     self.scroll_trace_rows,
@@ -2417,6 +2452,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @divTrunc(now.nanoseconds, std.time.ns_per_us),
                     self.scroll_anim.left,
                     self.scroll_anim.right,
+                    self.scroll_anim.touch_rate,
                 },
             );
         }

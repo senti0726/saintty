@@ -62,6 +62,12 @@ limit_px: f32 = 0,
 /// See `advanceSpring`.
 key_paced: bool = false,
 
+/// The touch glide (see `advanceGlide`): the finger's speed on a touchpad,
+/// device px per ms, while it is moving slowly; 0 otherwise. Set by the
+/// renderer before each `advance`, with the height of a row.
+touch_rate: f32 = 0,
+touch_row_px: f32 = 0,
+
 /// The held-key glide (see `advanceGlide`): the model's speed under a held
 /// key, px per ms, averaged over the frames that brought rows, and the
 /// averaged time between those frames.
@@ -641,6 +647,43 @@ fn advanceGlide(self: *ScrollAnim, dt_ms: f32) bool {
         self.glide_since_ms = 0;
     }
     self.glide_since_ms += dt_ms;
+
+    // A slow touchpad scroll. Rows come only when a whole cell of finger
+    // travel has built up -- every ~350 ms at 2 rows/s -- and the spring
+    // retired each one in ~300 ms and then stood still: "snaps, stop, snaps,
+    // stop" (2026-11-11). Here the finger's own speed drives the text, so it
+    // keeps moving between rows. Up to a row of offset is ordinary (the
+    // sawtooth between deliveries); only beyond that does it speed up to
+    // catch up, and below `lead` it eases in to wait for the next row
+    // rather than land and end the animation. When the fingers stop, the
+    // renderer zeroes `touch_rate` and the spring takes over, velocity and
+    // all, for whatever is left.
+    if (self.touch_rate > 0) {
+        if (!self.gliding) {
+            self.gliding = true;
+            self.glide_v = @abs(self.vel_px_ms);
+        }
+        const g = @abs(self.offset_px);
+        const sign: f32 = if (self.offset_px > 0) 1 else -1;
+        const rate = self.touch_rate;
+        const lead = @max(rate * glide_lead_ms, 1.0);
+        const band = lead + @max(self.touch_row_px, 1.0);
+        const target = if (g >= band)
+            rate + (g - band) / glide_catch_ms
+        else if (g >= lead)
+            rate
+        else
+            rate * g / lead;
+        self.glide_v += (target - self.glide_v) * (1.0 - @exp(-dt_ms / glide_smooth_ms));
+        var g2 = g - self.glide_v * dt_ms;
+        if (g2 < min_offset_px) {
+            g2 = min_offset_px;
+            self.glide_v = 0;
+        }
+        self.offset_px = sign * g2;
+        self.vel_px_ms = -sign * self.glide_v;
+        return true;
+    }
 
     const steady = self.key_paced and
         self.glide_samples >= glide_min_samples and
@@ -3704,4 +3747,53 @@ test "detectShift: an icon column in a popup rides with the names" {
     try testing.expectEqual(@as(isize, 1), s_.rows);
     try testing.expectEqual(@as(usize, 32), s_.left); // after the gutter, icon included
     try testing.expectEqual(@as(usize, 68), s_.right);
+}
+
+test "ScrollAnim: a slow touchpad scroll keeps moving between rows" {
+    // 2026-11-11, the user's slow drag: ~2.9 rows/s, cell 20 px, a row
+    // every 350 ms, 60 Hz frames. Without the touch glide the spring
+    // retired each row in ~300 ms and then the text stood still until the
+    // next: "snaps, stop, snaps, stop".
+    var a: ScrollAnim = .{};
+    const row: f32 = 20;
+    const iv: f32 = 350;
+    const frame: f32 = 1000.0 / 60.0;
+    const rate = row / iv;
+    var t: f32 = 0;
+    var next_row: f32 = 0;
+    var still_frames: usize = 0;
+    var frames: usize = 0;
+    var min_step: f32 = std.math.inf(f32);
+    var max_step: f32 = 0;
+    while (t < 3000) : (t += frame) {
+        var drawn_before = a.offset_px;
+        if (t >= next_row) {
+            a.push(row, 0, 40, 0, 80, 2 * row);
+            drawn_before += row;
+            next_row += iv;
+        }
+        a.touch_rate = rate;
+        a.touch_row_px = row;
+        a.advance(frame, 600, .spring);
+        // Displacement retired this frame = how far the text moved.
+        const step = drawn_before - a.offset_px;
+        if (t > 1000) {
+            frames += 1;
+            if (step < 0.05) still_frames += 1;
+            min_step = @min(min_step, step);
+            max_step = @max(max_step, step);
+        }
+    }
+    // Steady: never stands still, and no frame moves more than twice
+    // another (the spring alone: 0 px on half the frames, ~4 px on others).
+    try std.testing.expectEqual(@as(usize, 0), still_frames);
+    try std.testing.expect(max_step < 2.0 * min_step);
+    // And it does not drift away from the model: at most ~a row behind.
+    try std.testing.expect(@abs(a.offset_px) <= 1.5 * row);
+
+    // Fingers stop: the spring lands what is left.
+    a.touch_rate = 0;
+    var n: usize = 0;
+    while (a.active() and n < 200) : (n += 1) a.advance(frame, 600, .spring);
+    try std.testing.expect(!a.active());
 }

@@ -1030,6 +1030,18 @@ palette: Palette = .{},
 /// so raising this also makes repeated flicks build speed more readily.
 @"mouse-scroll-momentum-decay": f64 = 0.45,
 
+/// The slowest finger-lift that starts a momentum fling, in rows per second.
+///
+/// Lifting the fingers off the touchpad while they move slower than this
+/// stops the scroll where it is, exactly as if they had stayed on the pad:
+/// no fling, and any earlier fling still coasting is dropped too. Only a
+/// lift at or above this speed carries on. 0 flings on every lift (the old
+/// behaviour). Has no effect unless `mouse-scroll-momentum` is enabled.
+///
+/// With `scroll-trace` on, every lift logs `scrollmomentum rows_s=...`,
+/// which is the number to compare against when tuning this.
+@"mouse-scroll-momentum-min-speed": f64 = 10,
+
 /// Replay a recorded list of touchpad scroll samples on startup, for testing.
 ///
 /// The file holds one signed pixel delta per line, in the units GTK reports

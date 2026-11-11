@@ -440,6 +440,8 @@ fn drainMailbox(self: *Thread) !void {
                 if (dir != 0 and !typed) self.renderer.noteWheelActivity(std.math.sign(dir), @abs(dir) >= 2);
             },
 
+            .touch_speed => |v| self.renderer.noteTouchSpeed(v),
+
             .macos_display_id => |v| {
                 if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
                     try self.renderer.setMacOSDisplayID(v, &self.draw_now);

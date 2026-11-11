@@ -48,6 +48,10 @@ pub const Message = union(enum) {
     /// typed text (see `Renderer.noteInputActivity`).
     input_activity: i8,
 
+    /// The finger's speed on a touchpad, device px per ms, after each
+    /// precision scroll event. See `ScrollAnim.touch_rate`.
+    touch_speed: f32,
+
     /// Change the font grid. This can happen for any number of reasons
     /// including a font size change, family change, etc.
     font_grid: struct {

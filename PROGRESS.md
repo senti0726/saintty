@@ -2925,3 +2925,17 @@ binary path afterwards (the build writes a bare `ghostty`). Rollback:
 - Presentation (DMA-BUF export, swap-chain slots, GTK damage): screen grabs matched Ghostty's dumped frames to JPEG noise in every run, and the user's dump had the trail itself.
 - The cage rig and the first real-screen runs could not reproduce because they never had a display-maths PICTURE on screen: `hold_k_maths` at 1330 and Figure 2.5 regions show inline maths as `%%INLINE%%` text. The pictures are Unicode-placeholder images (`config/math-images.lua`). Any image-related scroll bug needs a scenario over display maths (lines ~120–175).
 - The recording's `0 0 0 0 3 0 3 9` read as the Figure 2.5 table, but the stale gutter number `4591` is `459` + stale digit; the identification from a filmed frame was misleading — the dump was decisive.
+
+## 2026-11-11 — touch glide: slow touchpad scrolling moves between rows; slow lifts don't fling
+
+**Symptom:** a slow touchpad scroll went "snaps, stop, snaps, stop" (the animation itself looked fine).
+
+**Cause:** at 2–3 rows/s a row reaches the screen only once a whole cell of finger travel has built up (~350 ms apart in the user's trace, cell_h 20); the spring retired each in ~300 ms and the text then stood still until the next. Separately, every finger lift started a fling, so a slow scroll lurched on release.
+
+**Fix:**
+- `mouse-scroll-momentum-min-speed` (rows/s, default 10): a lift slower than this stops dead and drops any coasting fling. `scroll-trace` logs `scrollmomentum rows_s=… fling=`. User's slow lifts 0–2 rows/s, flicks 29–145.
+- `Surface.noteTouchSpeed` averages precision-event finger speed (~80 ms) → `Message.touch_speed` → `Renderer.noteTouchSpeed`. While the last report is <80 ms old and under `touch_glide_max_rows_s` = 15, `advanceScrollAnim` sets `ScrollAnim.touch_rate`, and `advanceGlide` drives the offset at that speed: constant between `lead` and `lead + row`, catch-up only beyond a row of slack, ease-in below `lead`, holding at `min_offset_px` rather than ending. Fingers stop → `touch_rate` 0 → spring lands the rest with velocity carried over. `scrolltrace` lines end in `touch=`.
+
+**Ruled out:** the held-key glide as is (rate from row arrivals: ≥5 samples at 350 ms ≈ 2 s before it engages); drawing the finger's sub-row remainder (the incoming row isn't drawn until the app scrolls).
+
+**Verified:** new test `ScrollAnim: a slow touchpad scroll keeps moving between rows` passes, and fails with the glide disabled. Real trace from the user (`~/playground/minspeed-trace2.log`): 987 glide frames, median 0.35 px/frame, 8 % still (pauses/reversals). User: "look good". Installed; rollback `~/tools/ghostty/bin/ghostty.pre-touchglide`.
