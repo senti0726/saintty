@@ -80,7 +80,7 @@ Smooth-looking isn't the same as smooth, so most of the work went into measuring
 ## Status and scope
 
 - Linux, GTK, OpenGL only. No macOS/Metal port is planned.
-- Based on `ghostty-org/ghostty` at `349f02608` (2026-09-02).
+- Based on `ghostty-org/ghostty` at `fbb6dbe7e` (2026-11-10).
 - A personal daily driver, not a supported product. Bugs are welcome as issues.
 
 ## How this was made
