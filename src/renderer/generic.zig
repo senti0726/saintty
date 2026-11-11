@@ -356,6 +356,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// placements already describe the new model, and the slices that
         /// left are only in here. See `image.State.kitty_ghosts`.
         scroll_prev_images: std.ArrayListUnmanaged(imagepkg.Placement) = .empty,
+
+        /// Whether `scroll_prev_images` was taken in THIS updateFrame. Since
+        /// the upstream render-state rewrite (merge 7327e9207) the placements
+        /// are rebuilt only when their generation changes, not every frame,
+        /// so on an update with no rebuild the snapshot is from an older
+        /// frame and `kitty_placements` itself is what was last drawn.
+        /// Capturing from the stale snapshot copied image rows that had long
+        /// left, which piled up as ghost figures over the text.
+        scroll_prev_images_fresh: bool = false,
         scroll_bg_view: std.ArrayListUnmanaged(std.ArrayListUnmanaged(shaderpkg.CellBg)) = .empty,
 
         /// The row lists plus the ghost list, handed to the GPU upload in one
@@ -1921,11 +1930,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.scroll_image_ghosts_stale = false;
             }
             ScrollAnim.shiftGhostSlices(imagepkg.Placement, &self.images.kitty_ghosts, rows, top, bottom);
+            const drawn = if (self.scroll_prev_images_fresh)
+                self.scroll_prev_images.items
+            else
+                self.images.kitty_placements.items;
+            if (self.config.scroll_trace and !self.scroll_prev_images_fresh and
+                !std.mem.eql(u8, std.mem.sliceAsBytes(drawn), std.mem.sliceAsBytes(self.scroll_prev_images.items)))
+                log.info("imgghost stale-snapshot avoided rows={} drawn={} snapshot={}", .{ rows, drawn.len, self.scroll_prev_images.items.len });
             ScrollAnim.captureGhostSlices(
                 imagepkg.Placement,
                 self.alloc,
                 &self.images.kitty_ghosts,
-                self.scroll_prev_images.items,
+                drawn,
                 rows,
                 top,
                 bottom,
@@ -2791,6 +2807,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // or the images changed. The render state update above
                 // has already positioned every placement, so this is
                 // cheap. Most frames that only change text skip it.
+                self.scroll_prev_images_fresh = false;
                 if (self.images.kittyRequiresUpdate(
                     state.terminal,
                     &self.terminal_state,
@@ -2804,6 +2821,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.scroll_prev_images.clearRetainingCapacity();
                         self.scroll_prev_images.appendSlice(self.alloc, self.images.kitty_placements.items) catch
                             self.scroll_prev_images.clearRetainingCapacity();
+                        self.scroll_prev_images_fresh = true;
                     }
                     self.images.kittyUpdate(
                         self.alloc,
