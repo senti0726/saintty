@@ -4,6 +4,10 @@
 A fork of <a href="https://github.com/ghostty-org/ghostty">Ghostty</a> that scrolls smoothly, pixel by pixel, and stops redrawing the whole window when only one line changed. <br> Linux + GTK + OpenGL only. Built and used daily on Hyprland.
 </p>
 
+https://github.com/user-attachments/assets/a1fece0a-1946-4f6f-8344-20ab1ee3ce84
+
+<p align="center"><sub>Claude Code: the text slides while the prompt box and the "Jump to bottom" label stay put.</sub></p>
+
 ---
 
 ## What it adds
@@ -13,6 +17,10 @@ A fork of <a href="https://github.com/ghostty-org/ghostty">Ghostty</a> that scro
 A terminal is a grid of character cells, so stock Ghostty can only move text a whole row at a time. Saintty animates the rows in between.
 
 The hard part is that most scrolling isn't Ghostty's own scrollback. It's an *application* (nvim, tmux, less, yazi, Claude Code) redrawing its own screen. Saintty works out which part of the screen moved, and in which direction, and slides just that region, so tmux's status line, nvim's gutter and a split pane's border stay put.
+
+https://github.com/user-attachments/assets/c66de893-d3df-47bf-9bae-683941e6c2dc
+
+https://github.com/user-attachments/assets/5a988b05-65c4-4836-a344-0d1243e8870d
 
 - **A spring, not a curve.** Easing curves restart on every scroll, so a held key speeds up and sags at each row. A critically damped spring keeps its speed across scrolls. Curves (`ease-out`, `material`, `linear`, …) are still there via `scroll-animation-easing`.
 - **Held keys glide.** Holding `j` in nvim moves the text at the rate the input actually arrives, instead of passing nvim's per-row timing jitter straight to the screen (frame-to-frame spread 19.9 % → 11.2 %, filmed).
