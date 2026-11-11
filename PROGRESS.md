@@ -2939,3 +2939,18 @@ binary path afterwards (the build writes a bare `ghostty`). Rollback:
 **Ruled out:** the held-key glide as is (rate from row arrivals: ≥5 samples at 350 ms ≈ 2 s before it engages); drawing the finger's sub-row remainder (the incoming row isn't drawn until the app scrolls).
 
 **Verified:** new test `ScrollAnim: a slow touchpad scroll keeps moving between rows` passes, and fails with the glide disabled. Real trace from the user (`~/playground/minspeed-trace2.log`): 987 glide frames, median 0.35 px/frame, 8 % still (pauses/reversals). User: "look good". Installed; rollback `~/tools/ghostty/bin/ghostty.pre-touchglide`.
+
+## 2026-11-11 — Claude Code's "Jump to bottom" label: holes and clones on fast scroll
+
+**Symptom:** a fast touchpad scroll up through Claude Code's fullscreen view left label-shaped holes in the text, sent a second copy of the label (text, or an empty grey box) sliding down the screen, and lost ~16 lines per run (rig, installed build).
+
+**Cause:** `keepScrollGhosts` filtered what slides away using the label mask from the PREVIOUS frame (`scroll_pin`). That mask is wrong in three cases: empty on the first push of a scroll; empty while Claude Code's grey prompt block passes under the grey label (`computePins` can't see grey on grey); one cell short on each side right after Claude Code re-pads the label. Then the label leaked into the sliding rows and no underlay was kept for the text it hid.
+
+**Fix:**
+- `lateScrollPins()` runs right after `computePins` on push frames and, with THIS frame's mask, filters the push's kept glyphs and backgrounds again, and adds underlay glyphs for rows that are pinned now but got none (`snapshotOldFg` keeps the glyphs as last drawn; new fields `scroll_late`, `scroll_old_fg`, `scroll_old_fg_rows`, `scroll_under_rows`).
+- `unpinGhostBg` widens each pinned run over the label's one-cell padding (same colour, up to 2 cells), so no empty grey box slides away.
+- `keepStillPins` (`scroll_anim.zig`): a label pinned last frame whose text hasn't changed stays pinned, even when neither detector can see it (grey prompt block against its blank row). Unit test added.
+
+**Ruled out:** fix 2's widened range dropping cells by mask timing (`ghostsig` trace showed the ghost bookkeeping consistent push to push; leaks only at pushes with an empty or narrow mask); a "grey-ish" clone detector (noise; match exactly 58,58,58 with black on both sides).
+
+**Verified:** rig (`~/playground/ghostty-labelfix/ccrig.sh` + `holes2.py` + `lost.py`): 3 runs on the final build, 0 holes, 0 clones, 0 frames with the label missing from the bottom, 0 lost lines (was 2–3 bad frames per run, 16 lost lines on the installed build). Unit tests: `scroll` 392/392, `pins` 97/97. Installed; rollback `~/tools/ghostty/bin/ghostty.pre-labelfix`.

@@ -1155,6 +1155,107 @@ test "pins: a held bar's end caps are held with it, the names inside are not" {
     try std.testing.expectEqual(@as(u8, 0), pins[0 * cols + 3][0]);
 }
 
+/// Keep a text-held pin from the frame before while its text still stays
+/// put. The detectors above each need something that is not always there:
+/// `computePins` a colour that differs from the rows around it, and
+/// `pinStillText` other text on the row that moved. Claude Code's "Jump to
+/// bottom" label on an otherwise blank row, with its grey prompt block
+/// sliding up against it, had neither for a push or two: the label was not
+/// pinned, rode the scroll offset 30 rows up the screen, and its own place
+/// stood empty.
+///
+/// A run of `prev` cells held as text (byte 1) is kept, whole and as text,
+/// when its background is unchanged and most of its glyphs are the same as
+/// the frame before at the same place and NOT what the shift carried there
+/// -- `pinStillText`'s test, without its row conditions. Only ever sets.
+pub fn keepStillPins(
+    comptime T: type,
+    pins: []T,
+    prev: []const T,
+    bg_prev: []const T,
+    bg_now: []const T,
+    now: []const u64,
+    before: []const u64,
+    cols: usize,
+    shift: isize,
+) void {
+    const n = pins.len;
+    if (cols == 0 or prev.len != n or bg_prev.len != n or bg_now.len != n or
+        now.len != n or before.len != n) return;
+    const rows = n / cols;
+    for (0..rows) |r| {
+        const src = @as(isize, @intCast(r)) + shift;
+        const sr: ?usize = if (src < 0 or src >= @as(isize, @intCast(rows))) null else @intCast(src);
+        var c: usize = 0;
+        while (c < cols) {
+            const k0 = r * cols + c;
+            if (prev[k0][1] == 0) {
+                c += 1;
+                continue;
+            }
+            var e = c + 1;
+            while (e < cols and prev[r * cols + e][1] != 0) e += 1;
+            var ok = true;
+            var glyphs: usize = 0;
+            var still: usize = 0;
+            for (c..e) |x| {
+                const k = r * cols + x;
+                if (!std.meta.eql(bg_now[k], bg_prev[k])) {
+                    ok = false;
+                    break;
+                }
+                if (glyphOf(now[k]) == blank_glyph) continue;
+                glyphs += 1;
+                const carried = if (sr) |s| now[k] == before[s * cols + x] else false;
+                if (now[k] == before[k] and !carried) still += 1;
+            }
+            if (ok and glyphs >= pin_text_min and still * 5 >= glyphs * 4) {
+                for (c..e) |x| {
+                    pins[r * cols + x][0] = 255;
+                    pins[r * cols + x][1] = 255;
+                }
+            }
+            c = e;
+        }
+    }
+}
+
+test "pins: a held label stays held when its row offers no other evidence" {
+    const T = [4]u8;
+    const cols = 30;
+    const rows = 4;
+    const grey: T = .{ 58, 58, 58, 255 };
+    var pins: [rows * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var prev: [rows * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var bg_prev: [rows * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var bg_now: [rows * cols]T = @splat(.{ 0, 0, 0, 0 });
+    var now: [rows * cols]u64 = @splat(0);
+    var before: [rows * cols]u64 = @splat(0);
+    // Row 3: the label at 10..23 on a blank row, held last frame. A grey
+    // block slides up against it (row 2 grey now).
+    const label = "Jump to bottom";
+    for (label, 0..) |ch, j| {
+        const k = cellKey(if (ch == ' ') blank_glyph else ch, 9);
+        before[3 * cols + 10 + j] = k;
+        now[3 * cols + 10 + j] = k;
+        bg_prev[3 * cols + 10 + j] = grey;
+        bg_now[3 * cols + 10 + j] = grey;
+        prev[3 * cols + 10 + j] = .{ 255, 255, 0, 0 };
+    }
+    for (0..cols) |c| bg_now[2 * cols + c] = grey;
+    keepStillPins(T, &pins, &prev, &bg_prev, &bg_now, &now, &before, cols, -1);
+    try std.testing.expectEqual(@as(u8, 255), pins[3 * cols + 10][1]);
+    try std.testing.expectEqual(@as(u8, 255), pins[3 * cols + 23][0]);
+    try std.testing.expectEqual(@as(u8, 0), pins[3 * cols + 9][0]);
+
+    // Control: the same text is what the shift carried (identical lines
+    // moving past each other) -- not kept.
+    @memset(&pins, .{ 0, 0, 0, 0 });
+    for (0..cols) |c| before[2 * cols + c] = before[3 * cols + c];
+    keepStillPins(T, &pins, &prev, &bg_prev, &bg_now, &now, &before, cols, -1);
+    try std.testing.expectEqual(@as(u8, 0), pins[3 * cols + 10][0]);
+}
+
 pub fn markPinnedText(comptime T: type, pins: []T, now: []const u64, before: []const u64, cols: usize) void {
     const have = now.len == pins.len and before.len == pins.len and cols > 0;
     var i: usize = 0;
