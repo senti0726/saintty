@@ -53,7 +53,10 @@ TESTS = [
     ("taps", taps, False),
     ("hold_j", scenarios.hold_j, False),
     ("hold_k", scenarios.hold_k, True),
+    ("ctrl_d", scenarios.ctrl_d, False),
 ]
+# per-press tests: timed like taps, each press its own window
+PER_PRESS = {"taps": 1.2, "ctrl_d": 0.8}
 
 
 class Film:
@@ -121,10 +124,10 @@ def summarise(name, tr, events, nv, cell=20):
     res = {"filmed_frames": len(tr), "moved_rows": rows(tr[-1][1]) if tr else 0}
     if not moving:
         return res
-    if name == "taps":
+    if name in PER_PRESS:
         lat, land = [], []
         for i, k in enumerate(keys):
-            nxt = keys[i + 1] if i + 1 < len(keys) else k + 1.2
+            nxt = keys[i + 1] if i + 1 < len(keys) else k + PER_PRESS[name]
             mv = [t for t, _ in moving if k <= t < nxt]
             if mv:
                 lat.append((mv[0] - k) * 1000)
@@ -162,6 +165,8 @@ def main():
     binary = Path(opts.get("bin", Path.home() / "tools/ghostty/bin/ghostty"))
     out = Path(opts.get("out", Path.home() / "playground/fast-scroll" / time.strftime("%Y%m%d-%H%M%S-lat")))
     arms = [int(x) for x in opts.get("arms", "600,120,0,600").split(",")]
+    only = opts.get("tests")
+    tests = [t for t in TESTS if not only or t[0] in only.split(",")]
     before = subprocess.run([GT, "scroll", "--json"], capture_output=True, text=True)
     before = json.loads(before.stdout)["value"]
 
@@ -178,7 +183,7 @@ def main():
             time.sleep(1.0)
             rig.logf.flush()
             reloaded = "reloading configuration" in run.slice_file(rig.log, mark)
-            for name, fn, top in TESTS:
+            for name, fn, top in tests:
                 rig.reset(1500 if not top else 1700, bottom=not top)
                 if not rig.probe_keys():
                     print(f"{arm} {name}: PROBE FAILED")
