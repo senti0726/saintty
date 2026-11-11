@@ -2857,3 +2857,56 @@ logged smears (0,5)->(20,10)->(30,3)->(0,5) and nothing for the last hide;
 through tmux with the real hook, a Claude-style `❯ 2.` menu pane gave
 (0,1)->(68,4)->(0,1) and real yazi (0,1)->(77,3)->(0,1) (its hovered row).
 Installed; rollback `~/tools/ghostty/bin/ghostty.pre-target`.
+
+## 2026-11-11 — upstream merge (fbb6dbe7e) + FrameLink: GTK draws paced to the frame clock
+
+**Decision:** the fork now sits on upstream main `fbb6dbe7e` (merge
+`7327e9207`, 14 conflicting files), plus `33ba216fa` FrameLink: with the
+upstream renderer, Linux draws are asked for by a GTK frame-clock tick, the
+GTK counterpart of macOS DisplayLink. Installed as
+`1.4.1-merge-upstream-1110+33ba216fa`.
+
+**Why:** after the merge, held-j smooth% fell 99 → 79. Upstream's render
+thread draws on every wakeup and `hasVsync` is macOS-only, so a 60 Hz panel
+got 2-3 draws per refresh at random phases and the scroll animation was
+sampled at random points. With FrameLink, 2× A/B each against the installed
+pre-merge build (A), smooth% B vs A: held j 98.4/99.2 vs 98.8/99.2, held k
+99.6/99.2 vs 99.6/98.8, wheel_fast 87.2/85.9 vs 80.5/81.8, tp_flick
+99.0/98.4 vs 92.3/96.6, tp_fast 100/100 vs 93.1/98.8. One dip:
+hold_j_maths 94.4/93.2 vs 97.6/95.5. lat.py latency level within one
+refresh (Ctrl-D ~12 ms vs ~7, taps ~7 vs ~9).
+
+**Ruled out:**
+- Waiting up to 10 ms inside the tick for the draw to finish (to save a
+  frame of latency): it blocks GTK's main thread, so the frame clock ticked
+  at 67/s with 2-4 ms gaps on a 60 Hz panel. That was the real cause of the
+  leftover ~10/20 ms judder. The tick now only requests the draw, and the
+  frame is shown on the next refresh.
+- Sampling the animation at the frame clock's predicted present time on its
+  own (handoff part 3's plan): kept, but it did not fix the judder while the
+  tick still blocked.
+- Swap chain of 1 (part 1): rejected.
+
+**How it works:** `src/renderer/FrameLink.zig`. When enabled, the render
+thread only marks a frame wanted. GTK's `frameTickCallback` notifies it, and
+the renderer then draws once. The scroll animation and the held-key glide
+read the frame clock's predicted present time (`getFrameTime` + refresh
+interval), which advances exactly one refresh per frame, instead of the
+moment the draw started.
+
+**Held-key stop (owner call, 2026-11-11):** after release, B eases to a
+stop in partial-row steps (~55 ms longer in holdfilm), where A halted dead
+on a row. The owner tried it and kept the soft stop.
+
+**Verified:** `zig-0.17 build test` exit 0 with no `error: '…' failed`
+(the 15 "failed command" lines are the benign zig 0.17 shard labels).
+Visual check on the
+installed-to-be build with `custom-shader-cache-debug = verify`: 181 frames
+verified, 0 MISMATCH, 93 of them partial (scrolling + cursor moves in nvim).
+Screenshot clean, background `#000000`. `ghostty +validate-config` passes.
+Harness data in `~/playground/fast-scroll/2026-11-11-framelink/`.
+Installed with `zig-0.17 build -Doptimize=ReleaseFast --prefix
+~/tools/ghostty`; the desktop/dbus `Exec=` lines were set back to the full
+binary path afterwards (the build writes a bare `ghostty`). Rollback:
+`~/tools/ghostty/bin/ghostty.pre-upstream1110` and
+`~/tools/ghostty/share.pre-upstream1110.tar.gz`.
